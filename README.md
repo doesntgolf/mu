@@ -1,0 +1,202 @@
+# Mμ programming language
+
+Mu is a small, high-level, pure functional programming language with an ML-style type
+system. Its design is focused on anonymous types, inference, and polymorphism.
+
+Starting from a Hindley-Milner type system with let-polymorphism, we add:
+
+ - product and sum types with row polymorphism
+ - row polymorphic function parameters
+ - existential types
+ - iso-recursive types
+ - denominator-polymorphic number types, with units of measure
+ - pattern matching with sub-clauses
+ - (TODO) N-dimensional arrays
+ - (TODO) implicit parameters
+
+*Design status:* Other than arrays and implicit parameters, the main design for the type
+system and language semantics that I'd like is in place. Inconsistencies and necessary
+additions will probably still be uncovered during implementation. The syntax is still
+mostly undesigned.
+
+*Implementation status:* I'm implementing the bootstrapping type checker and
+tree-walk interpreter in OCaml. It's still in the beginning stages, not yet usable for
+anything. Concurrently with that, I'm designing a minimal prelude, to expose builtins
+and basic data structures and utilities. After that, I plan to implement a bytecode
+interpreter and runtime in C, and a self-hosted type-checker and compiler targeting
+that bytecode. At some point, I also intend to write a specification for the language.
+
+## Type system
+
+### Denominator polymorphism and units of measure
+
+Mu's number type represents rational numbers, where the denominator is part of the type.
+The denominator is a monomial: it's represented by the product of a coefficient and a set
+of variables. So the literal `5` has type `Num/1a` - that is, a number with denominator
+1 multiplied by the variable `a`. The `a` is a numeric type variable, freshly allocated
+for each literal value. Its purpose is similar to a row variable in a record type:
+it makes the value flexible. A `Num/4a` can be unified with a `Num/6b` by setting `a =
+3` and `b = 2`. By contrast, a number type without any variables in the denominator is
+inflexible - an indexing operation should require a `Num/1`. In general, the unifier
+unifies denominators by finding the least common multiple of the coefficients.
+
+A number without a statically known denominator is notated `Num/?`. Unifying this type
+with another number type will always result in a `Num/?`. Operations on values of this
+type will still be mathematically correct, we just won't know the resulting denominator
+until runtime. A number with a statically unknown denominator can be turned into one
+with a statically known denominator with functions like `quantize` or `floor`.
+
+Addition, subtraction, equality, and comparison demand operands with compatible
+denominators. Multiplication has type `fun(Num/a, Num/b) -> Num/a*b`, combining the
+two denominators. The type for division (`fun(Num a/b, Num c/d) -> Num/b*c`) shows
+another feature of number types: numerators in the type.
+
+The numerator is part of a number type in one specific circumstance: number literals. So,
+the type of the literal `5` is actually `Num 5/1a`. The purpose of having the numerator
+in the type is for a few operations (division, exponentiation, quantization) where
+the denominator of the output type depends on the numerator of one of the operands;
+this way, if you divide by a number literal (as is the common case), we're able to
+preserve a statically known denominator in the output. Across any operation, the known
+numerator component is immediately forgotten.
+
+Finally, units of measure can also be attached to numbers. There are no builtin units;
+a unit is simply any string raised to an exponent. Thus, you can have `3.6 meters`,
+`5 apples`, `80 miles/hour`, or `40 m^2/paint-bucket`. Units compose and cancel out as
+you would expect across multiplication and division; addition and comparison require
+alike units.
+
+### Explicit iso-recursive types, corresponding with lazy evaluation
+
+In the type system literature for iso-recursive types, explicit `roll e` and `unroll
+e` expressions are used to convert back and forth between a wrapped form like `rec
+nat. [Succ(nat), Zero]`, and the one-level-unwrapping `[Succ(rec nat. [Succ(nat),
+Zero]), Zero]`. The two forms are isomorphic.
+
+But in most languages that have iso-recursive types, the roll and unroll operations
+are made implicit in the data constructors of the language. For example, in OCaml we
+would write the previous example `type nat = Zero | Succ of nat`.  Constructing it
+in an expression or pattern with `Succ Zero` implicitly performs the roll or unroll,
+respectively.
+
+But Mu, with its anonymous types, isn't able to infer the roll and unroll forms as
+easily. (So perhaps we should instead use equi-recursive types, where the rolled and
+unrolled form are treated as equal to each other, rather than isomorphic?  Unfortunately,
+inferring equi-recursive types is a much harder job. Stephan Dolan's language MLsub
+does it, but the MLsub type system has a very different design, based on subtyping,
+than Mu.) So instead, we make roll explicit in the surface language, with the syntax
+`&e`. Unrolling is simply using the same syntax in a pattern, `&p`.
+
+Normally, the explicit roll requires a type annotation, otherwise it's unclear where
+the fold in the recursive structure should be placed. Instead, we use another sigil.
+Within a `&body` expression or pattern, `body` can contain 0 or more `^e` forms (I
+pronounce it "pin"). The "pinned" expression (or pattern) marks the folding point in
+the recursive type, constraining that sub-expression to match the type of the parent
+recursive structure.
+
+Mu is strictly evaluated, but we also have opt-in laziness, serendipitously corresponding
+with recursive types. A `&e` expression becomes a lazy thunk. Pattern matching on a
+lazy thunk with `&p` forces it. Notably, an iso-recursive type need not be actually
+recursive, so you can put this to use for lazy evaluation wherever you want it. (This
+also comes in handy for existential types; see below.)
+
+#### No recursive bindings
+
+Mu has purely lexical scope, with no recursive bindings. Thanks to iso-recursive types,
+we can type the Z-combinator, which we've done and placed in the prelude. With that, we
+derive a function called `recur` (based loosely on Clojure's `loop/recur` construct), also
+in the prelude. `recur` is meant to be the primary way to do recursion in the language.
+
+### Existential types
+
+In the HM type system, qualifiers for universal type variables aren't part of types
+themselves; instead they occur in so-called "prenex form". They're "generalized"
+at `let` (and at the implicit "top-level `let`"), and instantiated at variable usage
+sites. Similarly, in the Mu type system, existential qualifiers aren't types themselves;
+they're a component of function types. Existential type variables (aka "skolem"
+type variables) are generalized at function boundaries, and instantiated at every
+function application.
+
+The introduction expression for existential types is `exists <T> in <body>`.  Within
+`<body>`, `<T>` is used as a constructor expression and pattern, essentially annotating
+occurrences of the abstract type-to-be. After `<body>`, a fresh skolem type variable
+is allocated for the abstract type, which unifies with nothing but itself. Then,
+when inferring the type for a function, when we see a skolem type variable, we check
+if it occurs in the environment of the function; if so, it remains a simple skolem
+constant. If not, it means that skolem variable was introduced within the function,
+and the existential qualifier for that variable thus becomes part of the function type.
+This mirrors the environment check for generalization of universal type variables at
+`let`. (And likewise, the environment check can be optimized by tracking the "level"
+or "rank" of the respective type variables - `let` depth for universal type variables,
+and function depth for existential type variables.)
+
+At every function application, the existential qualifiers associated with the
+function type are instantiated, assigning new, unique skolem type variables for each
+qualifier. Instead of being bound to the introduction scope, as in the Mitchell-Plotkin
+formulation, the existential qualifier automatically flows outward, tracking the flow
+of the associated type variable.
+
+Functions aren't the only place where evaluation is delayed - roll expressions for
+recursive types are also delayed. Thus, existential type variables are also generalized
+in roll expressions (`&e`) and instantiated in unroll patterns, and recursive types
+also carry existential quantifiers. This provides a straightforward way to make two
+packages with different existential types compatible with each other:
+
+```
+let &pack = if cond then
+	&exists T in {
+		.x = T(5),
+		.f = fun(T(x)) -> x
+	}
+else
+	&exists T in {
+		.x = T("nice"),
+		.f = fun(T(s)) -> string.length(s)
+	}
+```
+
+Without delaying the evaluation of the `exists` expressions, new skolem variables would
+be immediately allocated, and in typechecking the branches we would find the two skolem
+types to be incompatible with each other. But by capturing the existential qualifier in a
+delayed recursive type, the two generalized types can be unified, and we can immediately
+unroll them on the outside via unrolling in the `let` pattern with `let &pack`.
+
+### Pattern matching sub-clauses
+
+This generalizes boolean guard clauses in other pattern matching implementations.
+Crucially, the sub-clause match may be partial - if there's no match in the sub-clause,
+control flows back out to the outer clause.
+
+This subsumes the need for a pattern like OCaml's `<pat> as x` (where you both match a
+specific structure and bind that structure to a variable), and also range patterns like
+`1..10` (since you can simply do that test in a sub-clause).
+
+The scrutinee for sub-clauses is an arbitrary expression. The syntax for introducing
+a sub-clause is `and`:
+
+```
+x [
+	#a -> 1,
+	#b(5, c) and f(c) [
+		100 -> 2,
+		200 -> 3
+	],
+	#c(d) -> d
+]
+```
+
+### Variants, records, and functions
+
+Variants (written `#ok(a, b)` or `#true`) are row polymorphic, similar to OCaml's
+polymorphic variants. A variant type is written `[#one, #two([#three, #four]), #five]`.
+The optional row variable at the end is written `..rest`. Additionally, a variant's
+payload is a product type, and is row polymorphic in the same way as records.
+
+Rather than a separate construct for tuples, records can begin with 0 or more positional
+fields. Records are row-polymorphic in the typical form. When records are used in
+pattern position, if the row parameter isn't explicitly bound, it's implicitly the
+wildcard pattern (NOT the empty row), so there's no way to form a closed record pattern.
+
+Functions are applied with the Algol-form (`f(a, b, c)`), rather than the curried ML-form
+(`f a b c`). The primary motivation for this design is so that row-polymorphism can
+be applied to function parameters, making more functions type-compatible with each
+other.
