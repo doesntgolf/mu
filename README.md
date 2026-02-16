@@ -1,4 +1,4 @@
-# Mμ programming language
+# μ programming language
 
 Mu is a small, high-level, pure functional programming language with an ML-style type
 system. Its design is focused on anonymous types, inference, and polymorphism.
@@ -9,17 +9,16 @@ Starting from a Hindley-Milner type system with let-polymorphism, we add:
  - row polymorphic function parameters
  - existential types
  - iso-recursive types
- - denominator-polymorphic number types, with units of measure
+ - a denominator-polymorphic number type, with units of measure
  - pattern matching with sub-clauses
  - (TODO) N-dimensional arrays
- - (TODO) implicit parameters
+ - (TODO) `do` notation? or backpassing syntax?
 
-*Design status:* Other than arrays and implicit parameters, the main design for the type
-system and language semantics that I'd like is in place. Inconsistencies and necessary
-additions will probably still be uncovered during implementation. The syntax is still
-mostly undesigned.
+**Design status:** Other than arrays, the main design for the type system and language
+semantics that I'd like is in place. Inconsistencies and necessary additions will
+probably still be uncovered during implementation. The syntax is still mostly undesigned.
 
-*Implementation status:* I'm implementing the bootstrapping type checker and
+**Implementation status:** I'm implementing the bootstrapping type checker and
 tree-walk interpreter in OCaml. It's still in the beginning stages, not yet usable for
 anything. Concurrently with that, I'm designing a minimal prelude, to expose builtins
 and basic data structures and utilities. After that, I plan to implement a bytecode
@@ -61,7 +60,7 @@ numerator component is immediately forgotten.
 
 Finally, units of measure can also be attached to numbers. There are no builtin units;
 a unit is simply any string raised to an exponent. Thus, you can have `3.6 meters`,
-`5 apples`, `80 miles/hour`, or `40 m^2/paint-bucket`. Units compose and cancel out as
+`5 apples`, `80 miles/hour`, or `40 m^3`. Units compose and cancel out as
 you would expect across multiplication and division; addition and comparison require
 alike units.
 
@@ -102,19 +101,19 @@ also comes in handy for existential types; see below.)
 #### No recursive bindings
 
 Mu has purely lexical scope, with no recursive bindings. Thanks to iso-recursive types,
-we can type the Z-combinator, which we've done and placed in the prelude. With that, we
-derive a function called `recur` (based loosely on Clojure's `loop/recur` construct), also
+we can type the Z-combinator, which we've placed in the prelude. With that, we
+derive a function called `recur` (based loosely on Clojure's `loop/recur` form), also
 in the prelude. `recur` is meant to be the primary way to do recursion in the language.
 
 ### Existential types
 
-In the HM type system, qualifiers for universal type variables aren't part of types
-themselves; instead they occur in so-called "prenex form". They're "generalized"
-at `let` (and at the implicit "top-level `let`"), and instantiated at variable usage
-sites. Similarly, in the Mu type system, existential qualifiers aren't types themselves;
+In the HM type system, quantifiers for universal type variables aren't part of types
+themselves; instead they occur in so-called "prenex form". They're generalized at
+`let` (and at the implicit "top-level `let`"), and instantiated at variable usage
+sites. Similarly, in the Mu type system, existential quantifiers aren't types themselves,
 they're a component of function types. Existential type variables (aka "skolem"
-type variables) are generalized at function boundaries, and instantiated at every
-function application.
+type variables) are instantiated by the introduction form (`exists T in <body>`),
+generalized at function boundaries, and re-instantiated at every function application.
 
 The introduction expression for existential types is `exists <T> in <body>`.  Within
 `<body>`, `<T>` is used as a constructor expression and pattern, essentially annotating
@@ -123,16 +122,16 @@ is allocated for the abstract type, which unifies with nothing but itself. Then,
 when inferring the type for a function, when we see a skolem type variable, we check
 if it occurs in the environment of the function; if so, it remains a simple skolem
 constant. If not, it means that skolem variable was introduced within the function,
-and the existential qualifier for that variable thus becomes part of the function type.
+and the existential quantifier for that variable thus becomes part of the function type.
 This mirrors the environment check for generalization of universal type variables at
 `let`. (And likewise, the environment check can be optimized by tracking the "level"
 or "rank" of the respective type variables - `let` depth for universal type variables,
 and function depth for existential type variables.)
 
-At every function application, the existential qualifiers associated with the
+At every function application, the existential quantifiers associated with the
 function type are instantiated, assigning new, unique skolem type variables for each
-qualifier. Instead of being bound to the introduction scope, as in the Mitchell-Plotkin
-formulation, the existential qualifier automatically flows outward, tracking the flow
+quantifier. Instead of being bound to the unpack scope, as in the Mitchell-Plotkin
+formulation, the existential quantifier naturally flows outward with the occurrence
 of the associated type variable.
 
 Functions aren't the only place where evaluation is delayed - roll expressions for
@@ -156,32 +155,33 @@ else
 
 Without delaying the evaluation of the `exists` expressions, new skolem variables would
 be immediately allocated, and in typechecking the branches we would find the two skolem
-types to be incompatible with each other. But by capturing the existential qualifier in a
+types to be incompatible with each other. But by capturing the existential quantifier in a
 delayed recursive type, the two generalized types can be unified, and we can immediately
-unroll them on the outside via unrolling in the `let` pattern with `let &pack`.
+unroll them on the outside, via the unroll pattern in `let &pack`.
 
 ### Pattern matching sub-clauses
 
-This generalizes boolean guard clauses in other pattern matching implementations.
-Crucially, the sub-clause match may be partial - if there's no match in the sub-clause,
+In a pattern match expression, a branch is normally `<pat> -> <expr>`. Sub-clauses
+allow the form `<pat> and <expr> [<pat> -> <expr> ..]`. That is, you can do an inner
+match on an arbitrary scrutinee using parts you've matched from the outer pattern.
+Crucially, the sub-clause matching may be partial - if there's no match in the sub-clause,
 control flows back out to the outer clause.
 
-This subsumes the need for a pattern like OCaml's `<pat> as x` (where you both match a
+This generalizes boolean guard clauses in other pattern matching implementations. It
+also subsumes the need for a pattern like OCaml's `<pat> as x` (where you both match a
 specific structure and bind that structure to a variable), and also range patterns like
-`1..10` (since you can simply do that test in a sub-clause).
+`1..10` (since you can simply do that test in a sub-clause). An example in OCaml-ish
+syntax:
 
-The scrutinee for sub-clauses is an arbitrary expression. The syntax for introducing
-a sub-clause is `and`:
-
-```
-x [
-	#a -> 1,
-	#b(5, c) and f(c) [
-		100 -> 2,
-		200 -> 3
-	],
-	#c(d) -> d
-]
+```ocaml
+match x with
+| A -> 1
+| B (5, c) and match f c with
+	| 100 -> 2
+	| 200 -> 3
+end
+| C d -> d
+| _ -> default
 ```
 
 ### Variants, records, and functions
