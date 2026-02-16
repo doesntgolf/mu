@@ -65,6 +65,13 @@ module Env = struct
         rev acc
     in
     aux Empty env
+
+  let iteri f env =
+    let rec aux i = function
+      | Binding {name; value; env} -> f name value i; aux (i+1) env
+      | Empty -> ()
+    in
+    aux 0 env
 end
 
 module Num : sig
@@ -207,12 +214,23 @@ module Type = struct
     ty : t
   }
 
-  let show = function
+  let rec show = function
     | Number {
         numer = Int i;
         denom = Known {coeff; vars};
         units
       } -> Printf.sprintf "Num %i/%i" i coeff
+    | Record fields ->
+      let buf = Buffer.create 16 in
+      Buffer.add_char buf '{';
+      Env.iteri
+        (fun name ty i ->
+           if i <> 0 then
+             Buffer.add_string buf ", ";
+           Printf.bprintf buf "%s = %s" (Symbol.to_string name) (show ty))
+        fields;
+      Buffer.add_char buf '}';
+      Buffer.contents buf
 
   let occurs a b = ()
 
@@ -243,11 +261,14 @@ module Type = struct
               units = []
             }
         }
-      (* 
-      | Expr.Record fields ->
-        let fields = Env.map (aux env ~expected) fields in
-        Record fields
 
+      | Expr.Record fields ->
+        let fields = Env.map (aux env ~expected) fields in {
+          expr = Expr.Record fields;
+          ty = Record (Env.map (fun field -> field.ty) fields)
+        }
+
+(*
       | Expr.Field (expr, name) ->
         let expr_type = aux env ~expected expr in
         let fields = Env.(Binding {name; value = expr_type; env = Empty}) in
@@ -305,8 +326,39 @@ module Parsing = struct
     | Int of int
     | Underscore
     | EOF
-    | Error of string
+    | TokenError of string
     | UnexpectedChar of char
+
+  let string_of_token = function
+    | Let -> "Let"
+    | LeftParen -> "LeftParen"
+    | RightParen -> "RightParen"
+    | LeftCurly -> "LeftCurly"
+    | RightCurly -> "RightCurly"
+    | LeftSquare -> "LeftSquare"
+    | RightSquare -> "RightSquare"
+    | Greater -> "Greater"
+    | Less -> "Less"
+    | Ident s -> "Ident " ^ Symbol.to_string s
+    | Field s -> "Field " ^ Symbol.to_string s
+    | Tag s -> "Tag " ^ Symbol.to_string s
+    | Comma -> "Comma"
+    | Arrow -> "Arrow"
+    | Equal -> "Equal"
+    | Undefined -> "Undefined"
+    | Exists -> "Exists"
+    | In -> "In"
+    | And -> "And"
+    | Or -> "Or"
+    | Ampersand -> "Ampersand"
+    | Caret -> "Caret"
+    | Pipe -> "Pipe"
+    | ForwardSlash -> "ForwardSlash"
+    | Int i -> "Int " ^ string_of_int i
+    | Underscore -> "Underscore"
+    | EOF -> "EOF"
+    | TokenError s -> "TokenError " ^ s
+    | UnexpectedChar c -> Printf.sprintf "UnexpectedChar %c" c
 
   let line_and_col_of_pos input target =
     let rec aux pos line col =
@@ -352,6 +404,8 @@ module Parsing = struct
         | '-' | '_' as c ->
           Buffer.add_char buf c;
           aux (pos+1) yield
+
+        | exception (Invalid_argument _)
         | _ ->
           let str = Buffer.contents buf in
           Buffer.reset buf;
@@ -395,13 +449,13 @@ module Parsing = struct
         symbol (pos+1) (fun pos str ->
             match keyword str with
             | Ident sym -> yield (Field sym) pos
-            | _ -> yield (Error "unexpected keyword") pos)
+            | _ -> yield (TokenError "unexpected keyword") pos)
 
       | '\'' ->
         symbol (pos+1) (fun pos str ->
             match keyword str with
             | Ident sym -> yield (Tag sym) pos
-            | _ -> yield (Error "unexpected keyword") pos)
+            | _ -> yield (TokenError "unexpected keyword") pos)
 
       | '-' -> begin match input.[pos+1] with
           | '>' -> yield Arrow (pos+2)
@@ -437,22 +491,45 @@ module Parsing = struct
       ()
     in
 
-    let expr_atom pos k =
+    let rec atomic_expr pos k =
       tokenize pos (fun token pos ->
-          match token with
-          | Int i -> k token pos)
-    in
-
-    let expr_compound pos k =
-      expr_atom pos (fun token pos ->
           match token with
           | Int value -> k (Expr.(Bare (Number {
               value;
               exp = 0;
               unit = None
-            }))) pos)
+            }))) pos
+
+          | LeftCurly ->
+            let rec aux acc pos =
+              tokenize pos (fun token pos ->
+                  match token with
+                  | Field name ->
+                    tokenize pos (fun token pos ->
+                        match token with
+                        | Equal ->
+                          compound_expr pos (fun expr pos ->
+                              let acc = Env.Binding {name; value = expr; env = acc} in
+                              aux acc pos))
+                  | Comma -> aux acc pos
+                  | RightCurly -> k (Expr.Bare (Record acc)) pos
+                  | _ -> Error (`UnexpectedToken (token, pos)))
+            in
+            aux Env.Empty pos
+
+          | token -> Error (`UnexpectedToken (token, pos)))
+
+    and compound_expr pos k =
+      atomic_expr pos (fun inner outer_pos ->
+          tokenize outer_pos (fun token inner_pos ->
+              match token with
+              | Field name -> 
+                k (Expr.Bare (Field (inner, name))) inner_pos
+              | _ -> k inner outer_pos))
     in
-    expr_compound 0 (fun token pos -> token)
+
+    compound_expr 0 (fun expr pos ->
+        Ok expr)
 
   let read_file fname =
     let ch = open_in fname in
@@ -481,8 +558,19 @@ end = struct
   module Frame = Hashtbl.Make(Symbol)
   type position = Return | Block
 
-  let show = function
+  let rec show = function
     | Number {value; exp; unit} -> string_of_int value
+    | Record fields ->
+      let buf = Buffer.create 16 in
+      Buffer.add_char buf '{';
+      Env.iteri
+        (fun name value i ->
+           if i <> 0 then
+             Buffer.add_string buf ", ";
+           Printf.bprintf buf "%s = %s" (Symbol.to_string name) (show value))
+        fields;
+      Buffer.add_char buf '}';
+      Buffer.contents buf
 
   let eval env node =
     let frame = Frame.create 16 in
@@ -491,6 +579,15 @@ end = struct
     let rec aux env node ~frame ~position k =
       match (node : Type.typed_expr).expr with
       | Expr.Number {value; exp; unit} -> k (Number {value; exp; unit})
+      | Expr.Record fields ->
+        let rec field_aux acc = function
+          | Env.Empty -> k (Record acc)
+          | Env.Binding {name; value; env = rec_env} ->
+            aux env value ~frame ~position:Block (fun field_val ->
+                let acc = Env.Binding {name; value=field_val; env=acc} in
+                field_aux acc rec_env)
+        in
+        field_aux Env.Empty fields
       | _ -> Error ()
     in
     aux env node ~frame ~position (fun res -> Ok res)
@@ -528,14 +625,21 @@ let main () =
   | `RunTests -> Test.run_tests (); 38
 
   | `Prog code -> begin
-      let ast = Parsing.parse code in
-      let typed = Type.infer Env.Empty ast in
-      Printf.printf "type: %s\n" (Type.show typed.ty);
-      match Runtime.eval Empty typed with
-      | Error () -> print_endline "runtime error"; 1
-      | Ok value ->
-        Printf.printf "result: %s\n" (Runtime.show value);
-        0
+      match Parsing.parse code with
+      | Error (`UnexpectedToken (token, pos)) ->
+        let (line, col) = Parsing.line_and_col_of_pos code pos in
+        Printf.printf
+          "Unexpected token %s at line %i, column %i\n"
+          (Parsing.string_of_token token) line col;
+        1
+      | Ok ast ->
+        let typed = Type.infer Env.Empty ast in
+        Printf.printf "type: %s\n" (Type.show typed.ty);
+        match Runtime.eval Empty typed with
+        | Error () -> print_endline "runtime error"; 1
+        | Ok value ->
+          Printf.printf "result: %s\n" (Runtime.show value);
+          0
     end
 
   | `PrintHelp ->

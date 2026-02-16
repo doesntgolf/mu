@@ -15,6 +15,8 @@ let num = {
 	; `$name` syntax is for builtins, only available to the prelude
 	.add(a, b) = $add(a, b),
 	.mul(a, b) = $mul(a, b)
+
+	;; IDEA: parse(str, base, denom)
 }
 in
 
