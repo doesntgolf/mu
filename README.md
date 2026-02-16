@@ -32,18 +32,21 @@ that bytecode. At some point, I also intend to write a specification for the lan
 Mu's number type represents rational numbers, where the denominator is part of the type.
 The denominator is a monomial: it's represented by the product of a coefficient and a set
 of variables. So the literal `5` has type `Num/1a` - that is, a number with denominator
-1 multiplied by the variable `a`. The `a` is a numeric type variable, freshly allocated
-for each literal value. Its purpose is similar to a row variable in a record type:
-it makes the value flexible. A `Num/4a` can be unified with a `Num/6b` by setting `a =
-3` and `b = 2`. By contrast, a number type without any variables in the denominator is
-inflexible - an indexing operation should require a `Num/1`. In general, the unifier
-unifies denominators by finding the least common multiple of the coefficients.
+1 multiplied by the variable `a`. The decimal literal `12.3` has type `Num/10a`. The
+`a` is a numeric type variable, freshly allocated for each literal value. Its purpose
+is similar to a row variable in a record type: it makes the value flexible. A `Num/4a`
+can be unified with a `Num/6b` by setting `a = 3` and `b = 2`. By contrast, a number
+type without any variables in the denominator is inflexible - an indexing operation
+should require a `Num/1`. In general, the unifier unifies denominators by finding the
+least common multiple of the coefficients.
 
-A number without a statically known denominator is notated `Num/?`. Unifying this type
-with another number type will always result in a `Num/?`. Operations on values of this
-type will still be mathematically correct, we just won't know the resulting denominator
-until runtime. A number with a statically unknown denominator can be turned into one
-with a statically known denominator with functions like `quantize` or `floor`.
+A number without a statically known denominator is notated `Num/?`. This type can
+be unified with another `Num/?`, or with any number whose denominator has a free
+type variable in it (by setting that variable equal to `?`, the whole denominator
+becomes `?`). The types `Num/1` and `Num/?` cannot be unified. Operations on values of
+type `Num/?` will still be mathematically correct, we just won't know the resulting
+denominator until runtime. A number with a statically unknown denominator can be turned
+into one with a statically known denominator with functions like `quantize` or `floor`.
 
 Addition, subtraction, equality, and comparison demand operands with compatible
 denominators. Multiplication has type `fun(Num/a, Num/b) -> Num/a*b`, combining the
