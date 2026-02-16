@@ -67,6 +67,35 @@ a unit is simply any string raised to an exponent. Thus, you can have `3.6 meter
 you would expect across multiplication and division; addition and comparison require
 alike units.
 
+### Existential types
+
+In the HM type system, quantifiers for universal type variables aren't part of types
+themselves; instead they occur in so-called "prenex form". They're generalized at
+`let` (and at the implicit "top-level `let`"), and instantiated at variable usage
+sites. Similarly, in the Mu type system, existential quantifiers aren't types themselves,
+they're a component of function types. Existential type variables are instantiated
+by the introduction form (`exists T in <body>`), generalized at function boundaries,
+and re-instantiated at every function application.
+
+The introduction expression for existential types is `exists <T> in <body>`.  Within
+`<body>`, `<T>` is used as a constructor expression and pattern, essentially annotating
+occurrences of the abstract type-to-be. After `<body>`, a fresh existential type variable
+is allocated for the abstract type, which unifies with nothing but itself. Then,
+when inferring the type for a function, when we see an existential type variable, we check
+if it occurs in the environment of the function; if so, it remains a simple
+constant. If not, it means that variable was introduced within the function,
+and the existential quantifier for that variable thus becomes part of the function type.
+This mirrors the environment check for generalization of universal type variables at
+`let`. (And likewise, the environment check can be optimized by tracking the "level"
+or "rank" of the respective type variables - `let` depth for universal type variables,
+and function depth for existential type variables.)
+
+At every function application, the existential quantifiers associated with the
+function type are instantiated, assigning new, unique type variables for each
+quantifier. Instead of being bound to the unpack scope, as in the Mitchell-Plotkin
+formulation, the existential quantifier naturally flows outward with the occurrence
+of the associated type variable.
+
 ### Explicit iso-recursive types, corresponding with lazy evaluation
 
 In the type system literature for iso-recursive types, explicit `roll e` and `unroll
@@ -98,50 +127,13 @@ recursive structure.
 Mu is strictly evaluated, but we also have opt-in laziness, serendipitously corresponding
 with recursive types. A `&e` expression becomes a lazy thunk. Pattern matching on a
 lazy thunk with `&p` forces it. Notably, an iso-recursive type need not be actually
-recursive, so you can put this to use for lazy evaluation wherever you want it. (This
-also comes in handy for existential types; see below.)
+recursive, so you can put this to use for lazy evaluation wherever you want it.
 
-#### No recursive bindings
-
-Mu has purely lexical scope, with no recursive bindings. Thanks to iso-recursive types,
-we can type the Z-combinator, which we've placed in the prelude. With that, we
-derive a function called `recur` (based loosely on Clojure's `loop/recur` form), also
-in the prelude. `recur` is meant to be the primary way to do recursion in the language.
-
-### Existential types
-
-In the HM type system, quantifiers for universal type variables aren't part of types
-themselves; instead they occur in so-called "prenex form". They're generalized at
-`let` (and at the implicit "top-level `let`"), and instantiated at variable usage
-sites. Similarly, in the Mu type system, existential quantifiers aren't types themselves,
-they're a component of function types. Existential type variables (aka "skolem"
-type variables) are instantiated by the introduction form (`exists T in <body>`),
-generalized at function boundaries, and re-instantiated at every function application.
-
-The introduction expression for existential types is `exists <T> in <body>`.  Within
-`<body>`, `<T>` is used as a constructor expression and pattern, essentially annotating
-occurrences of the abstract type-to-be. After `<body>`, a fresh skolem type variable
-is allocated for the abstract type, which unifies with nothing but itself. Then,
-when inferring the type for a function, when we see a skolem type variable, we check
-if it occurs in the environment of the function; if so, it remains a simple skolem
-constant. If not, it means that skolem variable was introduced within the function,
-and the existential quantifier for that variable thus becomes part of the function type.
-This mirrors the environment check for generalization of universal type variables at
-`let`. (And likewise, the environment check can be optimized by tracking the "level"
-or "rank" of the respective type variables - `let` depth for universal type variables,
-and function depth for existential type variables.)
-
-At every function application, the existential quantifiers associated with the
-function type are instantiated, assigning new, unique skolem type variables for each
-quantifier. Instead of being bound to the unpack scope, as in the Mitchell-Plotkin
-formulation, the existential quantifier naturally flows outward with the occurrence
-of the associated type variable.
-
-Functions aren't the only place where evaluation is delayed - roll expressions for
-recursive types are also delayed. Thus, existential type variables are also generalized
-in roll expressions (`&e`) and instantiated in unroll patterns, and recursive types
-also carry existential quantifiers. This provides a straightforward way to make two
-packages with different existential types compatible with each other:
+Because roll expressions - like functions - are delayed, existential types are
+generalized by rolls and instantiated by unrolls, just like function abstraction and
+application. Thus, recursive types also carry existential type quantifiers. This also
+provides a straightforward way to make two packages with different existential types
+compatible with each other:
 
 ```
 let &pack = if cond then
@@ -156,11 +148,19 @@ else
 	}
 ```
 
-Without delaying the evaluation of the `exists` expressions, new skolem variables would
-be immediately allocated, and in typechecking the branches we would find the two skolem
-types to be incompatible with each other. But by capturing the existential quantifier in a
-delayed recursive type, the two generalized types can be unified, and we can immediately
-unroll them on the outside, via the unroll pattern in `let &pack`.
+Without delaying the evaluation of the `exists` expressions, new existential type
+variables would be immediately allocated, and in typechecking the branches we would
+find two existential types that are incompatible with each other. But by capturing the
+existential quantifier in a delayed recursive type, the two generalized types can be
+unified, and we can immediately unroll them on the outside, via the unroll pattern in
+`let &pack`.
+
+#### No recursive bindings
+
+Mu has purely lexical scope, with no recursive bindings. Thanks to iso-recursive types,
+we can type the Z-combinator, which we've placed in the prelude. With that, we
+derive a function called `recur` (based loosely on Clojure's `loop/recur` form), also
+in the prelude. `recur` is meant to be the primary way to do recursion in the language.
 
 ### Pattern matching sub-clauses
 
@@ -203,3 +203,18 @@ Functions are applied with the Algol-form (`f(a, b, c)`), rather than the currie
 (`f a b c`). The primary motivation for this design is so that row-polymorphism can
 be applied to function parameters, making more functions type-compatible with each
 other.
+
+### Forall notation
+
+Although quantifiers for univeral type variables (`forall a. ...`) are always in prenex
+form (outside the type itself, in a "type scheme"), in the type notation we always
+display the quantifier at the smallest region that contains all of the variable's
+occurrences. And for universal variables with one occurrence, we notate it as `*`,
+without a quantifier. The reason for this is that, because we lack the module system
+that many ML-family languages have, we use records to bundle common functionality into a
+package. And if that package operates on generic data structures, the type of each item
+in the package may end up accruing one or more universal type variables. When we view
+the type of that package as a whole, it may end up looking like `forall a b c d. {.x
+: a, .f : b -> b, .g : c -> d -> {c, d}}`, which is arguably not user-friendly. So
+instead, with the regional quantifier notation, that type is written `{.x : *, .f :
+forall a. a -> a, .g : forall a b. a -> b -> {a, b}}`.
