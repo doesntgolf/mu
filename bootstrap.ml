@@ -105,12 +105,14 @@ module Pat = struct
         exp : int;
         units : Num.units
       }
-    | Record of ('pat, 'sym) t Env.t
-    | Variant of 'sym * ('pat, 'sym) t Env.t
-    | Constructor of 'sym * ('pat, 'sym) t
-    | Roll of ('pat, 'sym) t
-    | Pin of ('pat, 'sym) t
-    | Or of ('pat, 'sym) t * ('pat, 'sym) t
+    | Record of 'pat Env.t
+    | Variant of 'sym * 'pat Env.t
+    | Constructor of 'sym * 'pat
+    | Roll of 'pat
+    | Pin of 'pat
+    | Or of 'pat * 'pat
+
+  type untyped = Bare of (untyped, Symbol.t) t
 end
 
 module Expr = struct
@@ -123,9 +125,8 @@ module Expr = struct
     | NumEq
     | NumCmp
 
-  (* The general pattern of this type (and Pat.t) is described at
-     	https://blog.ezyang.com/2013/05/the-ast-typing-problem/ as 
-     	"two level types". *)
+  (* The general pattern of this type (and Pat.t) is described at 
+     https://blog.ezyang.com/2013/05/the-ast-typing-problem/ as "two level types". *)
   type ('expr, 'pat, 'sym) t =
       Number of {
         value : int;
@@ -133,47 +134,48 @@ module Expr = struct
         unit : ('sym * int) option
       }
 
-    | Record of ('expr, 'pat, 'sym) t Env.t
-    | Field of ('expr, 'pat, 'sym) t * 'sym
+    | Record of 'expr Env.t
+    | Field of 'expr * 'sym
 
-    | Variant of 'sym * ('expr, 'pat, 'sym) t Env.t
+    | Variant of 'sym * 'expr Env.t
     | Match of ('expr, 'pat, 'sym) match_expr
 
     | Function of {
-        param : ('pat, 'sym) Pat.t Env.t;
-        body : ('expr, 'pat, 'sym) t
+        param : 'pat Env.t;
+        body : 'expr
       }
     | Apply of {
-        f : ('expr, 'pat, 'sym) t;
-        args : ('expr, 'pat, 'sym) t Env.t
+        f : 'expr;
+        args : 'expr Env.t
       }
     | Builtin of {
         f : builtin;
-        args : ('expr, 'pat, 'sym) t Env.t
+        args : 'expr Env.t
       }
 
     | Var of 'sym
     | Let of {
-        pat : ('pat, 'sym) Pat.t;
-        defn : ('expr, 'pat, 'sym) t;
-        body : ('expr, 'pat, 'sym) t
+        pat : 'pat;
+        defn : 'expr;
+        body : 'expr
       }
 
-    | Exists of 'sym * ('expr, 'pat, 'sym) t
-    | Constructor of 'sym * ('expr, 'pat, 'sym) t
+    | Exists of 'sym * 'expr
+    | Constructor of 'sym * 'expr
 
-    | Roll of ('expr, 'pat, 'sym) t
-    | Pin of ('expr, 'pat, 'sym) t
+    | Roll of 'expr
+    | Pin of 'expr
 
   and ('expr, 'pat, 'sym) match_expr = {
     scrutinee : 'expr;
-    clauses : (('pat, 'sym) Pat.t * ('expr, 'pat, 'sym) match_branch) list
+    clauses : ('pat * ('expr, 'pat, 'sym) match_branch) list
   }
 
   and ('expr, 'pat, 'sym) match_branch =
-      Branch of ('expr, 'pat, 'sym) t
+      Branch of 'expr
     | SubClause of ('expr, 'pat, 'sym) match_expr
 
+  type untyped = Bare of (untyped, Pat.untyped, Symbol.t) t
 end
 
 module Type = struct
@@ -200,10 +202,8 @@ module Type = struct
     pat : (typed_pat, Symbol.t) Pat.t;
     ty : t
   }
-
   type typed_expr = {
     expr : (typed_expr, typed_pat, Symbol.t) Expr.t;
-    env : typed_expr Env.t;
     ty : t
   }
 
@@ -222,28 +222,28 @@ module Type = struct
 
   let instantiate (Forall (v, ty)) = ty
 
-  let infer_pat env pat =
+  let infer_pat env (Pat.Bare pat) =
     let rec aux env = function
       | Pat.Number _ -> env
     in
     aux env pat
 
-  let int value env = {
-    expr = Expr.Number {value; exp = 0; unit = None};
-    env;
-    ty = Number {
-        numer = Int value;
-        denom = Known {coeff = 1; vars = []};
-        units = []
-      }
-  }
-
   let infer env expr =
     let let_level = ref 0 in
-    let fun_level = ref 0 in
+    let fun_level = ref 0 in (* fun_level of bootstrapping a language: over 9000 *)
+    let roll_level = ref 0 in
 
-    let rec aux env ~expected expr =
+    let rec aux env ~expected (Expr.Bare expr) =
       match expr with
+      | Expr.Number {value; exp; unit} -> {
+          expr = Expr.Number {value; exp; unit};
+          ty = Number {
+              numer = Int value;
+              denom = Known {coeff = 1; vars = []};
+              units = []
+            }
+        }
+      (* 
       | Expr.Record fields ->
         let fields = Env.map (aux env ~expected) fields in
         Record fields
@@ -271,6 +271,7 @@ module Type = struct
         match Env.lookup var env with
         | Some scheme -> instantiate scheme
         | None -> Error "var not found"
+        *)
     in
     aux env ~expected:(Record Empty) expr
 end
@@ -445,7 +446,11 @@ module Parsing = struct
     let expr_compound pos k =
       expr_atom pos (fun token pos ->
           match token with
-          | Int i -> k (Type.int i Empty) pos)
+          | Int value -> k (Expr.(Bare (Number {
+              value;
+              exp = 0;
+              unit = None
+            }))) pos)
     in
     expr_compound 0 (fun token pos -> token)
 
@@ -524,8 +529,9 @@ let main () =
 
   | `Prog code -> begin
       let ast = Parsing.parse code in
-      Printf.printf "type: %s\n" (Type.show ast.ty);
-      match Runtime.eval Empty ast with
+      let typed = Type.infer Env.Empty ast in
+      Printf.printf "type: %s\n" (Type.show typed.ty);
+      match Runtime.eval Empty typed with
       | Error () -> print_endline "runtime error"; 1
       | Ok value ->
         Printf.printf "result: %s\n" (Runtime.show value);
