@@ -69,21 +69,27 @@ end
 
 module Num : sig
   type atom = Int of int | Var of int | Unknown
+  type monomial =
+      Known of {coeff : int; vars : Symbol.t list}
+    | Uknown
   type units = (Symbol.t * int) list
   type t = {
     numer : atom;
-    denom : atom list;
+    denom : monomial;
     units : units
   }
 
   val unify : t -> t -> unit
 end = struct
   type atom = Int of int | Var of int | Unknown
+  type monomial =
+      Known of {coeff : int; vars : Symbol.t list}
+    | Uknown
   type units = (Symbol.t * int) list
 
   type t = {
     numer : atom;
-    denom : atom list;
+    denom : monomial;
     units : units;
   }
 
@@ -124,7 +130,7 @@ module Expr = struct
       Number of {
         value : int;
         exp : int; (* value * 10^-exp *)
-        unit : 'sym * int
+        unit : ('sym * int) option
       }
 
     | Record of ('expr, 'pat, 'sym) t Env.t
@@ -197,8 +203,16 @@ module Type = struct
 
   type typed_expr = {
     expr : (typed_expr, typed_pat, Symbol.t) Expr.t;
+    env : typed_expr Env.t;
     ty : t
   }
+
+  let show = function
+    | Number {
+        numer = Int i;
+        denom = Known {coeff; vars};
+        units
+      } -> Printf.sprintf "Num %i/%i" i coeff
 
   let occurs a b = ()
 
@@ -213,6 +227,16 @@ module Type = struct
       | Pat.Number _ -> env
     in
     aux env pat
+
+  let int value env = {
+    expr = Expr.Number {value; exp = 0; unit = None};
+    env;
+    ty = Number {
+        numer = Int value;
+        denom = Known {coeff = 1; vars = []};
+        units = []
+      }
+  }
 
   let infer env expr =
     let let_level = ref 0 in
@@ -305,9 +329,9 @@ module Parsing = struct
     (* TODO parse decimal, unit, scientific notation *)
     let rec number pos yield =
       let rec aux acc pos =
-        let acc = acc * 10 in
         match input.[pos] with
         | '0'..'9' as c ->
+          let acc = acc * 10 in
           let i = int_of_char c - 48 in
           aux (acc + i) (pos + 1)
 
@@ -415,12 +439,13 @@ module Parsing = struct
     let expr_atom pos k =
       tokenize pos (fun token pos ->
           match token with
-          | Int i -> ())
+          | Int i -> k token pos)
     in
 
     let expr_compound pos k =
-      expr_atom pos (fun expr pos ->
-          ())
+      expr_atom pos (fun token pos ->
+          match token with
+          | Int i -> k (Type.int i Empty) pos)
     in
     expr_compound 0 (fun token pos -> token)
 
@@ -432,17 +457,16 @@ module Parsing = struct
 end
 
 module Runtime : sig
-  type value =
-      Int of int
-    | Record of value Env.t
-    | Variant of {
-        tag : Symbol.t;
-        payload : value Env.t
-      }
+  type value
+  val show : value -> string
   val eval : value Env.t -> Type.typed_expr -> (value, unit) result
 end = struct
   type value =
-      Int of int
+      Number of {
+        value : int;
+        exp : int;
+        unit : (Symbol.t * int) option
+      }
     | Record of value Env.t
     | Variant of {
         tag : Symbol.t;
@@ -452,12 +476,19 @@ end = struct
   module Frame = Hashtbl.Make(Symbol)
   type position = Return | Block
 
-  let eval env expr =
-    let rec aux env expr position k =
-      let frame = Frame.create 16 in
-      Error ()
+  let show = function
+    | Number {value; exp; unit} -> string_of_int value
+
+  let eval env node =
+    let frame = Frame.create 16 in
+    let position = Return in
+
+    let rec aux env node ~frame ~position k =
+      match (node : Type.typed_expr).expr with
+      | Expr.Number {value; exp; unit} -> k (Number {value; exp; unit})
+      | _ -> Error ()
     in
-    aux env expr Return (fun res -> res)
+    aux env node ~frame ~position (fun res -> Ok res)
 end
 
 module Test = struct
@@ -467,12 +498,49 @@ module Test = struct
     (* let result = eval expr in
        expect result = value *)
     ()
+
+  let run_tests () =
+    print_endline "TODO: run tests"
 end
 
 let main () =
-  (* 1. parse and typecheck prelude. *)
-  Out_channel.(output_string stderr "TODO\n");
-  38
+  let cmd =
+    if Array.length Sys.argv < 2 then
+      `PrintHelp
+    else
+      match Sys.argv.(1) with
+      | "-h"
+      | "--help" -> `PrintHelp
+      | "-t"
+      | "--test" -> `RunTests
+      | "-"
+      | "--" ->`Prog In_channel.(input_all stdin)
+      | "-e"
+      | "--eval" -> `Prog Sys.argv.(2)
+      | fname -> `Prog (Parsing.read_file fname)
+  in
+  match cmd with
+  | `RunTests -> Test.run_tests (); 38
+
+  | `Prog code -> begin
+      let ast = Parsing.parse code in
+      Printf.printf "type: %s\n" (Type.show ast.ty);
+      match Runtime.eval Empty ast with
+      | Error () -> print_endline "runtime error"; 1
+      | Ok value ->
+        Printf.printf "result: %s\n" (Runtime.show value);
+        0
+    end
+
+  | `PrintHelp ->
+    Printf.printf {|usage: %s [option]
+  -h or --help		Print this help text.
+  -t or --test		Perform bootstrap tests.
+  -e or --eval 'code'	Parse, typecheck, and evaluate 'code'.
+  - or --		Parse, typecheck, and evaluate code from stdin.
+  'filename'		Parse, typecheck, and evaluate code from file 'filename'
+|} Sys.argv.(0);
+    0
 
 let () =
   if not !Sys.interactive then
