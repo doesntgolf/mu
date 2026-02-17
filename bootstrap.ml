@@ -75,27 +75,27 @@ module Env = struct
 end
 
 module Num : sig
-  type atom = Int of int | Var of int | Unknown
+  type numer = Int of int | Var of int | Unknown
   type monomial =
       Known of {coeff : int; vars : Symbol.t list}
     | Uknown
   type units = (Symbol.t * int) list
   type t = {
-    numer : atom;
+    numer : numer;
     denom : monomial;
     units : units
   }
 
   val unify : t -> t -> unit
 end = struct
-  type atom = Int of int | Var of int | Unknown
+  type numer = Int of int | Var of int | Unknown
   type monomial =
       Known of {coeff : int; vars : Symbol.t list}
     | Uknown
   type units = (Symbol.t * int) list
 
   type t = {
-    numer : atom;
+    numer : numer;
     denom : monomial;
     units : units;
   }
@@ -200,15 +200,16 @@ module Type = struct
         binder : Symbol.t;
         body : t
       }
-    | Universal of universal ref
-    | Existential of {
+
+    | PolyVar of polyvar ref
+    | RigidVar of {
         id : int;
         mutable fun_level : int
       }
-    (* | Array of t * int option * int option list *)
+
     | Error of string
 
-  and universal =
+  and polyvar =
       Unbound of {
         id : int;
         mutable let_level : int
@@ -239,22 +240,63 @@ module Type = struct
         (fun name ty i ->
            if i <> 0 then
              Buffer.add_string buf ", ";
-           Printf.bprintf buf "%s = %s" (Symbol.to_string name) (show ty))
+           Printf.bprintf buf ".%s = %s" (Symbol.to_string name) (show ty))
         fields;
       Buffer.add_char buf '}';
       Buffer.contents buf
 
-    | Universal _ -> Printf.sprintf "*"
+    | PolyVar {contents = Unbound {id; _}} -> Printf.sprintf "`%i" id
+    | PolyVar {contents = Forwarded ty} -> show ty
 
-  let occurs a b = ()
+  let rec occurs polyvar ty =
+    match ty with
+    | PolyVar var when polyvar == var -> failwith "occurs check"
+    | PolyVar ({contents = Unbound ({id; let_level} as unbound)}) ->
+      let min_level =
+        match !polyvar with
+        | Unbound {let_level = let_level'} -> Int.min let_level let_level'
+        | _ -> let_level
+      in
+      unbound.let_level <- min_level
+    | PolyVar {contents = Forwarded ty} -> occurs polyvar ty
 
-  let unify a b =
+    (* TODO: traverse other kinds *)
+
+    | _ -> ()
+
+  let rec unify a b =
     if a == b then Ok ()
     else match a, b with
-      | Universal _, a
-      | a, Universal _ -> Ok ()
+      | PolyVar {contents = Forwarded t1}, t2
+      | t1, PolyVar {contents = Forwarded t2} ->
+        unify t1 t2
 
-      | _, _ -> Ok ()
+      | PolyVar ({contents = Unbound _} as polyvar), t 
+      | t, PolyVar ({contents = Unbound _} as polyvar) ->
+        occurs polyvar t;
+        polyvar := Forwarded t;
+        Ok ()
+
+      | Record a_fields, Record b_fields ->
+        (* NOTE: incomplete *)
+        let rec aux a_fields =
+          match a_fields with
+          | Env.Binding {name; value = a_field; env = a_fields} ->
+            begin match Env.lookup name b_fields with
+              | None -> Result.Error ()
+              | Some b_field ->
+                let _ = unify a_field b_field in
+                aux a_fields
+            end
+          | Env.Empty -> Ok ()
+        in
+        aux a_fields
+
+      (* TODO traverse other kinds *)
+
+      | _, _ ->
+        Printf.printf "Error unifying %s and %s\n" (show a) (show b);
+        Error ()
 
   let generalize ty = Forall ("", ty)
 
@@ -282,14 +324,14 @@ module Type = struct
       fun () ->
         let id = !n in
         incr n;
-        Universal (ref (Unbound {id; let_level = !let_level}))
+        PolyVar (ref (Unbound {id; let_level = !let_level}))
     in
     let new_existential =
       let n = ref 0 in
       fun () ->
         let id = !n in
         incr n;
-        Existential {id; fun_level = !fun_level}
+        RigidVar {id; fun_level = !fun_level}
     in
 
     let rec aux env ~expected (Expr.Bare expr) =
@@ -305,7 +347,10 @@ module Type = struct
         {expr = Expr.Number {value; exp; unit}; ty}
 
       | Expr.Record fields ->
-        let fields = Env.map (aux env ~expected) fields in
+        let fields = Env.map
+            (fun field -> aux env ~expected:(new_universal ()) field)
+            fields
+        in
         let ty = Record (Env.map (fun field -> field.ty) fields) in
         let _ = unify expected ty in
         {expr = Expr.Record fields; ty}

@@ -14,9 +14,10 @@ Starting from a Hindley-Milner type system with let-polymorphism, we add:
  - (TODO) N-dimensional arrays
  - (TODO) `do` notation
 
-**Design status:** Other than arrays, the main design for the type system and language
-semantics that I'd like is in place. Inconsistencies and necessary additions will
-probably still be uncovered during implementation. The syntax is still mostly undesigned.
+**Design status:** Other than arrays and do-notation, the main design for the type
+system and language semantics that I'd like is in place. Inconsistencies and necessary
+additions will probably still be uncovered during implementation. The syntax is still
+mostly undesigned.
 
 **Implementation status:** I'm implementing the bootstrapping type checker and
 tree-walk interpreter in OCaml. It's still in the beginning stages, not yet usable for
