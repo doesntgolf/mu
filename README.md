@@ -12,7 +12,7 @@ Starting from a Hindley-Milner type system with let-polymorphism, we add:
  - a denominator-polymorphic number type, with units of measure
  - pattern matching with sub-clauses
  - (TODO) N-dimensional arrays
- - (TODO) `do` notation? or backpassing syntax?
+ - (TODO) `do` notation
 
 **Design status:** Other than arrays, the main design for the type system and language
 semantics that I'd like is in place. Inconsistencies and necessary additions will
@@ -206,15 +206,15 @@ other.
 
 ### Forall notation
 
-Although quantifiers for univeral type variables (`forall a. ...`) are always in prenex
-form (outside the type itself, in a "type scheme"), in the type notation we always
-display the quantifier at the smallest region that contains all of the variable's
-occurrences. And for universal variables with one occurrence, we notate it as `*`,
-without a quantifier. The reason for this is that, because we lack the module system
-that many ML-family languages have, we use records to bundle common functionality into a
-package. And if that package operates on generic data structures, the type of each item
-in the package may end up accruing one or more universal type variables. When we view
-the type of that package as a whole, it may end up looking like `forall a b c d. {.x
-: a, .f : b -> b, .g : c -> d -> {c, d}}`, which is arguably not user-friendly. So
-instead, with the regional quantifier notation, that type is written `{.x : *, .f :
-forall a. a -> a, .g : forall a b. a -> b -> {a, b}}`.
+Mu has rank-1 polymorphism, where quantifiers for universal type variables (`forall
+a. ...`) are outside the type itself, in a "type scheme". Despite this, in the type
+notation we always display the quantifier at the smallest region that contains all of
+the variable's occurrences, rather than on the outside. And for universal variables
+with one occurrence, we notate it without a quantifier, as `*`. The reason for this
+is that, because we lack the module system that many ML-family languages have, we use
+records to bundle common functionality into a package. And if that package operates on
+generic data structures, the type of each item in the package may end up accruing one
+or more universal type variables. When we view the type of that package as a whole, it
+may end up looking like `forall a b c d. {.x : a, .f : b -> b, .g : c -> d -> {c, d}}`,
+which is arguably not user-friendly. So instead, with the regional quantifier notation,
+that type is written `{.x : *, .f : forall a. a -> a, .g : forall a b. a -> b -> {a, b}}`.

@@ -200,8 +200,20 @@ module Type = struct
         binder : Symbol.t;
         body : t
       }
+    | Universal of universal ref
+    | Existential of {
+        id : int;
+        mutable fun_level : int
+      }
     (* | Array of t * int option * int option list *)
     | Error of string
+
+  and universal =
+      Unbound of {
+        id : int;
+        mutable let_level : int
+      }
+    | Forwarded of t
 
   type scheme = Forall of string * t
 
@@ -232,9 +244,17 @@ module Type = struct
       Buffer.add_char buf '}';
       Buffer.contents buf
 
+    | Universal _ -> Printf.sprintf "*"
+
   let occurs a b = ()
 
-  let unify a b = ()
+  let unify a b =
+    if a == b then Ok ()
+    else match a, b with
+      | Universal _, a
+      | a, Universal _ -> Ok ()
+
+      | _, _ -> Ok ()
 
   let generalize ty = Forall ("", ty)
 
@@ -246,34 +266,56 @@ module Type = struct
     in
     aux env pat
 
+  (***
+   * The inference algorithm:
+   *  - Algorithm J-style, using refs for type vars rather than a Map
+   *  - Algorithm M-style, passing down an expected type, rather than bottom-up W-style
+   *  - Attaches levels to type vars for generalization rather than scanning the environment
+   **)
   let infer env expr =
     let let_level = ref 0 in
     let fun_level = ref 0 in (* fun_level of bootstrapping a language: over 9000 *)
     let roll_level = ref 0 in
 
+    let new_universal =
+      let n = ref 0 in
+      fun () ->
+        let id = !n in
+        incr n;
+        Universal (ref (Unbound {id; let_level = !let_level}))
+    in
+    let new_existential =
+      let n = ref 0 in
+      fun () ->
+        let id = !n in
+        incr n;
+        Existential {id; fun_level = !fun_level}
+    in
+
     let rec aux env ~expected (Expr.Bare expr) =
       match expr with
-      | Expr.Number {value; exp; unit} -> {
-          expr = Expr.Number {value; exp; unit};
-          ty = Number {
-              numer = Int value;
-              denom = Known {coeff = 1; vars = []};
-              units = []
-            }
-        }
+      | Expr.Number {value; exp; unit} -> 
+        let ty = Number {
+            numer = Int value;
+            denom = Known {coeff = 1; vars = []};
+            units = []
+          }
+        in
+        let _ = unify expected ty in
+        {expr = Expr.Number {value; exp; unit}; ty}
 
       | Expr.Record fields ->
-        let fields = Env.map (aux env ~expected) fields in {
-          expr = Expr.Record fields;
-          ty = Record (Env.map (fun field -> field.ty) fields)
-        }
+        let fields = Env.map (aux env ~expected) fields in
+        let ty = Record (Env.map (fun field -> field.ty) fields) in
+        let _ = unify expected ty in
+        {expr = Expr.Record fields; ty}
+
+      | Expr.Field (expr, name) ->
+        let rec_expected = Record (Env.Binding {name; value = expected; env = Env.Empty}) in
+        let rec_expr = aux env ~expected:rec_expected expr in
+        {expr = Expr.Field (rec_expr, name); ty = expected}
 
 (*
-      | Expr.Field (expr, name) ->
-        let expr_type = aux env ~expected expr in
-        let fields = Env.(Binding {name; value = expr_type; env = Empty}) in
-        Record fields
-
       | Expr.Variant (tag, payload) ->
         Variant (Binding {
             name = tag;
@@ -294,7 +336,7 @@ module Type = struct
         | None -> Error "var not found"
         *)
     in
-    aux env ~expected:(Record Empty) expr
+    aux env ~expected:(new_universal ()) expr
 end
 
 module Parsing = struct
@@ -508,7 +550,7 @@ module Parsing = struct
                     tokenize pos (fun token pos ->
                         match token with
                         | Equal ->
-                          compound_expr pos (fun expr pos ->
+                          whole_expr pos (fun expr pos ->
                               let acc = Env.Binding {name; value = expr; env = acc} in
                               aux acc pos))
                   | Comma -> aux acc pos
@@ -519,16 +561,20 @@ module Parsing = struct
 
           | token -> Error (`UnexpectedToken (token, pos)))
 
-    and compound_expr pos k =
+    and compound_expr inner pos k =
+      tokenize pos (fun token next_pos ->
+          match token with
+          | Field name ->
+            let expr = Expr.Bare (Field (inner, name)) in
+            compound_expr expr next_pos k
+          | _ -> k inner pos)
+
+    and whole_expr pos k =
       atomic_expr pos (fun inner outer_pos ->
-          tokenize outer_pos (fun token inner_pos ->
-              match token with
-              | Field name -> 
-                k (Expr.Bare (Field (inner, name))) inner_pos
-              | _ -> k inner outer_pos))
+          compound_expr inner outer_pos k)
     in
 
-    compound_expr 0 (fun expr pos ->
+    whole_expr 0 (fun expr pos ->
         Ok expr)
 
   let read_file fname =
@@ -541,7 +587,7 @@ end
 module Runtime : sig
   type value
   val show : value -> string
-  val eval : value Env.t -> Type.typed_expr -> (value, unit) result
+  val eval : value Env.t -> Type.typed_expr -> (value, string) result
 end = struct
   type value =
       Number of {
@@ -576,19 +622,30 @@ end = struct
     let frame = Frame.create 16 in
     let position = Return in
 
-    let rec aux env node ~frame ~position k =
-      match (node : Type.typed_expr).expr with
-      | Expr.Number {value; exp; unit} -> k (Number {value; exp; unit})
-      | Expr.Record fields ->
-        let rec field_aux acc = function
-          | Env.Empty -> k (Record acc)
-          | Env.Binding {name; value; env = rec_env} ->
-            aux env value ~frame ~position:Block (fun field_val ->
-                let acc = Env.Binding {name; value=field_val; env=acc} in
-                field_aux acc rec_env)
-        in
-        field_aux Env.Empty fields
-      | _ -> Error ()
+    let rec aux env (node : Type.typed_expr) ~frame ~position k =
+      match node.ty with
+      | Error str -> Error (Printf.sprintf "Type error: %s" str)
+      | _ ->
+        match node.expr with
+        | Expr.Number {value; exp; unit} -> k (Number {value; exp; unit})
+
+        | Expr.Record fields ->
+          let rec field_aux acc = function
+            | Env.Empty -> k (Record acc)
+            | Env.Binding {name; value; env = rec_env} ->
+              aux env value ~frame ~position:Block (fun field_val ->
+                  let acc = Env.Binding {name; value=field_val; env=acc} in
+                  field_aux acc rec_env)
+          in
+          field_aux Env.Empty fields
+
+        | Expr.Field (record, name) ->
+          aux env record ~frame ~position:Block (fun (Record fields) ->
+              match Env.lookup name fields with
+              | Some value -> k value
+              | None -> Error (Printf.sprintf "Field error: %s" (Symbol.to_string name)))
+
+        | _ -> Error ("unimplemented eval for expression")
     in
     aux env node ~frame ~position (fun res -> Ok res)
 end
@@ -635,8 +692,8 @@ let main () =
       | Ok ast ->
         let typed = Type.infer Env.Empty ast in
         Printf.printf "type: %s\n" (Type.show typed.ty);
-        match Runtime.eval Empty typed with
-        | Error () -> print_endline "runtime error"; 1
+        match Runtime.eval Env.Empty typed with
+        | Error s -> print_endline s; 1
         | Ok value ->
           Printf.printf "result: %s\n" (Runtime.show value);
           0
