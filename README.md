@@ -11,7 +11,7 @@ Starting from a Hindley-Milner type system with let-polymorphism, we add:
  - iso-recursive types
  - a denominator-polymorphic number type, with units of measure
  - pattern matching with sub-clauses
- - (TODO) N-dimensional arrays
+ - (TODO) arrays
  - (TODO) `do` notation
 
 **Design status:** Other than arrays and do-notation, the main design for the type
@@ -130,31 +130,32 @@ with recursive types. A `&e` expression becomes a lazy thunk. Pattern matching o
 lazy thunk with `&p` forces it. Notably, an iso-recursive type need not be actually
 recursive, so you can put this to use for lazy evaluation wherever you want it.
 
-Because roll expressions - like functions - are delayed, existential types are
-generalized by rolls and instantiated by unrolls, just like function abstraction and
-application. Thus, recursive types also carry existential type quantifiers. This also
-provides a straightforward way to make two packages with different existential types
-compatible with each other:
+Recursive types are also useful for existentials. Because roll expressions - like
+functions - are delayed, existential types are generalized by rolls and instantiated
+by unrolls, just like function abstraction and application. Recursive types therefore
+also carry existential type quantifiers. This provides a straightforward way to make
+two packages with different existential types compatible with each other:
 
 ```
-let &pack = if cond then
-	&exists T in {
-		.x = T(5),
-		.f = fun(T(x)) -> x
+let &shape = if cond then
+	exists T in &{
+		.data = T({.radius = 2.0}),
+		.area = fun(T(circ)) -> pi * circ.radius * circ.radius
 	}
 else
-	&exists T in {
-		.x = T("nice"),
-		.f = fun(T(s)) -> string.length(s)
+	exists T in &{
+		.data = T({width = 1.8, height = 1.2}),
+		.area = fun(T(rect)) -> rect.width * rect.height
 	}
 ```
 
-Without delaying the evaluation of the `exists` expressions, new existential type
-variables would be immediately allocated, and in typechecking the branches we would
-find two existential types that are incompatible with each other. But by capturing the
-existential quantifier in a delayed recursive type, the two generalized types can be
-unified, and we can immediately unroll them on the outside, via the unroll pattern in
-`let &pack`.
+If we didn't have the rolls in each branch, the type of each branch would be `{.data :
+~t, .area : fun(~t) -> Num}`, except that each branch has its own, unique `~t`. The type
+checker will find the `~t` from one side incompatible with the `~t` from the other,
+and thus reject the expression. But with the rolls, the type of each branch becomes
+`& exists ~t. {.data : ~t, .area : fun(~t) -> Num}`. With the existential quantifier in
+place, the two branches are compatible. Outside the conditional, we immediate unpack
+with the roll pattern in `let &shape = ...`, instantiating the existential variable.
 
 #### No recursive bindings
 
@@ -165,10 +166,10 @@ in the prelude. `recur` is meant to be the primary way to do recursion in the la
 
 ### Pattern matching sub-clauses
 
-In a pattern match expression, a branch is normally `<pat> -> <expr>`. Sub-clauses
-allow the form `<pat> and <expr> [<pat> -> <expr> ..]`. That is, you can do an inner
-match on an arbitrary scrutinee using parts you've matched from the outer pattern.
-Crucially, the sub-clause matching may be partial - if there's no match in the sub-clause,
+In a match expression, a branch is normally `<pat> -> <expr>`. Sub-clauses allow the
+form `<pat> and <expr> [<pat> -> <expr> ..]`. That is, you can do an inner match on an
+arbitrary scrutinee using parts you've matched from the outer pattern.  Crucially,
+the sub-clause matching may be partial - if there's no match in the sub-clause,
 control flows back out to the outer clause.
 
 This generalizes boolean guard clauses in other pattern matching implementations. It
@@ -219,3 +220,33 @@ or more universal type variables. When we view the type of that package as a who
 may end up looking like `forall a b c d. {.x : a, .f : b -> b, .g : c -> d -> {c, d}}`,
 which is arguably not user-friendly. So instead, with the regional quantifier notation,
 that type is written `{.x : *, .f : forall a. a -> a, .g : forall a b. a -> b -> {a, b}}`.
+
+### Dependencies
+
+#### Function dependencies
+
+Sometimes a function may work on a generic type of data, but it may depend on certain
+functionality associated with the type, like an `equal` or `add` function. In Haskell and
+Rust, typeclasses and traits are used to accomplish this. In OCaml, we may use functors
+(like `Set.Make`) or normal arguments (like the first argument to `List.equal`).
+In Mu, we use dependencies. Every function takes a dependency argument, which is
+always a record. In the body of the function, you can use the form `@<label>`, as in
+`@compare(a, b)`, or `@mul(x, y)`. The type of the dependency parameter is inferred
+via normal type inference. In the application form, the dependency is specified as the
+last argument, in the form `f(a, b, @ = c)`. Not including the dependency argument is
+the same as passing an empty record.
+
+#### Package dependencies
+
+The `@<label>` form can also be used at the top level of a file, for inter-package
+dependencies.  One package can't directly reference another - instead, an external package
+manifest composes packages, passing dependencies as necessary. The manifest references
+packages via their cryptographic hash. Registries are mappings from a petname to the
+hash representing a package. File trees form a local registry with file paths as petnames.
+
+## Todo
+
+ - Arrays (length in the type when statically known)
+ - Do notation (something like F# computation expressions?)
+ - Terminology (currently using packages to mean "something with an existential type", and
+   also a "file")
