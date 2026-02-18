@@ -1,4 +1,5 @@
 module Symbol : sig
+  (* Strings backed by a WeakSet, so we can use physical equality *)
   type t
   val equal : t -> t -> bool
   val compare : t -> t -> int
@@ -6,34 +7,23 @@ module Symbol : sig
   val of_string : string -> t
   val to_string : t -> string
 end = struct
-  type t = int
-  let equal = Int.equal
-  let compare = Int.compare
-  let hash = Int.hash
+  type t = string
 
-  module Table = Hashtbl.Make(String)
-  let table = Table.create 64
-  let n = ref 0
+  let equal a b = a == b
+  let compare = String.compare
+  let hash = String.hash
+
+  module Table = Weak.Make(String)
+  let table = Table.create 32
 
   let of_string str =
     match Table.find_opt table str with
-    | Some v -> v
+    | Some s -> s
     | None ->
-      let curr = !n in
-      incr n;
-      Table.add table str curr;
-      curr
-  let to_string n =
-    let exception Found of string in
-    try
-      Table.iter
-        (fun str i ->
-           if Int.equal n i then
-             raise_notrace (Found str))
-        table;
-      raise Not_found
-    with
-    | Found key -> key
+      Table.add table str;
+      str
+
+  let to_string s = s
 end
 
 module Env = struct
@@ -153,7 +143,8 @@ module Expr = struct
       }
     | Apply of {
         f : 'expr;
-        args : 'expr Env.t
+        args : 'expr Env.t;
+        dependency : 'expr option
       }
     | Builtin of {
         f : builtin;
@@ -166,6 +157,10 @@ module Expr = struct
         defn : 'expr;
         body : 'expr
       }
+
+    | Dependency of 'sym
+
+    | Array of 'expr list
 
     | Exists of 'sym * 'expr
     | Constructor of 'sym * 'expr
@@ -192,13 +187,18 @@ module Type = struct
     | Variant of (t Env.t) Env.t
     | Function of {
         exists : Symbol.t list;
-        input : (t Env.t);
+        inputs : (t Env.t);
+        dependencies : t Env.t;
         output : t
       }
     | Recurs of {
         exists : Symbol.t list;
         binder : Symbol.t;
         body : t
+      }
+    | Array of {
+        size : Num.numer; (* int | var | ? *)
+        ty : t
       }
 
     | PolyVar of polyvar ref
