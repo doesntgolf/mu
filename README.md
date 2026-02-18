@@ -11,8 +11,6 @@ Starting from a Hindley-Milner type system with let-polymorphism, we add:
  - iso-recursive types
  - a denominator-polymorphic number type, with units of measure
  - pattern matching with sub-clauses
- - (TODO) arrays
- - (TODO) `do` notation
 
 **Design status:** Other than arrays and do-notation, the main design for the type
 system and language semantics that I'd like is in place. Inconsistencies and necessary
@@ -189,23 +187,6 @@ end
 | _ -> default
 ```
 
-### Variants, records, and functions
-
-Variants (written `#ok(a, b)` or `#true`) are row polymorphic, similar to OCaml's
-polymorphic variants. A variant type is written `[#one, #two([#three, #four]), #five]`.
-The optional row variable at the end is written `..rest`. Additionally, a variant's
-payload is a product type, and is row polymorphic in the same way as records.
-
-Rather than a separate construct for tuples, records can begin with 0 or more positional
-fields. Records are row-polymorphic in the typical form. When records are used in
-pattern position, if the row parameter isn't explicitly bound, it's implicitly the
-wildcard pattern (NOT the empty row), so there's no way to form a closed record pattern.
-
-Functions are applied with the Algol-form (`f(a, b, c)`), rather than the curried ML-form
-(`f a b c`). The primary motivation for this design is so that row-polymorphism can
-be applied to function parameters, making more functions type-compatible with each
-other.
-
 ### Forall notation
 
 Mu has rank-1 polymorphism, where quantifiers for universal type variables (`forall
@@ -244,9 +225,38 @@ manifest composes packages, passing dependencies as necessary. The manifest refe
 packages via their cryptographic hash. Registries are mappings from a petname to the
 hash representing a package. File trees form a local registry with file paths as petnames.
 
+### Variants, records, and functions
+
+Variants (written `#ok(a, b)` or `#true`) are row polymorphic, similar to OCaml's
+polymorphic variants. A variant type is written `[#one, #two([#three, #four]), #five]`.
+The optional row variable at the end is written `..rest`. Additionally, a variant's
+payload is a product type, and is row polymorphic in the same way as records.
+
+Rather than a separate construct for tuples, records can begin with 0 or more positional
+fields. Records are row-polymorphic in the typical form. When records are used in
+pattern position, if the row parameter isn't explicitly bound, it's implicitly the
+wildcard pattern (NOT the empty row), so there's no way to form a closed record pattern.
+
+Functions are applied with the Algol-form (`f(a, b, c)`), rather than the curried ML-form
+(`f a b c`). The primary motivation for this design is so that row-polymorphism can
+be applied to function parameters, making more functions type-compatible with each
+other.
+
 ## Todo
+
+### Design
 
  - Arrays (length in the type when statically known)
  - Do notation (something like F# computation expressions?)
+ - Syntax
+ - Prelude
  - Terminology (currently using packages to mean "something with an existential type", and
    also a "file")
+ - Metaprogramming?
+
+### Not-design
+
+ - Bootstrap parser, typechecker, tree walking interpreter (in progress)
+ - Write "Learn Mu in 15 minutes"
+ - Type system specification (maybe in Rocq)
+ - Bytecode interpreter and runtime, and a compiler targeting it
