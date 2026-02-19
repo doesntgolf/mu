@@ -163,15 +163,6 @@ we can type the Z-combinator, which we've placed in the prelude. With that, we
 derive a function called `recur` (based loosely on Clojure's `loop/recur` form), also
 in the prelude. `recur` is meant to be the primary way to do recursion in the language.
 
-#### Potential alternative design for recursive types
-
-If `&` and `^` are too unwieldy, we could have something more similar to the `exists`
-expression: `recurs R in <body>`. Within `<body>`, `R` would be the roll constructor
-in expressions and patterns (like `&`), except that throughout `<body>`, `R` would be
-constrained to refer to the same recursive fold. I think this would be enough on its
-own for type inference, without needing an analogue to `^`. It would still match
-structurally with other declared recursive roll constructors.
-
 ### Arrays
 
 Arrays have their size as part of their type when it's statically known. When it's not

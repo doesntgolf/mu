@@ -14,7 +14,7 @@ end = struct
   let hash = String.hash
 
   module Table = Weak.Make(String)
-  let table = Table.create 32
+  let table = Table.create 64
 
   let of_string str =
     match Table.find_opt table str with
@@ -64,35 +64,6 @@ module Env = struct
     aux 0 env
 end
 
-module Num : sig
-  type numer = Int of int | Var of int | Unknown
-  type monomial =
-      Known of {coeff : int; vars : Symbol.t list}
-    | Uknown
-  type units = (Symbol.t * int) list
-  type t = {
-    numer : numer;
-    denom : monomial;
-    units : units
-  }
-
-  val unify : t -> t -> unit
-end = struct
-  type numer = Int of int | Var of int | Unknown
-  type monomial =
-      Known of {coeff : int; vars : Symbol.t list}
-    | Uknown
-  type units = (Symbol.t * int) list
-
-  type t = {
-    numer : numer;
-    denom : monomial;
-    units : units;
-  }
-
-  let unify _ _ = ()
-end
-
 module Pat = struct
   type ('pat, 'sym) t =
       Var of 'sym
@@ -100,7 +71,7 @@ module Pat = struct
     | Number of {
         value : int;
         exp : int;
-        units : Num.units
+        units : ('sym * int) list
       }
     | Record of 'pat Env.t
     | Variant of 'sym * 'pat Env.t
@@ -128,7 +99,7 @@ module Expr = struct
       Number of {
         value : int;
         exp : int; (* value * 10^-exp *)
-        unit : ('sym * int) option
+        unit : ('sym * int) list
       }
 
     | Record of 'expr Env.t
@@ -181,8 +152,17 @@ module Expr = struct
 end
 
 module Type = struct
+  type numer = Int of int | Var of int | Unknown
+  type denom =
+      Known of {coeff : int; vars : Symbol.t list}
+    | Unknown
+
   type t =
-      Number of Num.t
+      Number of {
+        numer : numer;
+        denom : denom;
+        units : (Symbol.t * int) list
+      }
     | Record of t Env.t
     | Variant of (t Env.t) Env.t
     | Function of {
@@ -197,7 +177,7 @@ module Type = struct
         body : t
       }
     | Array of {
-        size : Num.numer; (* int | var | ? *)
+        size : numer; (* int | var | ? *)
         ty : t
       }
 
@@ -228,6 +208,7 @@ module Type = struct
   }
 
   let rec show = function
+    (* TODO: refactor this to thread through a buffer *)
     | Number {
         numer = Int i;
         denom = Known {coeff; vars};
@@ -247,6 +228,18 @@ module Type = struct
 
     | PolyVar {contents = Unbound {id; _}} -> Printf.sprintf "`%i" id
     | PolyVar {contents = Forwarded ty} -> show ty
+
+    | Function {exists; inputs; dependencies; output} ->
+      let buf = Buffer.create 16 in
+      Buffer.add_string buf "fun(";
+      Env.iteri (fun name ty i ->
+          if i <> 0 then
+            Buffer.add_string buf ", ";
+          Printf.bprintf buf ".%s = %s" (Symbol.to_string name) (show ty))
+        inputs;
+      Buffer.add_string buf ") -> ";
+      Buffer.add_string buf (show output);
+      Buffer.contents buf
 
     | Error s -> Printf.sprintf "error: %s" s
 
@@ -385,6 +378,36 @@ module Type = struct
         in
         let _ = unify expected ty in
         {expr = Expr.Var sym; ty}
+
+      | Expr.Function {param; body} ->
+        (* TODO: this is all hardcoded for a single parameter *)
+        let first_param = Symbol.of_string "1" in
+        let input = new_universal () in
+        let output = new_universal () in
+        let found = Function {
+            exists = [];
+            inputs = Env.Binding {
+                name = first_param;
+                value = input;
+                env = Env.Empty
+              };
+            dependencies = Env.Empty;
+            output
+          }
+        in
+        let _ = unify expected found in
+        let Env.Binding {value = param; _} = param in
+        let (pat_node, inner_env) = infer_pat env ~expected:input param in
+        let body_node = aux inner_env ~expected:output body in
+        let expr = Expr.Function {
+            param = Env.Binding {name = first_param; value = pat_node; env = Env.Empty};
+            body = body_node
+          }
+        in
+        {expr; ty = found}
+
+      | Expr.Apply {f; args; dependency} ->
+        failwith "TODO"
 
 (*
       | Expr.Variant (tag, payload) ->
@@ -558,6 +581,14 @@ module Parsing = struct
   let parse input =
     let tokenize = tokenize input in
 
+    let expect expected pos k =
+      tokenize pos (fun token pos ->
+          if token = expected then
+            k pos
+          else
+            Error (`UnexpectedToken (token, pos)))
+    in
+
     let whole_pat pos k =
       tokenize pos (fun token pos ->
           match token with
@@ -570,21 +601,31 @@ module Parsing = struct
           | Int value -> k (Expr.(Bare (Number {
               value;
               exp = 0;
-              unit = None
+              unit = []
             }))) pos
 
           | Ident sym -> k (Expr.(Bare (Var sym))) pos
 
           | Let ->
             whole_pat pos (fun pat pos ->
-                tokenize pos (fun token pos ->
-                    match token with
-                    | Equal -> whole_expr pos (fun defn pos ->
-                        tokenize pos (fun token pos ->
-                            match token with
-                            | In -> whole_expr pos (fun body pos ->
+                expect Equal pos (fun pos ->
+                    whole_expr pos (fun defn pos ->
+                        expect In pos (fun pos ->
+                            whole_expr pos (fun body pos ->
                                 let expr = Expr.(Bare (Let {pat; defn; body})) in
                                 k expr pos)))))
+
+          | ForwardSlash ->
+            whole_pat pos (fun pat pos ->
+                expect Arrow pos (fun pos ->
+                    whole_expr pos (fun body pos ->
+                        let param = Env.Binding {
+                            name = Symbol.of_string "1";
+                            value = pat;
+                            env = Env.Empty
+                          } in
+                        let expr = Expr.(Bare (Function {param; body})) in
+                        k expr pos)))
 
           | LeftCurly ->
             let rec aux acc pos =
@@ -605,13 +646,31 @@ module Parsing = struct
 
           | token -> Error (`UnexpectedToken (token, pos)))
 
-    and compound_expr inner pos k =
+    and compound_expr left pos k =
       tokenize pos (fun token next_pos ->
           match token with
           | Field name ->
-            let expr = Expr.Bare (Field (inner, name)) in
+            let expr = Expr.Bare (Field (left, name)) in
             compound_expr expr next_pos k
-          | _ -> k inner pos)
+
+          | LeftParen ->
+            whole_expr next_pos (fun arg pos ->
+                expect RightParen pos (fun pos ->
+                    let args = Env.Binding {
+                        name = Symbol.of_string "1";
+                        value = arg;
+                        env = Env.Empty
+                      }
+                    in
+                    let expr = Expr.(Bare (Apply {
+                        f = left;
+                        args;
+                        dependency = None
+                      }))
+                    in
+                    compound_expr expr pos k))
+
+          | _ -> k left pos)
 
     and whole_expr pos k =
       atomic_expr pos (fun inner outer_pos ->
@@ -637,12 +696,17 @@ end = struct
       Number of {
         value : int;
         exp : int;
-        unit : (Symbol.t * int) option
+        unit : (Symbol.t * int) list
       }
     | Record of value Env.t
     | Variant of {
         tag : Symbol.t;
         payload : value Env.t
+      }
+    | Function of {
+        param : Type.typed_pat Env.t;
+        body_env : value Env.t;
+        body : Type.typed_expr
       }
 
   module Frame = Hashtbl.Make(Symbol)
@@ -659,7 +723,8 @@ end = struct
            Printf.bprintf buf "%s = %s" (Symbol.to_string name) (show value))
         fields;
       Buffer.add_char buf '}';
-      Buffer.contents buf
+      Buffer.contents buf;
+    | Function _ -> "<function>"
 
   let match_ env (typed_pat : Type.typed_pat) value =
     match typed_pat.pat with
@@ -674,7 +739,8 @@ end = struct
       | Error str -> Error (Printf.sprintf "Type error: %s" str)
       | _ ->
         match node.expr with
-        | Expr.Number {value; exp; unit} -> k (Number {value; exp; unit})
+        | Expr.Number {value; exp; unit} ->
+          k (Number {value; exp; unit})
 
         | Expr.Record fields ->
           let rec field_aux acc = function
@@ -702,6 +768,29 @@ end = struct
             | Some value -> k value
             | None -> Error (Printf.sprintf "Variable not in env: %s" (Symbol.to_string sym))
           end
+
+        | Expr.Function {param; body} ->
+          k (Function {param; body_env = env; body})
+
+        | Expr.Apply {f; args; dependency} ->
+          let outer_env = env in
+          aux outer_env f ~frame (fun (Function {param; body_env; body}) ->
+              let rec apply_aux env_acc args =
+                match args with
+                | Env.Binding {name; value=arg; env=args} ->
+                  aux outer_env arg ~frame (fun arg_value ->
+                      let env_acc =
+                        match Env.lookup name param with
+                        | Some param -> match_ env_acc param arg_value
+                        | None ->
+                          Printf.printf "Missing parameter: %s\n" (Symbol.to_string name);
+                          env_acc
+                      in
+                      apply_aux env_acc args)
+                | Env.Empty ->
+                  aux env_acc body ~frame k
+              in
+              apply_aux body_env args)
 
         | _ -> Error ("unimplemented eval for expression")
     in
