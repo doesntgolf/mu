@@ -362,9 +362,8 @@ programming with universal type variables.
 
 Mainly dissatisfaction with floats, and the dichotomy between floats and ints. The
 clear alternative was rational numbers, and the need for some numbers to be integers
-suggested that the denominator should be part of the type. I couldn't find anything
-in other languages or type system literature along these lines (please share with me
-if I'm incorrect!), so I tried to design something myself. The main inspiration for
-putting a type variable in the denominator to give the type flexibility came from
-the row variable in row polymorphism. With those two components in place, I had the
-primary design for the number type.
+suggested that the denominator should be part of the type. I couldn't find anything in
+other languages or type system literature along these lines (please share with me if I'm
+incorrect!), so I tried to design something myself. The main inspiration for putting
+a type variable in the denominator for flexibility came from row polymorphism. With
+those two components in place, I had the primary design for the number type.

@@ -241,6 +241,23 @@ module Type = struct
       Buffer.add_string buf (show output);
       Buffer.contents buf
 
+    | Variant variants ->
+      let buf = Buffer.create 32 in
+      Buffer.add_char buf '[';
+      Env.iteri (fun name fields i ->
+          if i <> 0 then
+            Buffer.add_string buf ", ";
+          Printf.bprintf buf "'%s(" (Symbol.to_string name);
+          Env.iteri (fun name ty i ->
+              if i <> 0 then
+                Buffer.add_string buf ", ";
+              Buffer.add_string buf (show ty))
+            fields;
+          Buffer.add_char buf ')')
+        variants;
+      Buffer.add_char buf ']';
+      Buffer.contents buf
+
     | Error s -> Printf.sprintf "error: %s" s
 
   let rec occurs polyvar ty =
@@ -455,15 +472,21 @@ module Type = struct
           ty = expected
         }
 
-(*
-      | Expr.Variant (tag, payload) ->
-        Variant (Binding {
-            name = tag;
-            value = Env.map (aux env ~expected) payload;
-            env = Empty (* TODO fresh type var *)
-          })
-
-        *)
+      | Expr.Variant (tag, fields) ->
+        let fields = Env.map (aux env ~expected:(new_universal ())) fields in
+        let field_types = Env.map (fun node -> node.ty) fields in
+        let found =
+          Variant (Binding {
+              name = tag;
+              value = field_types;
+              env = Empty
+            })
+        in
+        let _ = unify expected found in
+        {
+          expr = Variant (tag, fields);
+          ty = found
+        }
     in
     aux env ~expected:(new_universal ()) expr
 end
@@ -690,6 +713,27 @@ module Parsing = struct
             in
             aux Env.Empty pos
 
+          | Tag tag ->
+            tokenize pos (fun token next_pos ->
+                match token with
+                | LeftParen ->
+                  let rec aux acc pos =
+                    (* TODO: this just parses one payload field *)
+                    whole_expr pos (fun expr pos ->
+                        expect RightParen pos (fun pos ->
+                            let expr = Expr.(Bare (Variant (tag, Env.Binding {
+                                name = Symbol.of_string "1";
+                                value = expr;
+                                env = Env.Empty
+                              })))
+                            in
+                            k expr pos))
+                  in
+                  aux Env.Empty next_pos
+
+                | _ ->
+                  k (Expr.(Bare (Variant (tag, Env.Empty)))) pos)
+
           | token -> Error (`UnexpectedToken (token, pos)))
 
     and compound_expr left pos k =
@@ -770,6 +814,16 @@ end = struct
         fields;
       Buffer.add_char buf '}';
       Buffer.contents buf;
+    | Variant {tag; payload} ->
+      let buf = Buffer.create 16 in
+      Printf.bprintf buf "'%s(" (Symbol.to_string tag);
+      Env.iteri (fun name ty i ->
+          if i <> 0 then
+            Buffer.add_string buf ", ";
+          Printf.bprintf buf ".%s = %s" (Symbol.to_string name) (show ty))
+        payload;
+      Buffer.add_char buf ')';
+      Buffer.contents buf
     | Function _ -> "<function>"
 
   let match_ env (typed_pat : Type.typed_pat) value =
@@ -837,6 +891,17 @@ end = struct
                   aux env_acc body ~frame k
               in
               apply_aux body_env args)
+
+        | Expr.Variant (tag, fields) ->
+          let rec field_aux acc = function
+            | Env.Binding {name; value; env=rest} ->
+              aux env value ~frame (fun value ->
+                  let acc = Env.Binding {name; value; env = acc} in
+                  field_aux acc rest)
+            | Env.Empty ->
+              k (Variant {tag; payload = acc})
+          in
+          field_aux Env.Empty fields
 
         | _ -> Error ("unimplemented eval for expression")
     in
