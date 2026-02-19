@@ -356,7 +356,7 @@ module Type = struct
       let rec aux acc ty =
         match ty with
         | PolyVar {contents = Unbound {id; let_level=lev}}
-          when lev > !let_level ->
+          when lev > !let_level && not (List.exists (Int.equal id) acc) ->
           id :: acc
 
         | PolyVar {contents = Forwarded ty} -> aux acc ty
@@ -372,7 +372,7 @@ module Type = struct
           in
           fun_aux acc inputs
 
-        (* TODO: traverse function, record, variant *)
+        (* TODO: traverse record, variant *)
         | _ -> acc
       in
       let vars = aux [] ty in
@@ -393,6 +393,7 @@ module Type = struct
             | Some replacement -> replacement
             | None -> ty
           end
+        | PolyVar {contents = Forwarded ty} -> aux ty
 
         | Record fields ->
           Record (Env.map aux fields)
