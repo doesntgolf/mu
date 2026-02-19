@@ -12,10 +12,10 @@ Starting from a Hindley-Milner type system with let-polymorphism, we add:
  - a denominator-polymorphic number type, with units of measure
  - pattern matching with sub-clauses
 
-**Design status:** Other than arrays and do-notation, the main design for the type
-system and language semantics that I'd like is in place. Inconsistencies and necessary
-additions will probably still be uncovered during implementation. The syntax is still
-mostly undesigned.
+**Design status:** The main design for the type system and language semantics that
+I'd like is in place, though some things still need to be fleshed out. Inconsistencies
+and deficiencies will probably still be uncovered during implementation. The syntax
+is still mostly undesigned.
 
 **Implementation status:** I'm implementing the bootstrapping type checker and
 tree-walk interpreter in OCaml. It's still in the beginning stages, not yet usable for
@@ -129,10 +129,10 @@ lazy thunk with `&p` forces it. Notably, an iso-recursive type need not be actua
 recursive, so you can put this to use for lazy evaluation wherever you want it.
 
 Recursive types are also useful for existentials. Because roll expressions - like
-functions - are delayed, existential types are generalized by rolls and instantiated
-by unrolls, just like function abstraction and application. Recursive types therefore
-also carry existential type quantifiers. This provides a straightforward way to make
-two packages with different existential types compatible with each other:
+functions - are delayed, rolls generalize existential types and unrolls instantiate
+them, just like function abstraction and application. Recursive types therefore also
+carry existential type quantifiers. This provides a straightforward way to make two
+types containing different existential variables compatible with each other:
 
 ```
 let &shape = if cond then
@@ -151,9 +151,10 @@ If we didn't have the rolls in each branch, the type of each branch would be `{.
 ~t, .area : fun(~t) -> Num}`, except that each branch has its own, unique `~t`. The type
 checker will find the `~t` from one side incompatible with the `~t` from the other,
 and thus reject the expression. But with the rolls, the type of each branch becomes
-`& exists ~t. {.data : ~t, .area : fun(~t) -> Num}`. With the existential quantifier in
-place, the two branches are compatible. Outside the conditional, we immediate unpack
-with the roll pattern in `let &shape = ...`, instantiating the existential variable.
+`& exists ~t. {.data : ~t, .area : fun(~t) -> Num}`. With the existential quantifier
+in place, the types of the two branches are compatible. Outside the conditional,
+we immediately unpack with the roll pattern in `let &shape = ...`, instantiating the
+existential variable.
 
 #### No recursive bindings
 
@@ -162,9 +163,21 @@ we can type the Z-combinator, which we've placed in the prelude. With that, we
 derive a function called `recur` (based loosely on Clojure's `loop/recur` form), also
 in the prelude. `recur` is meant to be the primary way to do recursion in the language.
 
+### Arrays
+
+Arrays have their size as part of their type when it's statically known. When it's not
+statically known, or when two arrays with different sizes are unified, the resulting
+type has `?` for the size. Functions like `Array.map` are polymorphic over the array
+size. Functions like `Array.init` (with type `fun(Num 'a/1, fun(Num/1) -> 'b) ->
+Array<'b, size='a>`) can make use of integers of static information from a number type to retain
+static information about array size.
+
+Strings are likewise arrays of bytes. The prelude will also contain an existential
+type for UTF8 strings.
+
 ### Pattern matching sub-clauses
 
-In a match expression, a branch is normally `<pat> -> <expr>`. Sub-clauses allow the
+In a match expression, a clause is normally `<pat> -> <expr>`. Sub-clauses allow the
 form `<pat> and <expr> [<pat> -> <expr> ..]`. That is, you can do an inner match on an
 arbitrary scrutinee using parts you've matched from the outer pattern.  Crucially,
 the sub-clause matching may be partial - if there's no match in the sub-clause,
@@ -179,11 +192,11 @@ syntax:
 ```ocaml
 match x with
 | A -> 1
-| B (5, c) and match f c with
+| B (5, x) and match f x with
 	| 100 -> 2
 	| 200 -> 3
 end
-| C d -> d
+| C x -> x
 | _ -> default
 ```
 
@@ -202,6 +215,35 @@ may end up looking like `forall a b c d. {.x : a, .f : b -> b, .g : c -> d -> {c
 which is arguably not user-friendly. So instead, with the regional quantifier notation,
 that type is written `{.x : *, .f : forall a. a -> a, .g : forall a b. a -> b -> {a, b}}`.
 
+### Comprehensions
+
+```
+mod {
+	bind x, y = f(z) in
+	let a = g(x, y) in
+	where a < b
+	yield a
+}
+```
+
+desugars to
+
+```
+mod.bind(f(z), fun(x, y) ->
+	let a = g(x, y) in
+	if a < b then
+		mod.unit(a)
+	else
+		mod.zero)
+```
+
+Type inference works just as it would for the desugared version. (If you don't use
+`bind`, `yield`, or `where`, then `mod` doesn't need to have `bind`, `unit`, or
+`zero` respectively.)
+
+(**TODO**: flesh out this design more. I think this is overall most similar to F#'s
+computation expressions?)
+
 ### Dependencies
 
 #### Function dependencies
@@ -214,8 +256,8 @@ In Mu, we use dependencies. Every function takes a dependency argument, which is
 always a record. In the body of the function, you can use the form `@<label>`, as in
 `@compare(a, b)`, or `@mul(x, y)`. The type of the dependency parameter is inferred
 via normal type inference. In the application form, the dependency is specified as the
-last argument, in the form `f(a, b, @ = c)`. Not including the dependency argument is
-the same as passing an empty record.
+last argument, with the keyword `using`, as in `f(a, b, using c)`. Not including the
+dependency argument is the same as passing an empty record.
 
 #### Package dependencies
 
@@ -227,10 +269,9 @@ hash representing a package. File trees form a local registry with file paths as
 
 ### Variants, records, and functions
 
-Variants (written `#ok(a, b)` or `#true`) are row polymorphic, similar to OCaml's
-polymorphic variants. A variant type is written `[#one, #two([#three, #four]), #five]`.
-The optional row variable at the end is written `..rest`. Additionally, a variant's
-payload is a product type, and is row polymorphic in the same way as records.
+Variants (written `'ok(a, b)` or `'true`) are row polymorphic, similar to OCaml's
+polymorphic variants. A variant type is written `['one, 'two(['three, 'four]), 'five,
+..rest]`, with the `..rest` denoting the row variable.
 
 Rather than a separate construct for tuples, records can begin with 0 or more positional
 fields. Records are row-polymorphic in the typical form. When records are used in
@@ -246,17 +287,24 @@ other.
 
 ### Design
 
- - Arrays (length in the type when statically known)
- - Do notation (something like F# computation expressions?)
  - Syntax
  - Prelude
  - Terminology (currently using packages to mean "something with an existential type", and
    also a "file")
- - Metaprogramming?
+ - Metaprogramming? (maybe type-safe eval as in https://haskellforall.com/2026/01/typesafe-eval
+   except taking an AST (and environment?) rather than a string)
 
-### Not-design
+### Implementation
 
  - Bootstrap parser, typechecker, tree walking interpreter (in progress)
  - Write "Learn Mu in 15 minutes"
  - Type system specification (maybe in Rocq)
  - Bytecode interpreter and runtime, and a compiler targeting it
+
+## Design philosophy
+
+### Why design for complete type inference?
+
+I don't see full type inference as an end in itself, though it is nice. Instead, I see
+having a predictable language semantics and type system as the goal, and complete type
+inference via a simple algorithm as a signpost pointing toward that goal.

@@ -248,6 +248,8 @@ module Type = struct
     | PolyVar {contents = Unbound {id; _}} -> Printf.sprintf "`%i" id
     | PolyVar {contents = Forwarded ty} -> show ty
 
+    | Error s -> Printf.sprintf "error: %s" s
+
   let rec occurs polyvar ty =
     match ty with
     | PolyVar var when polyvar == var -> failwith "occurs check"
@@ -302,12 +304,6 @@ module Type = struct
 
   let instantiate (Forall (v, ty)) = ty
 
-  let infer_pat env (Pat.Bare pat) =
-    let rec aux env = function
-      | Pat.Number _ -> env
-    in
-    aux env pat
-
   (***
    * The inference algorithm:
    *  - Algorithm J-style, using refs for type vars rather than a Map
@@ -332,6 +328,16 @@ module Type = struct
         let id = !n in
         incr n;
         RigidVar {id; fun_level = !fun_level}
+    in
+
+    let infer_pat env ~expected (Pat.Bare pat) =
+      let rec aux env ~expected = function
+        | Pat.Var name ->
+          let value = Forall ("", expected) in
+          let env = Env.Binding {name; value; env} in
+          ({pat = Pat.Var name; ty = expected}, env)
+      in
+      aux env ~expected pat
     in
 
     let rec aux env ~expected (Expr.Bare expr) =
@@ -360,6 +366,26 @@ module Type = struct
         let rec_expr = aux env ~expected:rec_expected expr in
         {expr = Expr.Field (rec_expr, name); ty = expected}
 
+      | Expr.Let {pat; defn; body} ->
+        let (pat_node, body_env) = infer_pat env ~expected:(new_universal ()) pat in
+        incr let_level;
+        let defn_node = aux env ~expected:pat_node.ty defn in
+        decr let_level;
+        let body_node = aux body_env ~expected body in
+        {
+          expr = Expr.Let {pat = pat_node; defn = defn_node; body = body_node};
+          ty = body_node.ty
+        }
+
+      | Expr.Var sym ->
+        let ty =
+          match Env.lookup sym env with
+          | Some scheme -> instantiate scheme
+          | None -> Error "var not found"
+        in
+        let _ = unify expected ty in
+        {expr = Expr.Var sym; ty}
+
 (*
       | Expr.Variant (tag, payload) ->
         Variant (Binding {
@@ -368,17 +394,6 @@ module Type = struct
             env = Empty (* TODO fresh type var *)
           })
 
-      | Expr.Let {pat; defn; body} ->
-        incr let_level;
-        let defn_ty = aux env ~expected defn in
-        decr let_level;
-        let env = infer_pat env pat in
-        aux env ~expected body
-
-      | Expr.Var var ->
-        match Env.lookup var env with
-        | Some scheme -> instantiate scheme
-        | None -> Error "var not found"
         *)
     in
     aux env ~expected:(new_universal ()) expr
@@ -415,37 +430,6 @@ module Parsing = struct
     | EOF
     | TokenError of string
     | UnexpectedChar of char
-
-  let string_of_token = function
-    | Let -> "Let"
-    | LeftParen -> "LeftParen"
-    | RightParen -> "RightParen"
-    | LeftCurly -> "LeftCurly"
-    | RightCurly -> "RightCurly"
-    | LeftSquare -> "LeftSquare"
-    | RightSquare -> "RightSquare"
-    | Greater -> "Greater"
-    | Less -> "Less"
-    | Ident s -> "Ident " ^ Symbol.to_string s
-    | Field s -> "Field " ^ Symbol.to_string s
-    | Tag s -> "Tag " ^ Symbol.to_string s
-    | Comma -> "Comma"
-    | Arrow -> "Arrow"
-    | Equal -> "Equal"
-    | Undefined -> "Undefined"
-    | Exists -> "Exists"
-    | In -> "In"
-    | And -> "And"
-    | Or -> "Or"
-    | Ampersand -> "Ampersand"
-    | Caret -> "Caret"
-    | Pipe -> "Pipe"
-    | ForwardSlash -> "ForwardSlash"
-    | Int i -> "Int " ^ string_of_int i
-    | Underscore -> "Underscore"
-    | EOF -> "EOF"
-    | TokenError s -> "TokenError " ^ s
-    | UnexpectedChar c -> Printf.sprintf "UnexpectedChar %c" c
 
   let line_and_col_of_pos input target =
     let rec aux pos line col =
@@ -574,8 +558,10 @@ module Parsing = struct
   let parse input =
     let tokenize = tokenize input in
 
-    let pat pos k =
-      ()
+    let whole_pat pos k =
+      tokenize pos (fun token pos ->
+          match token with
+          | Ident sym -> k (Pat.(Bare (Var sym))) pos)
     in
 
     let rec atomic_expr pos k =
@@ -586,6 +572,19 @@ module Parsing = struct
               exp = 0;
               unit = None
             }))) pos
+
+          | Ident sym -> k (Expr.(Bare (Var sym))) pos
+
+          | Let ->
+            whole_pat pos (fun pat pos ->
+                tokenize pos (fun token pos ->
+                    match token with
+                    | Equal -> whole_expr pos (fun defn pos ->
+                        tokenize pos (fun token pos ->
+                            match token with
+                            | In -> whole_expr pos (fun body pos ->
+                                let expr = Expr.(Bare (Let {pat; defn; body})) in
+                                k expr pos)))))
 
           | LeftCurly ->
             let rec aux acc pos =
@@ -647,7 +646,6 @@ end = struct
       }
 
   module Frame = Hashtbl.Make(Symbol)
-  type position = Return | Block
 
   let rec show = function
     | Number {value; exp; unit} -> string_of_int value
@@ -663,11 +661,15 @@ end = struct
       Buffer.add_char buf '}';
       Buffer.contents buf
 
+  let match_ env (typed_pat : Type.typed_pat) value =
+    match typed_pat.pat with
+    | Pat.Var name -> Env.Binding {name; value; env}
+    | Pat.Wildcard -> env
+
   let eval env node =
     let frame = Frame.create 16 in
-    let position = Return in
 
-    let rec aux env (node : Type.typed_expr) ~frame ~position k =
+    let rec aux env (node : Type.typed_expr) ~frame k =
       match node.ty with
       | Error str -> Error (Printf.sprintf "Type error: %s" str)
       | _ ->
@@ -678,21 +680,32 @@ end = struct
           let rec field_aux acc = function
             | Env.Empty -> k (Record acc)
             | Env.Binding {name; value; env = rec_env} ->
-              aux env value ~frame ~position:Block (fun field_val ->
+              aux env value ~frame (fun field_val ->
                   let acc = Env.Binding {name; value=field_val; env=acc} in
                   field_aux acc rec_env)
           in
           field_aux Env.Empty fields
 
         | Expr.Field (record, name) ->
-          aux env record ~frame ~position:Block (fun (Record fields) ->
+          aux env record ~frame (fun (Record fields) ->
               match Env.lookup name fields with
               | Some value -> k value
               | None -> Error (Printf.sprintf "Field error: %s" (Symbol.to_string name)))
 
+        | Expr.Let {pat; defn; body} ->
+          aux env defn ~frame (fun defn_val ->
+              let env = match_ env pat defn_val in
+              aux env body ~frame k)
+
+        | Expr.Var sym ->
+          begin match Env.lookup sym env with
+            | Some value -> k value
+            | None -> Error (Printf.sprintf "Variable not in env: %s" (Symbol.to_string sym))
+          end
+
         | _ -> Error ("unimplemented eval for expression")
     in
-    aux env node ~frame ~position (fun res -> Ok res)
+    aux env node ~frame (fun res -> Ok res)
 end
 
 module Test = struct
@@ -731,8 +744,8 @@ let main () =
       | Error (`UnexpectedToken (token, pos)) ->
         let (line, col) = Parsing.line_and_col_of_pos code pos in
         Printf.printf
-          "Unexpected token %s at line %i, column %i\n"
-          (Parsing.string_of_token token) line col;
+          "Unexpected token at line %i, column %i\n"
+          line col;
         1
       | Ok ast ->
         let typed = Type.infer Env.Empty ast in
