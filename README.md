@@ -15,14 +15,14 @@ Starting from a Hindley-Milner type system with let-polymorphism, we add:
 **Design status:** The main design for the type system and language semantics that
 I'd like is in place, though some things still need to be fleshed out. Inconsistencies
 and deficiencies will probably still be uncovered during implementation. The syntax
-is still mostly undesigned.
+is still mostly undesigned. I'm actively seeking feedback on the language semantics
+and type system - please reach out if you have thoughts or ideas!
 
-**Implementation status:** I'm implementing the bootstrapping type checker and
-tree-walk interpreter in OCaml. It's still in the beginning stages, not yet usable for
-anything. Concurrently with that, I'm designing a minimal prelude, to expose builtins
-and basic data structures and utilities. After that, I plan to implement a bytecode
-interpreter and runtime in C, and a self-hosted type-checker and compiler targeting
-that bytecode. At some point, I also intend to write a specification for the language.
+**Implementation status:** I'm implementing the bootstrapping type checker and tree-walk
+interpreter in OCaml. It's still in the beginning stages - it can parse, typecheck, and
+evaluate a few basic forms. After that, I plan to implement a bytecode interpreter and
+runtime in C, and a self-hosted type-checker and compiler targeting that bytecode. At
+some point, I also intend to write a specification for the language.
 
 ## Type system
 
@@ -60,7 +60,7 @@ this way, if you divide by a number literal (as is the common case), we're able 
 preserve a statically known denominator in the output. Across any operation, the known
 numerator component is immediately forgotten.
 
-Finally, units of measure can also be attached to numbers. There are no builtin units;
+Finally, units of measure can also be attached to numbers. There are no built-in units;
 a unit is simply any string raised to an exponent. Thus, you can have `3.6 meters`,
 `5 apples`, `80 miles/hour`, or `40 m^3`. Units compose and cancel out as
 you would expect across multiplication and division; addition and comparison require
@@ -163,13 +163,22 @@ we can type the Z-combinator, which we've placed in the prelude. With that, we
 derive a function called `recur` (based loosely on Clojure's `loop/recur` form), also
 in the prelude. `recur` is meant to be the primary way to do recursion in the language.
 
+#### Potential alternative design for recursive types
+
+If `&` and `^` are too unwieldy, we could have something more similar to the `exists`
+expression: `recurs R in <body>`. Within `<body>`, `R` would be the roll constructor
+in expressions and patterns (like `&`), except that throughout `<body>`, `R` would be
+constrained to refer to the same recursive fold. I think this would be enough on its
+own for type inference, without needing an analogue to `^`. It would still match
+structurally with other declared recursive roll constructors.
+
 ### Arrays
 
 Arrays have their size as part of their type when it's statically known. When it's not
 statically known, or when two arrays with different sizes are unified, the resulting
 type has `?` for the size. Functions like `Array.map` are polymorphic over the array
 size. Functions like `Array.init` (with type `fun(Num 'a/1, fun(Num/1) -> 'b) ->
-Array<'b, size='a>`) can make use of integers of static information from a number type to retain
+Array<'b, size='a>`) can make use of static information from the number type to retain
 static information about array size.
 
 Strings are likewise arrays of bytes. The prelude will also contain an existential
@@ -291,8 +300,6 @@ other.
  - Prelude
  - Terminology (currently using packages to mean "something with an existential type", and
    also a "file")
- - Metaprogramming? (maybe type-safe eval as in https://haskellforall.com/2026/01/typesafe-eval
-   except taking an AST (and environment?) rather than a string)
 
 ### Implementation
 
@@ -301,10 +308,72 @@ other.
  - Type system specification (maybe in Rocq)
  - Bytecode interpreter and runtime, and a compiler targeting it
 
-## Design philosophy
+## Design notes
 
-### Why design for complete type inference?
+### Why design for full type inference?
 
-I don't see full type inference as an end in itself, though it is nice. Instead, I see
-having a predictable language semantics and type system as the goal, and complete type
-inference via a simple algorithm as a signpost pointing toward that goal.
+I don't see full type inference as an end in itself, though it is nice. Instead,
+I see having a simple and predictable language semantics as the goal, and full type
+inference via a simple algorithm as a good indicator gesturing towards that goal.
+
+**TODO:** I should probably call this something more nuanced than "full type inference".
+The existential constructor and `&` and `^` forms are specific kinds of annotations.
+
+### Why no recursive bindings?
+
+I'm open to the idea of adding a `let rec / and` form. But one of my main design goals
+is the idea of a "minimum viable lambda calculus", or perhaps "minimum viable ML". I
+like the idea of having the fewest forms necessary to express a thing, and since
+we can express term-level recursion with iso-recursive types and self-application,
+that feels like the right fit for Mu.  (Though hopefully we can make it convenient
+and natural with library functions.) If it ends up being too onerous in practice,
+I'm entirely open to `let rec`.
+
+### What was the impetus for this formulation of existential types?
+
+I knew right away I didn't want the split between a module language and core languages,
+as in other MLs. I considered trying the design of 1ML, but the "weight" of the 1ML type
+system didn't quite match what I had in mind (and, though I find 1ML very intuitive, the
+theory proves quite difficult for me). I also considered just using Mitchell/Plotkin
+formulation of existentials with `pack` and `unpack` forms.  I like very much its
+simplicity, and that packages are first class and can unify with each other, but I found
+some of the same tradeoffs that motivated MacQueen's module design - that it's difficult
+to find a suitable unpacking scope to share an existential abstraction throughout a
+large segment of a program, since every unpack leads to unique type variables. Later,
+I found the paper "Abstract Types and the Dot Notation" by Cardelli and Leroy. In their
+formulation, the opening of a package is placed implicitly around the region where the
+type and value parts of a package are used (with a dot notation). I like this design,
+but I found section 3 of the paper (where the package must be a simple variable) not
+quite expressive enough, and section 4 (where the package may itself be any expression)
+somehow "too expressive", in a way that didn't quite feel intuitive.
+
+For awhile, I also considered not having existential types at all - simply using closures
+for information hiding. I liked this for how it simplified the language and type system,
+and felt very "pure" in its reliance on closures (only one way to do abstraction!).
+But it has clear drawbacks. One is that it forces a lot of types into being recursive
+types where they otherwise wouldn't, in a way that doesn't mesh naturally with recursive
+types being lazily evaluated. But the bigger drawback is that it can no longer express
+strong binary operations, like `equal : t -> t -> bool`, where a function takes more than
+one of the hidden type. (See *Types and Programming Languages* by Pierce, section 24.2).
+
+At this point I got on the course that led me to the current design. I was thinking
+about how simple and intuitive universal type variables are in the HM formulation -
+type inference takes care of them without any programmer help! So I tried to think
+about a formulation where existential type variables are instantiated and generalized
+like forall variables. At first I tried to formulate it around `let`, like universals,
+but couldn't come up with anything that worked well. But from there, it was a short
+leap to having existentials generalized by functions, and instantiated by application,
+which broadly matched my intuition for existential types. Most importantly, it doesn't
+require an unpack form; after explicit introduction, it feels to me the same as
+programming with universal type variables.
+
+### What was the impetus for denominator polymorphism?
+
+Mainly dissatisfaction with floats, and the dichotomy between floats and ints. The
+clear alternative was rational numbers, and the need for some numbers to be integers
+suggested that the denominator should be part of the type. I couldn't find anything
+in other languages or type system literature along these lines (please share with me
+if I'm incorrect!), so I tried to design something myself. The main inspiration for
+putting a type variable in the denominator to give the type flexibility came from
+the row variable in row polymorphism. With those two components in place, I had the
+primary design for the number type.
