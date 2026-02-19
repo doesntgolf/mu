@@ -287,8 +287,24 @@ module Type = struct
         in
         aux a_fields
 
-      (* TODO traverse other kinds *)
+      | Function {inputs=a_inputs; output=a_output; _}, Function {inputs=b_inputs; output=b_output; _} ->
+        let rec aux a_inputs =
+          match a_inputs with
+          | Env.Empty -> ()
+          | Env.Binding {name; value=a_input; env=a_rest} ->
+            let () =
+              match Env.lookup name b_inputs with
+              | Some b_input ->
+                let _ = unify a_input b_input in ()
+              | None ->
+                ()
+            in
+            aux a_rest
+        in
+        let _ = aux a_inputs in
+        unify a_output b_output
 
+      (* TODO traverse other kinds *)
       | _, _ ->
         Printf.printf "Error unifying %s and %s\n" (show a) (show b);
         Error ()
@@ -407,7 +423,37 @@ module Type = struct
         {expr; ty = found}
 
       | Expr.Apply {f; args; dependency} ->
-        failwith "TODO"
+        (* TODO: this is all hardcoded for a single parameter *)
+        let first_param = Symbol.of_string "1" in
+        let arg_expected = new_universal () in
+        let inputs = Env.Binding {
+            name = first_param;
+            value = arg_expected;
+            env = Env.Empty
+          }
+        in
+        let f_ty = Function {
+            exists = [];
+            inputs;
+            dependencies = Env.Empty;
+            output = expected
+          }
+        in
+        let f_node = aux env ~expected:f_ty f in
+        let Env.Binding {value = arg; _} = args in
+        let arg_node = aux env ~expected:arg_expected arg in
+        {
+          expr = Expr.Apply {
+              f = f_node;
+              args = Binding {
+                  name = first_param;
+                  value = arg_node;
+                  env = Env.Empty
+                };
+              dependency = None
+            };
+          ty = expected
+        }
 
 (*
       | Expr.Variant (tag, payload) ->
