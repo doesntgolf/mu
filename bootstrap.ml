@@ -196,7 +196,7 @@ module Type = struct
       }
     | Forwarded of t
 
-  type scheme = Forall of string * t
+  type scheme = Forall of int list * t
 
   type typed_pat = {
     pat : (typed_pat, Symbol.t) Pat.t;
@@ -326,10 +326,6 @@ module Type = struct
         Printf.printf "Error unifying %s and %s\n" (show a) (show b);
         Error ()
 
-  let generalize ty = Forall ("", ty)
-
-  let instantiate (Forall (v, ty)) = ty
-
   (***
    * The inference algorithm:
    *  - Algorithm J-style, using refs for type vars rather than a Map
@@ -356,10 +352,79 @@ module Type = struct
         RigidVar {id; fun_level = !fun_level}
     in
 
-    let infer_pat env ~expected (Pat.Bare pat) =
+    let generalize ty =
+      let rec aux acc ty =
+        match ty with
+        | PolyVar {contents = Unbound {id; let_level=lev}}
+          when lev > !let_level ->
+          id :: acc
+
+        | PolyVar {contents = Forwarded ty} -> aux acc ty
+
+        | Function {exists; inputs; dependencies; output} ->
+          let rec fun_aux acc inputs =
+            match inputs with
+            | Env.Binding {name; value; env=inputs} ->
+              let acc = aux acc value in
+              fun_aux acc inputs
+            | Env.Empty ->
+              aux acc output
+          in
+          fun_aux acc inputs
+
+        (* TODO: traverse function, record, variant *)
+        | _ -> acc
+      in
+      let vars = aux [] ty in
+      Forall (vars, ty)
+    in
+
+    let no_generalize ty = Forall ([], ty) in
+
+    let instantiate (Forall (vars, ty)) =
+      let mapping = List.map
+          (fun var -> (var, new_universal ()))
+          vars
+      in
+      let rec aux ty =
+        match ty with
+        | PolyVar {contents = Unbound {id; _}} ->
+          begin match List.assoc_opt id mapping with
+            | Some replacement -> replacement
+            | None -> ty
+          end
+
+        | Record fields ->
+          Record (Env.map aux fields)
+
+        | Variant variants ->
+          Variant (Env.map
+                     (fun variant -> Env.map aux variant)
+                     variants)
+
+        | Function {exists; inputs; dependencies; output} ->
+          Function {
+            exists;
+            inputs = Env.map aux inputs;
+            dependencies = Env.map aux dependencies;
+            output = aux output
+          }
+
+        | Recurs {exists; binder; body} ->
+          Recurs {exists; binder; body = aux body}
+
+        | Array {size; ty} ->
+          Array {size; ty = aux ty}
+
+        | _ -> ty
+      in
+      aux ty
+    in
+
+    let infer_pat env ~expected ~generalize (Pat.Bare pat) =
       let rec aux env ~expected = function
         | Pat.Var name ->
-          let value = Forall ("", expected) in
+          let value = generalize expected in
           let env = Env.Binding {name; value; env} in
           ({pat = Pat.Var name; ty = expected}, env)
       in
@@ -393,10 +458,10 @@ module Type = struct
         {expr = Expr.Field (rec_expr, name); ty = expected}
 
       | Expr.Let {pat; defn; body} ->
-        let (pat_node, body_env) = infer_pat env ~expected:(new_universal ()) pat in
         incr let_level;
-        let defn_node = aux env ~expected:pat_node.ty defn in
+        let defn_node = aux env ~expected:(new_universal ()) defn in
         decr let_level;
+        let (pat_node, body_env) = infer_pat env ~expected:defn_node.ty ~generalize pat in
         let body_node = aux body_env ~expected body in
         {
           expr = Expr.Let {pat = pat_node; defn = defn_node; body = body_node};
@@ -430,7 +495,7 @@ module Type = struct
         in
         let _ = unify expected found in
         let Env.Binding {value = param; _} = param in
-        let (pat_node, inner_env) = infer_pat env ~expected:input param in
+        let (pat_node, inner_env) = infer_pat env ~expected:input ~generalize:no_generalize param in
         let body_node = aux inner_env ~expected:output body in
         let expr = Expr.Function {
             param = Env.Binding {name = first_param; value = pat_node; env = Env.Empty};
@@ -888,7 +953,8 @@ end = struct
                       in
                       apply_aux env_acc args)
                 | Env.Empty ->
-                  aux env_acc body ~frame k
+                  let inner_frame = Frame.create 16 in
+                  aux env_acc body ~frame:inner_frame k
               in
               apply_aux body_env args)
 
