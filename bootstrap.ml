@@ -166,14 +166,14 @@ module Type = struct
     | Record of t Env.t
     | Variant of (t Env.t) Env.t
     | Function of {
-        exists : Symbol.t list;
+        exists : int list;
         inputs : (t Env.t);
         dependencies : t Env.t;
         output : t
       }
     | Recurs of {
-        exists : Symbol.t list;
-        binder : Symbol.t;
+        id : int;
+        exists : int list;
         body : t
       }
     | Array of {
@@ -258,6 +258,8 @@ module Type = struct
       Buffer.add_char buf ']';
       Buffer.contents buf
 
+    | Recurs {id; exists; body} -> Printf.sprintf "μ `%i. %s" id (show body)
+
     | Error s -> Printf.sprintf "error: %s" s
 
   let rec occurs polyvar ty =
@@ -335,7 +337,8 @@ module Type = struct
   let infer env expr =
     let let_level = ref 0 in
     let fun_level = ref 0 in (* fun_level of bootstrapping a language: over 9000 *)
-    let roll_level = ref 0 in
+
+    let current_roll = ref None in
 
     let new_universal =
       let n = ref 0 in
@@ -350,6 +353,13 @@ module Type = struct
         let id = !n in
         incr n;
         RigidVar {id; fun_level = !fun_level}
+    in
+    let new_binder =
+      let n = ref 0 in
+      fun () ->
+        let id = !n in
+        incr n;
+        id
     in
 
     let generalize ty =
@@ -411,8 +421,8 @@ module Type = struct
             output = aux output
           }
 
-        | Recurs {exists; binder; body} ->
-          Recurs {exists; binder; body = aux body}
+        | Recurs {exists; id; body} ->
+          Recurs {exists; id; body = aux body}
 
         | Array {size; ty} ->
           Array {size; ty = aux ty}
@@ -422,12 +432,19 @@ module Type = struct
       aux ty
     in
 
-    let infer_pat env ~expected ~generalize (Pat.Bare pat) =
-      let rec aux env ~expected = function
+    let infer_pat env ~expected ~generalize pat =
+      let rec aux env ~expected (Pat.Bare pat) =
+        match pat with
         | Pat.Var name ->
           let value = generalize expected in
           let env = Env.Binding {name; value; env} in
           ({pat = Pat.Var name; ty = expected}, env)
+
+        | Pat.Roll inner ->
+          let inner_ty = new_universal () in
+          let found = Recurs {id = new_binder (); exists = []; body = inner_ty} in
+          let (inner_node, env) = aux env ~expected:inner_ty inner in
+          ({pat = Pat.Roll inner_node; ty = found}, env)
       in
       aux env ~expected pat
     in
@@ -553,6 +570,26 @@ module Type = struct
           expr = Variant (tag, fields);
           ty = found
         }
+
+      | Expr.Roll expr ->
+        let inner_ty = new_universal () in
+        let id = new_binder () in
+
+        let prev_roll = !current_roll in
+        current_roll := Some id;
+        let inner_node = aux env ~expected:inner_ty expr in
+        current_roll := prev_roll;
+
+        let found_ty = Recurs {exists = []; id; body = inner_node.ty} in
+        let _ = unify expected found_ty in
+        {expr = Roll inner_node; ty = found_ty}
+
+      | Expr.Pin expr ->
+        (* TODO: this isn't right. i need to use a PolyVar or something as Recurs {binder} *)
+        let inner_ty = new_universal () in
+        let inner_node = aux env ~expected:inner_ty expr in
+        let _ = unify expected inner_node.ty in
+        {expr = Pin inner_node; ty = inner_node.ty}
     in
     aux env ~expected:(new_universal ()) expr
 end
@@ -724,10 +761,20 @@ module Parsing = struct
             Error (`UnexpectedToken (token, pos)))
     in
 
-    let whole_pat pos k =
+    let rec whole_pat pos k =
       tokenize pos (fun token pos ->
           match token with
-          | Ident sym -> k (Pat.(Bare (Var sym))) pos)
+          | Ident sym -> k (Pat.(Bare (Var sym))) pos
+          | Underscore -> k (Pat.(Bare Wildcard)) pos
+
+          | Ampersand ->
+            whole_pat pos (fun pat pos ->
+                k (Pat.(Bare (Roll pat))) pos)
+          | Caret ->
+            whole_pat pos (fun pat pos ->
+                k (Pat.(Bare (Pin pat))) pos)
+
+          | token -> Error (`UnexpectedToken (token, pos)))
     in
 
     let rec atomic_expr pos k =
@@ -800,6 +847,13 @@ module Parsing = struct
                 | _ ->
                   k (Expr.(Bare (Variant (tag, Env.Empty)))) pos)
 
+          | Ampersand ->
+            whole_expr pos (fun expr pos ->
+                k (Expr.(Bare (Roll expr))) pos)
+          | Caret ->
+            whole_expr pos (fun expr pos ->
+                k (Expr.(Bare (Pin expr))) pos)
+
           | token -> Error (`UnexpectedToken (token, pos)))
 
     and compound_expr left pos k =
@@ -864,6 +918,7 @@ end = struct
         body_env : value Env.t;
         body : Type.typed_expr
       }
+    | Roll of {env : value Env.t; body : Type.typed_expr}
 
   module Frame = Hashtbl.Make(Symbol)
 
@@ -891,13 +946,22 @@ end = struct
       Buffer.add_char buf ')';
       Buffer.contents buf
     | Function _ -> "<function>"
+    | Roll _ -> "<roll>"
 
-  let match_ env (typed_pat : Type.typed_pat) value =
+  let rec match_ env (typed_pat : Type.typed_pat) value =
     match typed_pat.pat with
     | Pat.Var name -> Env.Binding {name; value; env}
     | Pat.Wildcard -> env
 
-  let eval env node =
+    | Pat.Roll pat ->
+      let Roll {env = roll_env; body} = value in
+      begin match eval roll_env body with
+        | Ok value -> match_ env pat value
+        | Error _ -> failwith "force roll failure"
+      end
+    | Pat.Pin pat -> match_ env pat value
+
+  and eval env node =
     let frame = Frame.create 16 in
 
     let rec aux env (node : Type.typed_expr) ~frame k =
@@ -969,6 +1033,11 @@ end = struct
               k (Variant {tag; payload = acc})
           in
           field_aux Env.Empty fields
+
+        | Expr.Roll body ->
+          k (Roll {env; body})
+        | Expr.Pin expr ->
+          aux env expr ~frame k
 
         | _ -> Error ("unimplemented eval for expression")
     in
