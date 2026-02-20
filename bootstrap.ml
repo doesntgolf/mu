@@ -229,6 +229,8 @@ module Type = struct
     | PolyVar {contents = Unbound {id; _}} -> Printf.sprintf "`%i" id
     | PolyVar {contents = Forwarded ty} -> show ty
 
+    | RigidVar {id; _} -> Printf.sprintf "~%i" id
+
     | Function {exists; inputs; dependencies; output} ->
       let buf = Buffer.create 16 in
       Buffer.add_string buf "fun(";
@@ -259,6 +261,7 @@ module Type = struct
       Buffer.contents buf
 
     | Recurs {id; exists; body} -> Printf.sprintf "μ `%i. %s" id (show body)
+
 
     | Error s -> Printf.sprintf "error: %s" s
 
@@ -339,6 +342,7 @@ module Type = struct
     let fun_level = ref 0 in (* fun_level of bootstrapping a language: over 9000 *)
 
     let current_roll = ref None in
+    let constructor_env = ref Env.Empty in
 
     let new_universal =
       let n = ref 0 in
@@ -445,6 +449,15 @@ module Type = struct
           let found = Recurs {id = new_binder (); exists = []; body = inner_ty} in
           let (inner_node, env) = aux env ~expected:inner_ty inner in
           ({pat = Pat.Roll inner_node; ty = found}, env)
+
+        | Pat.Constructor (sym, pat) ->
+          let ty =
+            match Env.lookup sym !constructor_env with
+            | None -> Error "constructor not found"
+            | Some var -> var
+          in
+          let (inner_node, env) = aux env ~expected:ty pat in
+          ({pat = Pat.Constructor (sym, inner_node); ty}, env)
       in
       aux env ~expected pat
     in
@@ -590,6 +603,23 @@ module Type = struct
         let inner_node = aux env ~expected:inner_ty expr in
         let _ = unify expected inner_node.ty in
         {expr = Pin inner_node; ty = inner_node.ty}
+
+      | Expr.Exists (sym, body) ->
+        let prev_cons_env = !constructor_env in
+        constructor_env := Env.Binding {name=sym; value = new_existential (); env = prev_cons_env};
+        let body_node = aux env ~expected body in
+        constructor_env := prev_cons_env;
+        {expr = Expr.Exists (sym, body_node); ty = body_node.ty}
+
+      | Expr.Constructor (sym, body) ->
+        let ty =
+          match Env.lookup sym !constructor_env with
+          | None -> Error "constructor not found"
+          | Some var -> var
+        in
+        let body_node = aux env ~expected:ty body in
+        let _ = unify expected ty in
+        {expr = Expr.Exists (sym, body_node); ty}
     in
     aux env ~expected:(new_universal ()) expr
 end
@@ -608,6 +638,7 @@ module Parsing = struct
     | Ident of Symbol.t
     | Field of Symbol.t
     | Tag of Symbol.t
+    | Constructor of Symbol.t
     | Comma
     | Arrow
     | Equal
@@ -723,6 +754,12 @@ module Parsing = struct
             | Ident sym -> yield (Tag sym) pos
             | _ -> yield (TokenError "unexpected keyword") pos)
 
+      | '~' ->
+        symbol (pos+1) (fun pos str ->
+            match keyword str with
+            | Ident sym -> yield (Constructor sym) pos
+            | _ -> yield (TokenError "unexpected keyword") pos)
+
       | '-' -> begin match input.[pos+1] with
           | '>' -> yield Arrow (pos+2)
           | '0'..'9' -> number pos yield
@@ -764,6 +801,11 @@ module Parsing = struct
     let rec whole_pat pos k =
       tokenize pos (fun token pos ->
           match token with
+          | LeftParen ->
+            whole_pat pos (fun pat pos ->
+                expect RightParen pos (fun pos ->
+                    k pat pos))
+
           | Ident sym -> k (Pat.(Bare (Var sym))) pos
           | Underscore -> k (Pat.(Bare Wildcard)) pos
 
@@ -774,12 +816,21 @@ module Parsing = struct
             whole_pat pos (fun pat pos ->
                 k (Pat.(Bare (Pin pat))) pos)
 
+          | Constructor sym ->
+            whole_pat pos (fun pat pos ->
+                k (Pat.(Bare (Constructor (sym, pat)))) pos)
+
           | token -> Error (`UnexpectedToken (token, pos)))
     in
 
     let rec atomic_expr pos k =
       tokenize pos (fun token pos ->
           match token with
+          | LeftParen ->
+            whole_expr pos (fun expr pos ->
+                expect RightParen pos (fun pos ->
+                    k expr pos))
+
           | Int value -> k (Expr.(Bare (Number {
               value;
               exp = 0;
@@ -853,6 +904,20 @@ module Parsing = struct
           | Caret ->
             whole_expr pos (fun expr pos ->
                 k (Expr.(Bare (Pin expr))) pos)
+
+          | Exists ->
+            tokenize pos (fun token pos ->
+                match token with
+                | Ident sym ->
+                  expect In pos (fun pos ->
+                      whole_expr pos (fun body pos ->
+                          let expr = Expr.(Bare (Exists (sym, body))) in
+                          k expr pos)))
+
+          | Constructor sym ->
+            whole_expr pos (fun expr pos ->
+                let expr = Expr.(Bare (Constructor (sym, expr))) in
+                k expr pos)
 
           | token -> Error (`UnexpectedToken (token, pos)))
 
@@ -961,6 +1026,8 @@ end = struct
       end
     | Pat.Pin pat -> match_ env pat value
 
+    | Pat.Constructor (_, pat) -> match_ env pat value
+
   and eval env node =
     let frame = Frame.create 16 in
 
@@ -1037,6 +1104,11 @@ end = struct
         | Expr.Roll body ->
           k (Roll {env; body})
         | Expr.Pin expr ->
+          aux env expr ~frame k
+
+        | Expr.Exists (_, body) ->
+          aux env body ~frame k
+        | Expr.Constructor (_, expr) ->
           aux env expr ~frame k
 
         | _ -> Error ("unimplemented eval for expression")
