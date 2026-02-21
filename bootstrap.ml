@@ -262,8 +262,15 @@ module Type = struct
 
     | Recurs {id; exists; body} -> Printf.sprintf "μ `%i. %s" id (show body)
 
-
     | Error s -> Printf.sprintf "error: %s" s
+
+  let lcm =
+    let rec gcd a b =
+      if Int.equal b 0 then a
+      else gcd b (a mod b)
+    in
+    fun a b ->
+      Int.abs (a * b) / gcd a b
 
   let rec occurs polyvar ty =
     match ty with
@@ -278,7 +285,6 @@ module Type = struct
     | PolyVar {contents = Forwarded ty} -> occurs polyvar ty
 
     (* TODO: traverse other kinds *)
-
     | _ -> ()
 
   let rec unify a b =
@@ -293,6 +299,18 @@ module Type = struct
         occurs polyvar t;
         polyvar := Forwarded t;
         Ok ()
+
+      | Number a, Number b ->
+        if a.units <> b.units then
+          Error ()
+        else
+          begin match a.denom, b.denom with
+            | Unknown, Unknown -> Ok ()
+            | Known {coeff=coeff_a; vars=vars_a}, Known {coeff=coeff_b; vars=vars_b}
+              when Int.equal coeff_a coeff_b
+                && List.equal Symbol.equal vars_a vars_b ->
+              Ok ()
+          end
 
       | Record a_fields, Record b_fields ->
         (* NOTE: incomplete *)
@@ -677,7 +695,7 @@ module Parsing = struct
     in
 
     (* TODO parse decimal, unit, scientific notation *)
-    let rec number pos yield =
+    let rec number pos =
       let rec aux acc pos =
         match input.[pos] with
         | '0'..'9' as c ->
@@ -686,7 +704,7 @@ module Parsing = struct
           aux (acc + i) (pos + 1)
 
         | exception (Invalid_argument _)
-        | _ -> yield (Int acc) pos
+        | _ -> Int acc, pos
       in
       aux 0 pos
     in
@@ -722,230 +740,222 @@ module Parsing = struct
       | s -> Ident (Symbol.of_string s)
     in
 
-    let rec aux pos yield =
+    let rec aux pos =
       match input.[pos] with
       | ' ' | '\b' | '\012'
       | '\t' | '\011'
-      | '\n' | '\r' -> aux (pos+1) yield
+      | '\n' | '\r' -> aux (pos+1)
 
-      | ',' -> yield Comma (pos+1)
+      | ',' -> Comma, (pos+1)
       | ';' ->
         let pos = skip_comment (pos+1) in
-        aux pos yield
+        aux pos
 
-      | '0'..'9' -> number pos yield
+      | '0'..'9' -> number pos
 
       | 'a'..'z'
       | 'A'..'Z'
       | '_' ->
         symbol pos (fun pos str ->
-            let token = keyword str in
-            yield token pos)
+            keyword str, pos)
 
       | '.' ->
         symbol (pos+1) (fun pos str ->
             match keyword str with
-            | Ident sym -> yield (Field sym) pos
-            | _ -> yield (TokenError "unexpected keyword") pos)
+            | Ident sym -> Field sym, pos
+            | _ -> TokenError "unexpected keyword", pos)
 
       | '\'' ->
         symbol (pos+1) (fun pos str ->
             match keyword str with
-            | Ident sym -> yield (Tag sym) pos
-            | _ -> yield (TokenError "unexpected keyword") pos)
+            | Ident sym -> Tag sym, pos
+            | _ -> TokenError "unexpected keyword", pos)
 
       | '~' ->
         symbol (pos+1) (fun pos str ->
             match keyword str with
-            | Ident sym -> yield (Constructor sym) pos
-            | _ -> yield (TokenError "unexpected keyword") pos)
+            | Ident sym -> Constructor sym, pos
+            | _ -> TokenError "unexpected keyword", pos)
 
       | '-' -> begin match input.[pos+1] with
-          | '>' -> yield Arrow (pos+2)
-          | '0'..'9' -> number pos yield
-          | _ -> yield (UnexpectedChar '-') (pos+1)
+          | '>' -> Arrow, pos+2
+          | '0'..'9' -> number pos
+          | _ -> UnexpectedChar '-', pos+1
         end
 
-      | '=' -> yield Equal (pos+1)
-      | '<' -> yield Less (pos+1)
-      | '>' -> yield Greater (pos+1)
+      | '=' -> Equal, pos+1
+      | '<' -> Less, pos+1
+      | '>' -> Greater, pos+1
 
-      | '(' -> yield LeftParen (pos+1)
-      | ')' -> yield RightParen (pos+1)
-      | '{' -> yield LeftCurly (pos+1)
-      | '}' -> yield RightCurly (pos+1)
-      | '[' -> yield LeftSquare (pos+1)
-      | ']' -> yield RightSquare (pos+1)
+      | '(' -> LeftParen, pos+1
+      | ')' -> RightParen, pos+1
+      | '{' -> LeftCurly, pos+1
+      | '}' -> RightCurly, pos+1
+      | '[' -> LeftSquare, pos+1
+      | ']' -> RightSquare, pos+1
 
-      | '\\' -> yield ForwardSlash (pos+1)
-      | '|' -> yield Pipe (pos+1)
-      | '&' -> yield Ampersand (pos+1)
-      | '^' -> yield Caret (pos+1)
+      | '\\' -> ForwardSlash, pos+1
+      | '|' -> Pipe, pos+1
+      | '&' -> Ampersand, pos+1
+      | '^' -> Caret, pos+1
 
-      | c -> yield (UnexpectedChar c) (pos+1)
-      | exception (Invalid_argument _) -> yield EOF pos
+      | c -> UnexpectedChar c, pos+1
+      | exception (Invalid_argument _) -> EOF, pos
     in
     aux
 
   let parse input =
     let tokenize = tokenize input in
 
-    let expect expected pos k =
-      tokenize pos (fun token pos ->
-          if token = expected then
-            k pos
-          else
-            Error (`UnexpectedToken (token, pos)))
-    in
-
     let rec whole_pat pos k =
-      tokenize pos (fun token pos ->
-          match token with
-          | LeftParen ->
-            whole_pat pos (fun pat pos ->
-                expect RightParen pos (fun pos ->
-                    k pat pos))
+      let token, pos = tokenize pos in
+      match token with
+      | LeftParen ->
+        whole_pat pos (fun pat pos ->
+            let RightParen, pos = tokenize pos in
+            k pat pos)
 
-          | Ident sym -> k (Pat.(Bare (Var sym))) pos
-          | Underscore -> k (Pat.(Bare Wildcard)) pos
+      | Ident sym -> k (Pat.(Bare (Var sym))) pos
+      | Underscore -> k (Pat.(Bare Wildcard)) pos
 
-          | Ampersand ->
-            whole_pat pos (fun pat pos ->
-                k (Pat.(Bare (Roll pat))) pos)
-          | Caret ->
-            whole_pat pos (fun pat pos ->
-                k (Pat.(Bare (Pin pat))) pos)
+      | Ampersand ->
+        whole_pat pos (fun pat pos ->
+            k (Pat.(Bare (Roll pat))) pos)
+      | Caret ->
+        whole_pat pos (fun pat pos ->
+            k (Pat.(Bare (Pin pat))) pos)
 
-          | Constructor sym ->
-            whole_pat pos (fun pat pos ->
-                k (Pat.(Bare (Constructor (sym, pat)))) pos)
+      | Constructor sym ->
+        whole_pat pos (fun pat pos ->
+            k (Pat.(Bare (Constructor (sym, pat)))) pos)
 
-          | token -> Error (`UnexpectedToken (token, pos)))
+      | token -> Error (`UnexpectedToken (token, pos))
     in
 
     let rec atomic_expr pos k =
-      tokenize pos (fun token pos ->
+      let token, pos = tokenize pos in
+      match token with
+      | LeftParen ->
+        whole_expr pos (fun expr pos ->
+            let RightParen, pos = tokenize pos in
+            k expr pos)
+
+      | Int value -> k (Expr.(Bare (Number {
+          value;
+          exp = 0;
+          unit = []
+        }))) pos
+
+      | Ident sym -> k (Expr.(Bare (Var sym))) pos
+
+      | Let ->
+        whole_pat pos (fun pat pos ->
+            let Equal, pos = tokenize pos in
+            whole_expr pos (fun defn pos ->
+                let In, pos = tokenize pos in
+                whole_expr pos (fun body pos ->
+                    let expr = Expr.(Bare (Let {pat; defn; body})) in
+                    k expr pos)))
+
+      | ForwardSlash ->
+        whole_pat pos (fun pat pos ->
+            let Arrow, pos = tokenize pos in
+            whole_expr pos (fun body pos ->
+                let param = Env.Binding {
+                    name = Symbol.of_string "1";
+                    value = pat;
+                    env = Env.Empty
+                  } in
+                let expr = Expr.(Bare (Function {param; body})) in
+                k expr pos))
+
+      | LeftCurly ->
+        let rec aux acc pos =
+          let token, pos = tokenize pos in
           match token with
-          | LeftParen ->
+          | Field name ->
+            let token, pos = tokenize pos in
+            begin match token with
+              | Equal ->
+                whole_expr pos (fun expr pos ->
+                    let acc = Env.Binding {name; value = expr; env = acc} in
+                    aux acc pos)
+            end
+          | Comma -> aux acc pos
+          | RightCurly -> k (Expr.Bare (Record acc)) pos
+          | _ -> Error (`UnexpectedToken (token, pos))
+        in
+        aux Env.Empty pos
+
+      | Tag tag ->
+        let token, next_pos = tokenize pos in
+        match token with
+        | LeftParen ->
+          let rec aux acc pos =
+            (* TODO: this just parses one payload field *)
             whole_expr pos (fun expr pos ->
-                expect RightParen pos (fun pos ->
-                    k expr pos))
+                let RightParen, pos = tokenize pos in
+                let expr = Expr.(Bare (Variant (tag, Env.Binding {
+                    name = Symbol.of_string "1";
+                    value = expr;
+                    env = Env.Empty
+                  })))
+                in
+                k expr pos)
+          in
+          aux Env.Empty next_pos
 
-          | Int value -> k (Expr.(Bare (Number {
-              value;
-              exp = 0;
-              unit = []
-            }))) pos
+        | _ ->
+          k (Expr.(Bare (Variant (tag, Env.Empty)))) pos
 
-          | Ident sym -> k (Expr.(Bare (Var sym))) pos
+        | Ampersand ->
+          whole_expr pos (fun expr pos ->
+              k (Expr.(Bare (Roll expr))) pos)
+        | Caret ->
+          whole_expr pos (fun expr pos ->
+              k (Expr.(Bare (Pin expr))) pos)
 
-          | Let ->
-            whole_pat pos (fun pat pos ->
-                expect Equal pos (fun pos ->
-                    whole_expr pos (fun defn pos ->
-                        expect In pos (fun pos ->
-                            whole_expr pos (fun body pos ->
-                                let expr = Expr.(Bare (Let {pat; defn; body})) in
-                                k expr pos)))))
-
-          | ForwardSlash ->
-            whole_pat pos (fun pat pos ->
-                expect Arrow pos (fun pos ->
-                    whole_expr pos (fun body pos ->
-                        let param = Env.Binding {
-                            name = Symbol.of_string "1";
-                            value = pat;
-                            env = Env.Empty
-                          } in
-                        let expr = Expr.(Bare (Function {param; body})) in
-                        k expr pos)))
-
-          | LeftCurly ->
-            let rec aux acc pos =
-              tokenize pos (fun token pos ->
-                  match token with
-                  | Field name ->
-                    tokenize pos (fun token pos ->
-                        match token with
-                        | Equal ->
-                          whole_expr pos (fun expr pos ->
-                              let acc = Env.Binding {name; value = expr; env = acc} in
-                              aux acc pos))
-                  | Comma -> aux acc pos
-                  | RightCurly -> k (Expr.Bare (Record acc)) pos
-                  | _ -> Error (`UnexpectedToken (token, pos)))
-            in
-            aux Env.Empty pos
-
-          | Tag tag ->
-            tokenize pos (fun token next_pos ->
-                match token with
-                | LeftParen ->
-                  let rec aux acc pos =
-                    (* TODO: this just parses one payload field *)
-                    whole_expr pos (fun expr pos ->
-                        expect RightParen pos (fun pos ->
-                            let expr = Expr.(Bare (Variant (tag, Env.Binding {
-                                name = Symbol.of_string "1";
-                                value = expr;
-                                env = Env.Empty
-                              })))
-                            in
-                            k expr pos))
-                  in
-                  aux Env.Empty next_pos
-
-                | _ ->
-                  k (Expr.(Bare (Variant (tag, Env.Empty)))) pos)
-
-          | Ampersand ->
-            whole_expr pos (fun expr pos ->
-                k (Expr.(Bare (Roll expr))) pos)
-          | Caret ->
-            whole_expr pos (fun expr pos ->
-                k (Expr.(Bare (Pin expr))) pos)
-
-          | Exists ->
-            tokenize pos (fun token pos ->
-                match token with
-                | Ident sym ->
-                  expect In pos (fun pos ->
-                      whole_expr pos (fun body pos ->
-                          let expr = Expr.(Bare (Exists (sym, body))) in
-                          k expr pos)))
+        | Exists ->
+          let token, pos = tokenize pos in
+          match token with
+          | Ident sym ->
+            let In, pos = tokenize pos in
+            whole_expr pos (fun body pos ->
+                let expr = Expr.(Bare (Exists (sym, body))) in
+                k expr pos)
 
           | Constructor sym ->
             whole_expr pos (fun expr pos ->
                 let expr = Expr.(Bare (Constructor (sym, expr))) in
                 k expr pos)
 
-          | token -> Error (`UnexpectedToken (token, pos)))
+          | token -> Error (`UnexpectedToken (token, pos))
 
     and compound_expr left pos k =
-      tokenize pos (fun token next_pos ->
-          match token with
-          | Field name ->
-            let expr = Expr.Bare (Field (left, name)) in
-            compound_expr expr next_pos k
+      let token, next_pos = tokenize pos in
+      match token with
+      | Field name ->
+        let expr = Expr.Bare (Field (left, name)) in
+        compound_expr expr next_pos k
 
-          | LeftParen ->
-            whole_expr next_pos (fun arg pos ->
-                expect RightParen pos (fun pos ->
-                    let args = Env.Binding {
-                        name = Symbol.of_string "1";
-                        value = arg;
-                        env = Env.Empty
-                      }
-                    in
-                    let expr = Expr.(Bare (Apply {
-                        f = left;
-                        args;
-                        dependency = None
-                      }))
-                    in
-                    compound_expr expr pos k))
+      | LeftParen ->
+        whole_expr next_pos (fun arg pos ->
+            let RightParen, pos = tokenize pos in
+            let args = Env.Binding {
+                name = Symbol.of_string "1";
+                value = arg;
+                env = Env.Empty
+              }
+            in
+            let expr = Expr.(Bare (Apply {
+                f = left;
+                args;
+                dependency = None
+              }))
+            in
+            compound_expr expr pos k)
 
-          | _ -> k left pos)
+      | _ -> k left pos
 
     and whole_expr pos k =
       atomic_expr pos (fun inner outer_pos ->
