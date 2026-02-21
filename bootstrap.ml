@@ -711,20 +711,20 @@ module Parsing = struct
 
     let symbol =
       let buf = Buffer.create 16 in
-      let rec aux pos yield =
+      let rec aux pos =
         match input.[pos] with
         | 'a'..'z'
         | 'A'..'Z'
         | '0'..'9'
         | '-' | '_' as c ->
           Buffer.add_char buf c;
-          aux (pos+1) yield
+          aux (pos+1)
 
         | exception (Invalid_argument _)
         | _ ->
           let str = Buffer.contents buf in
           Buffer.reset buf;
-          yield pos str
+          str, pos
       in
       aux
     in
@@ -756,26 +756,29 @@ module Parsing = struct
       | 'a'..'z'
       | 'A'..'Z'
       | '_' ->
-        symbol pos (fun pos str ->
-            keyword str, pos)
+        let str, pos = symbol pos in
+        keyword str, pos
 
       | '.' ->
-        symbol (pos+1) (fun pos str ->
-            match keyword str with
-            | Ident sym -> Field sym, pos
-            | _ -> TokenError "unexpected keyword", pos)
+        let str, pos = symbol (pos+1) in
+        begin match keyword str with
+          | Ident sym -> Field sym, pos
+          | _ -> TokenError "unexpected keyword", pos
+        end
 
       | '\'' ->
-        symbol (pos+1) (fun pos str ->
-            match keyword str with
-            | Ident sym -> Tag sym, pos
-            | _ -> TokenError "unexpected keyword", pos)
+        let str, pos = symbol (pos+1) in
+        begin match keyword str with
+          | Ident sym -> Tag sym, pos
+          | _ -> TokenError "unexpected keyword", pos
+        end
 
       | '~' ->
-        symbol (pos+1) (fun pos str ->
-            match keyword str with
-            | Ident sym -> Constructor sym, pos
-            | _ -> TokenError "unexpected keyword", pos)
+        let str, pos = symbol (pos+1) in
+        begin match keyword str with
+          | Ident sym -> Constructor sym, pos
+          | _ -> TokenError "unexpected keyword", pos
+        end
 
       | '-' -> begin match input.[pos+1] with
           | '>' -> Arrow, pos+2
@@ -807,67 +810,69 @@ module Parsing = struct
   let parse input =
     let tokenize = tokenize input in
 
-    let rec whole_pat pos k =
+    let rec whole_pat pos =
       let token, pos = tokenize pos in
       match token with
       | LeftParen ->
-        whole_pat pos (fun pat pos ->
-            let RightParen, pos = tokenize pos in
-            k pat pos)
+        let pat, pos = whole_pat pos in
+        let RightParen, pos = tokenize pos in
+        pat, pos
 
-      | Ident sym -> k (Pat.(Bare (Var sym))) pos
-      | Underscore -> k (Pat.(Bare Wildcard)) pos
+      | Ident sym -> Pat.(Bare (Var sym)), pos
+      | Underscore -> Pat.(Bare Wildcard), pos
 
       | Ampersand ->
-        whole_pat pos (fun pat pos ->
-            k (Pat.(Bare (Roll pat))) pos)
+        let pat, pos = whole_pat pos in
+        Pat.(Bare (Roll pat)), pos
       | Caret ->
-        whole_pat pos (fun pat pos ->
-            k (Pat.(Bare (Pin pat))) pos)
+        let pat, pos = whole_pat pos in
+        Pat.(Bare (Pin pat)), pos
 
       | Constructor sym ->
-        whole_pat pos (fun pat pos ->
-            k (Pat.(Bare (Constructor (sym, pat)))) pos)
+        let pat, pos = whole_pat pos in
+        Pat.(Bare (Constructor (sym, pat))), pos
 
-      | token -> Error (`UnexpectedToken (token, pos))
+      | token ->
+        let line, col = line_and_col_of_pos input pos in
+        failwith (Printf.sprintf "unexpected token at line %i col %i" line col)
     in
 
-    let rec atomic_expr pos k =
+    let rec atomic_expr pos =
       let token, pos = tokenize pos in
       match token with
       | LeftParen ->
-        whole_expr pos (fun expr pos ->
-            let RightParen, pos = tokenize pos in
-            k expr pos)
+        let expr, pos = whole_expr pos in
+        let RightParen, pos = tokenize pos in
+        expr, pos
 
-      | Int value -> k (Expr.(Bare (Number {
+      | Int value -> Expr.(Bare (Number {
           value;
           exp = 0;
           unit = []
-        }))) pos
+        })), pos
 
-      | Ident sym -> k (Expr.(Bare (Var sym))) pos
+      | Ident sym -> Expr.(Bare (Var sym)), pos
 
       | Let ->
-        whole_pat pos (fun pat pos ->
-            let Equal, pos = tokenize pos in
-            whole_expr pos (fun defn pos ->
-                let In, pos = tokenize pos in
-                whole_expr pos (fun body pos ->
-                    let expr = Expr.(Bare (Let {pat; defn; body})) in
-                    k expr pos)))
+        let pat, pos = whole_pat pos in
+        let Equal, pos = tokenize pos in
+        let defn, pos = whole_expr pos in
+        let In, pos = tokenize pos in
+        let body, pos = whole_expr pos in
+        let expr = Expr.(Bare (Let {pat; defn; body})) in
+        expr, pos
 
       | ForwardSlash ->
-        whole_pat pos (fun pat pos ->
-            let Arrow, pos = tokenize pos in
-            whole_expr pos (fun body pos ->
-                let param = Env.Binding {
-                    name = Symbol.of_string "1";
-                    value = pat;
-                    env = Env.Empty
-                  } in
-                let expr = Expr.(Bare (Function {param; body})) in
-                k expr pos))
+        let pat, pos = whole_pat pos in
+        let Arrow, pos = tokenize pos in
+        let body, pos = whole_expr pos in
+        let param = Env.Binding {
+            name = Symbol.of_string "1";
+            value = pat;
+            env = Env.Empty
+          } in
+        let expr = Expr.(Bare (Function {param; body})) in
+        expr, pos
 
       | LeftCurly ->
         let rec aux acc pos =
@@ -877,93 +882,99 @@ module Parsing = struct
             let token, pos = tokenize pos in
             begin match token with
               | Equal ->
-                whole_expr pos (fun expr pos ->
-                    let acc = Env.Binding {name; value = expr; env = acc} in
-                    aux acc pos)
+                let expr, pos = whole_expr pos in
+                let acc = Env.Binding {name; value = expr; env = acc} in
+                aux acc pos
             end
           | Comma -> aux acc pos
-          | RightCurly -> k (Expr.Bare (Record acc)) pos
-          | _ -> Error (`UnexpectedToken (token, pos))
+          | RightCurly -> Expr.Bare (Record acc), pos
+          | _ ->
+            let line, col = line_and_col_of_pos input pos in
+            failwith (Printf.sprintf "Unexpected token at line %i col %i" line col)
         in
         aux Env.Empty pos
 
       | Tag tag ->
         let token, next_pos = tokenize pos in
-        match token with
-        | LeftParen ->
-          let rec aux acc pos =
-            (* TODO: this just parses one payload field *)
-            whole_expr pos (fun expr pos ->
-                let RightParen, pos = tokenize pos in
-                let expr = Expr.(Bare (Variant (tag, Env.Binding {
-                    name = Symbol.of_string "1";
-                    value = expr;
-                    env = Env.Empty
-                  })))
-                in
-                k expr pos)
-          in
-          aux Env.Empty next_pos
+        begin match token with
+          | LeftParen ->
+            let rec aux acc pos =
+              (* TODO: this just parses one payload field *)
+              let expr, pos = whole_expr pos in
+              let RightParen, pos = tokenize pos in
+              let expr = Expr.(Bare (Variant (tag, Env.Binding {
+                  name = Symbol.of_string "1";
+                  value = expr;
+                  env = Env.Empty
+                })))
+              in
+              expr, pos
+            in
+            aux Env.Empty next_pos
 
-        | _ ->
-          k (Expr.(Bare (Variant (tag, Env.Empty)))) pos
+          | _ ->
+            Expr.(Bare (Variant (tag, Env.Empty))), pos
+        end
 
-        | Ampersand ->
-          whole_expr pos (fun expr pos ->
-              k (Expr.(Bare (Roll expr))) pos)
-        | Caret ->
-          whole_expr pos (fun expr pos ->
-              k (Expr.(Bare (Pin expr))) pos)
+      | Ampersand ->
+        let expr, pos = whole_expr pos in
+        Expr.(Bare (Roll expr)), pos
+      | Caret ->
+        let expr, pos = whole_expr pos in
+        Expr.(Bare (Pin expr)), pos
 
-        | Exists ->
-          let token, pos = tokenize pos in
-          match token with
+      | Exists ->
+        let token, pos = tokenize pos in
+        begin match token with
           | Ident sym ->
             let In, pos = tokenize pos in
-            whole_expr pos (fun body pos ->
-                let expr = Expr.(Bare (Exists (sym, body))) in
-                k expr pos)
+            let body, pos = whole_expr pos in
+            let expr = Expr.(Bare (Exists (sym, body))) in
+            expr, pos
+        end
 
-          | Constructor sym ->
-            whole_expr pos (fun expr pos ->
-                let expr = Expr.(Bare (Constructor (sym, expr))) in
-                k expr pos)
+      | Constructor sym ->
+        let expr, pos = whole_expr pos in
+        let expr = Expr.(Bare (Constructor (sym, expr))) in
+        expr, pos
 
-          | token -> Error (`UnexpectedToken (token, pos))
+      | token ->
+        let line, col = line_and_col_of_pos input pos in
+        failwith (Printf.sprintf "Unexpected token at line %i col %i" line col)
 
-    and compound_expr left pos k =
+    and compound_expr left pos =
       let token, next_pos = tokenize pos in
       match token with
       | Field name ->
         let expr = Expr.Bare (Field (left, name)) in
-        compound_expr expr next_pos k
+        compound_expr expr next_pos
 
       | LeftParen ->
-        whole_expr next_pos (fun arg pos ->
-            let RightParen, pos = tokenize pos in
-            let args = Env.Binding {
-                name = Symbol.of_string "1";
-                value = arg;
-                env = Env.Empty
-              }
-            in
-            let expr = Expr.(Bare (Apply {
-                f = left;
-                args;
-                dependency = None
-              }))
-            in
-            compound_expr expr pos k)
+        let arg, pos = whole_expr next_pos in
+        let RightParen, pos = tokenize pos in
+        let args = Env.Binding {
+            name = Symbol.of_string "1";
+            value = arg;
+            env = Env.Empty
+          }
+        in
+        let expr = Expr.(Bare (Apply {
+            f = left;
+            args;
+            dependency = None
+          }))
+        in
+        compound_expr expr pos
 
-      | _ -> k left pos
+      | _ -> left, pos
 
-    and whole_expr pos k =
-      atomic_expr pos (fun inner outer_pos ->
-          compound_expr inner outer_pos k)
+    and whole_expr pos =
+      let inner, outer_pos = atomic_expr pos in
+      compound_expr inner outer_pos
     in
 
-    whole_expr 0 (fun expr pos ->
-        Ok expr)
+    let expr, _ = whole_expr 0 in
+    Ok expr
 
   let read_file fname =
     let ch = open_in fname in
