@@ -186,7 +186,12 @@ function type are instantiated, assigning new, unique type variables for each
 quantifier. Instead of being bound to the unpack scope, as in the Mitchell-Plotkin
 formulation, the existential quantifier naturally flows outward with the occurrence
 of the associated type variable. A function type's existential quantifiers are written
-before its result type, as in `fun('a) -> exists t. t('a)`.
+before its result type, as in `fun('a) -> exists t. t('a)`. Two function types are the
+same if they differ only in the names of their existential quantifiers, so two functions
+with the same signature but different implementations can be used interchangeably. A
+function that's only applied within another, like `f` in `fun(f, x) -> f(x)`, is
+inferred to have no existential quantifiers. So a function that creates an abstract type
+can't be passed to it - each of its applications would produce a different type.
 
 An abstract type is generalized along with its underlying type. If the underlying type
 contains type variables that get generalized at a `let`, the abstract type becomes a type

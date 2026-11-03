@@ -398,7 +398,7 @@ module Type = struct
     | Link _ -> ()
 
   let unify a b =
-    let seen = ref [] in
+    let seen = ref [] and renamed = ref [] and binders = ref [] in
     let rec go a b =
       match prune a, prune b with
       | Var v1, Var v2 when v1 == v2 -> ()
@@ -406,12 +406,17 @@ module Type = struct
       | Record r1, Record r2 -> rows false r1 r2
       | Variant r1, Variant r2 -> rows true r1 r2
       | Function f1, Function f2 ->
-        if List.compare_lengths f1.exists f2.exists <> 0
-        || not (List.for_all (fun abs -> List.memq abs f2.exists) f1.exists) then
-          raise (Compile_error "functions with different existential types");
+        if List.compare_lengths f1.exists f2.exists <> 0 then
+          raise (Compile_error "functions with different numbers of existential types");
         go f1.inputs f2.inputs;
         go f1.deps f2.deps;
-        go f1.output f2.output
+        (* Existentials match up to renaming *)
+        let outer = !renamed and outer_binders = !binders in
+        if not (List.for_all (fun abs -> List.memq abs f2.exists) f1.exists) then
+          binders := (f1.exists, f2.exists) :: outer_binders;
+        go f1.output f2.output;
+        renamed := outer;
+        binders := outer_binders
       | (Recurs r1 as a), (Recurs r2 as b) ->
         if r1 != r2 && not (List.exists (fun (x, y) -> x == r1 && y == r2) !seen) then begin
           seen := (r1, r2) :: !seen;
@@ -419,12 +424,29 @@ module Type = struct
           go r1.body r2.body
         end
       | Rigid r1, Rigid r2 when r1.abs == r2.abs -> go r1.view r2.view
+      (* Renamed existentials are compared by their parameters, so their
+         underlying types stay hidden *)
+      | (Rigid r1 as a), (Rigid r2 as b) when rename r1.abs r2.abs ->
+        let args1 = args r1.abs r1.view and args2 = args r2.abs r2.view in
+        if List.compare_lengths args1 args2 <> 0 then mismatch a b;
+        List.iter2 go args1 args2
       | a, b -> mismatch a b
+
+    (* Pairs two existentials, one from each function type, the first time
+       they meet; each may only be paired once *)
+    and rename x y =
+      let among (xs, ys) = List.memq x xs && List.memq y ys || List.memq y xs && List.memq x ys in
+      let pairs (x', y') = x' == x && y' == y || x' == y && y' == x in
+      let either (x', y') = x' == x || x' == y || y' == x || y' == y in
+      List.exists pairs !renamed
+      || List.exists among !binders && not (List.exists either !renamed)
+         && (renamed := (x, y) :: !renamed; true)
 
     and mismatch a b =
       let why =
         match a, b with
-        | Rigid r1, Rigid r2 when Symbol.equal r1.abs.name r2.abs.name ->
+        | Rigid r1, Rigid r2
+          when Symbol.equal r1.abs.name r2.abs.name && not (rename r1.abs r2.abs) ->
           ", a different abstract type"
         | _ -> ""
       in

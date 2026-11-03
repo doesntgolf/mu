@@ -1,0 +1,1 @@
+let m1() = abstract T in {.make(x) = the T x, .unwrap(the T x) = x} in let m2() = abstract T in {.make(x) = the T {x}, .unwrap(the T {x}) = x} in let m = #c [#c -> m1, #d -> m2]() in m.unwrap(m.make(#a))
