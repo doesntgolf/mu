@@ -498,24 +498,19 @@ module Type = struct
     in
     go a b
 
-  (* Closes a variant row, so it can't take more tags *)
-  let rec close ty =
-    match prune ty with
-    | Variant {rest = Some rest; _} ->
-      begin match prune rest with
-        | Var _ -> unify rest (Variant {fields = []; rest = None})
-        | rest -> close rest
-      end
-    | _ -> ()
-
-  (* A variant row's tags with their payloads, and whether it's open *)
+  (* A variant row's tags with their payloads, and its tail variable if it's
+     open, which identifies the row *)
   let rec tags ty =
     match prune ty with
     | Variant {fields; rest = Some rest} ->
-      let more, open_ = tags rest in
-      fields @ more, open_
-    | Variant {fields; rest = None} -> fields, false
-    | _ -> [], true
+      let more, tail = tags rest in
+      fields @ more, tail
+    | Variant {fields; rest = None} -> fields, None
+    | Var v -> [], Some v
+    | _ -> [], None
+
+  (* Closes a variant row by its tail, so it can't take more tags *)
+  let close tail = unify (Var tail) (Variant {fields = []; rest = None})
 end
 
 module Pat = struct
@@ -532,11 +527,14 @@ module Pat = struct
     ty : Type.t
   }
 
-  (* Finds a value, as text, that no row of patterns matches, following
-     Maranget's usefulness algorithm. Where a variant row is open and only
-     closing it could make the patterns exhaustive, it's closed, so a match
-     with no catch-all clause gives the scrutinee only the tags it handles. *)
-  let missing rows =
+  type coverage = Exhaustive | Missing of string | Ambiguous
+
+  (* Checks that patterns are exhaustive, following Maranget's usefulness
+     algorithm, and closes the open variant rows they must close to be: those
+     a match can't be exhaustive without, even with every other row closed.
+     Closing a row only removes values, so if closing just those isn't enough,
+     there's no single least choice of rows to close, and it's ambiguous. *)
+  let check pats =
     let wild = {pat = Wildcard; ty = Type.empty} in
     let rec row_type ty =
       match Type.prune ty with
@@ -554,7 +552,10 @@ module Pat = struct
           if Symbol.equal name (label i) then w else "." ^ Symbol.to_string name ^ " = " ^ w)
           (List.combine names ws))
     in
-    let rec go n rows =
+    (* Finds a value, as text, that no row matches, treating the open variant
+       rows [closed] picks as closed, and collecting the open rows into [found] *)
+    let found = ref [] in
+    let rec go closed n rows =
       let rec expand = function
         | {pat = Or (p, q); _} :: rest -> expand (p :: rest) @ expand (q :: rest)
         | row -> [row]
@@ -574,13 +575,14 @@ module Pat = struct
               | [] -> None)
               rows
           in
-          Option.map (fun w -> rebuild (List.take k w) :: List.drop k w) (go (k + n - 1) rows)
+          Option.map (fun w -> rebuild (List.take k w) :: List.drop k w)
+            (go closed (k + n - 1) rows)
         in
         let fields_of names fields =
           List.map (fun name -> Option.value (List.assq_opt name fields) ~default:wild) names
         in
         match List.find_opt (fun p -> not (is_wild p)) heads with
-        | None -> Option.map (fun w -> "_" :: w) (go (n - 1) (List.map List.tl rows))
+        | None -> Option.map (fun w -> "_" :: w) (go closed (n - 1) (List.map List.tl rows))
 
         | Some {pat = Roll _; _} ->
           specialize 1 (function {pat = Roll p; _} -> Some [p] | _ -> None)
@@ -597,8 +599,9 @@ module Pat = struct
             (fun ws -> "{" ^ show_fields names ws ^ "}")
 
         | Some p ->
-          let row = row_type p.ty in
-          let tags, open_ = Type.tags row in
+          let tags, tail = Type.tags (row_type p.ty) in
+          Option.iter (fun v -> if not (List.memq v !found) then found := !found @ [v]) tail;
+          let open_ = match tail with Some v -> not (closed v) | None -> false in
           let seen = List.filter_map (function
               | {pat = Variant (tag, _); _} -> Some tag
               | _ -> None)
@@ -623,7 +626,7 @@ module Pat = struct
                  | ws, _ -> tag ^ "(" ^ show_fields names ws ^ ")")
           in
           let complete = not open_ && List.for_all (fun (tag, _) -> List.memq tag seen) tags in
-          let default () = go (n - 1) (List.filter_map (function
+          let default () = go closed (n - 1) (List.filter_map (function
               | p :: rest when is_wild p -> Some rest
               | _ -> None)
               rows)
@@ -631,12 +634,17 @@ module Pat = struct
           if complete then List.find_map case tags
           else match default () with
             | None -> None
-            | Some _ when open_ ->
-              Type.close row;
-              List.find_map case (fst (Type.tags row))
+            | Some w when open_ -> Some ("_" :: w) (* any other tag *)
             | Some _ -> List.find_map case tags
     in
-    Option.map List.hd (go 1 (List.map (fun p -> [p]) rows))
+    let missing closed = Option.map List.hd (go closed 1 (List.map (fun p -> [p]) pats)) in
+    match missing (fun _ -> true) with
+    | Some w -> Missing w
+    | None ->
+      let forced = List.filter (fun v -> missing (fun v' -> v' != v) <> None) !found in
+      match missing (fun v -> List.memq v forced) with
+      | None -> List.iter Type.close forced; Exhaustive
+      | Some _ -> Ambiguous
 end
 
 module Expr = struct
@@ -885,9 +893,12 @@ module Parsing = struct
     in
 
     let exhaustive pos pats =
-      match Pat.missing pats with
-      | Some w -> fail pos ("patterns are not exhaustive, missing " ^ w)
-      | None -> ()
+      match Pat.check pats with
+      | Exhaustive -> ()
+      | Missing w -> fail pos ("patterns are not exhaustive, missing " ^ w)
+      | Ambiguous ->
+        fail pos "patterns are only exhaustive if more variant types are closed, \
+                  and which ones is ambiguous: add a catch-all clause or a type annotation"
     in
 
     (* Comma separated, up to [closer]: positional items, `.name <sep> item`,

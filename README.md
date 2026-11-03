@@ -44,11 +44,14 @@ scrutinee, as in `x [#some(y) -> y, #none -> d]`. Patterns mirror expressions: v
 alternatives (`p or q`).
 
 Patterns must be exhaustive everywhere they occur - in a match, a `let`, a function's
-parameters, and a `recur`. Where a variant type is still open and a tag isn't handled, at
-any depth, the type is closed to just the tags the patterns handle. So
+parameters, and a `recur`. Patterns close exactly the open variant types they must close to
+be exhaustive, at any depth, to just the tags they handle. So
 `x [#some(#a) -> e1, #none -> e2]` gives `x` the type `[#some([#a]), #none]`, while adding
 a clause `#some(_) -> e3` leaves the payload's type open. A variant type that's already
-closed, like an annotated one, must have all of its tags handled. The prefix forms `&e` and
+closed, like an annotated one, must have all of its tags handled. If there's more than one
+way to choose which types to close, as in `x [#p(.a = #x, .b = _) -> e1, #p(.a = _, .b = #y)
+-> e2]`, which could close either `.a` or `.b`, it's an error - so the inferred type never
+depends on a choice. A catch-all clause or a type annotation resolves it. The prefix forms `&e` and
 `the T e` include field accesses and applications in `e`, but not a match, so
 `&x [&y -> y]` matches on `&x`.
 

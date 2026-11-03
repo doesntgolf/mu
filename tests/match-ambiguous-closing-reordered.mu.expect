@@ -1,0 +1,1 @@
+line 1, column 13: patterns are only exhaustive if more variant types are closed, and which ones is ambiguous: add a catch-all clause or a type annotation
