@@ -1,0 +1,1 @@
+let rect() = abstract T in {.state = the T {.x = #two, .y = #three}, .area(the T d) = #times(d.x, d.y)} in let circle() = abstract T in {.state = the T {.r = #one}, .area(the T d) = #pi_r2(d.r)} in recur go(l <- &#cons({}, &#nil), k = rect) -> let p = k() in l [#nil -> p.area(p.state), #cons(_, t) -> go(t, fun() -> k())]

@@ -152,6 +152,14 @@ recursive type of `e` is inferred: passing a child to `go` gives it the type of 
 itself. Functions written outside of the `recur`, like a `length` function, take an
 index-polymorphic type, so they also work on subterms.
 
+Like a function application, each iteration of a `recur` introduces its own abstract
+types - both those created by `abstract`, and those opened by calling a function with
+existential types. So abstract types introduced in the body may not occur in the result
+or the accumulators, which would carry them between iterations. Otherwise, an iteration
+could apply its own operations to another iteration's values, which may have a different
+underlying type. To pass such a value along, wrap it in a function that creates it, like
+`go(t, fun() -> k())`, or introduce the abstract type outside of the `recur`.
+
 There is also a `forget e` expression (not yet implemented) for moving from a present
 abstract type index to the absent state. This is needed when a value must be both
 recursed on and used as plain data - in merging two sorted lists, the inner `recur` over

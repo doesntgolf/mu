@@ -327,17 +327,19 @@ module Type = struct
           | _ -> None)
         ty
 
-  (* Abstract types introduced within the current function, other than those
-     already quantified by a nested function *)
-  let existentials ty =
+  (* The abstract types in a type, other than those quantified by a function
+     type within it *)
+  let abstracts ty =
     let found = ref [] and bound = ref [] in
     iter (function
-        | Rigid {abs; _} when abs.fun_level > !fun_level && not (List.memq abs !found) ->
-          found := !found @ [abs]
+        | Rigid {abs; _} when not (List.memq abs !found) -> found := !found @ [abs]
         | Function fn -> bound := fn.exists @ !bound
         | _ -> ())
       ty;
     List.filter (fun abs -> not (List.memq abs !bound)) !found
+
+  (* Abstract types introduced within the current function *)
+  let existentials ty = List.filter (fun abs -> abs.fun_level > !fun_level) (abstracts ty)
 
   let mentions abss ty =
     try iter (function Rigid {abs; _} when List.memq abs abss -> raise Exit | _ -> ()) ty; false
@@ -1268,6 +1270,7 @@ module Parsing = struct
           output
         }
       in
+      let start = !Type.counter in
       let body, next =
         expr {scope with vars = (name, ty) :: !binds @ scope.vars} (expect Arrow pos)
       in
@@ -1275,6 +1278,15 @@ module Parsing = struct
       decr Type.fun_level;
       if k.fun_level < level then
         fail pos "recursion index escapes";
+      (* Each iteration introduces its own abstract types, so they can't be
+         passed between iterations, through the result or the accumulators *)
+      let carried = output :: List.map (fun (p, _) -> p.Pat.ty) accs in
+      begin match List.find_opt (fun abs -> abs.Type.id > start)
+                    (List.concat_map Type.abstracts carried) with
+      | Some abs ->
+        fail pos ("abstract type " ^ Symbol.to_string abs.name ^ " escapes the recursion")
+      | None -> ()
+      end;
       let outer = Type.fresh () in
       let input_ty, ty =
         match Type.copy (function Rigid r when r.abs == k -> Some outer | _ -> None)
