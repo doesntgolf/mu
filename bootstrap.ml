@@ -59,8 +59,9 @@ module Type = struct
   and row = {fields : (Symbol.t * t) list; rest : t option}
 
   (* A recursive type's binder is the Recurs node itself, so cyclic types are
-     cyclic graphs *)
-  and recurs = {mutable body : t}
+     cyclic graphs. The index is shared by every layer of a cycle: [empty] when
+     absent, and the Rigid of a `recur` while its subterms are recursed on. *)
+  and recurs = {mutable body : t; index : t}
 
   and var =
     | Unbound of {
@@ -116,6 +117,7 @@ module Type = struct
       | Function fn -> go fn.inputs; go fn.deps; go fn.output
       | Recurs r when not (List.memq r !recs) ->
         recs := r :: !recs;
+        go r.index;
         go r.body
       | Rigid r when repr && not (List.memq r !rigids) ->
         rigids := r :: !rigids;
@@ -198,7 +200,12 @@ module Type = struct
           in
           let name = if cyclic then next () else "_" in
           recs := (r, name) :: !recs;
-          Printf.bprintf buf "rec %s. " name;
+          Buffer.add_string buf "rec ";
+          begin match prune r.index with
+            | Rigid k -> Printf.bprintf buf "[%s] " (Symbol.to_string k.name)
+            | _ -> ()
+          end;
+          Printf.bprintf buf "%s. " name;
           go r.body
 
     and row show_items {fields; rest} =
@@ -238,7 +245,7 @@ module Type = struct
         begin match List.assq_opt r !recs with
           | Some r' -> Recurs r'
           | None ->
-            let r' = {body = r.body} in
+            let r' = {body = r.body; index = go r.index} in
             recs := (r, r') :: !recs;
             r'.body <- go r.body;
             Recurs r'
@@ -265,12 +272,20 @@ module Type = struct
         | _ -> ())
       ty
 
+  (* Copies only when needed, so recursive types keep their identity *)
   let instantiate ty =
     let fresh_for = memo () in
-    copy (function
-        | Var {contents = Unbound u} when u.level = generic -> fresh_for u.id fresh
-        | ty -> ty)
-      ty
+    let find_generic = function
+      | Var {contents = Unbound u} when u.level = generic -> raise Exit
+      | _ -> ()
+    in
+    match iter find_generic ty with
+    | () -> ty
+    | exception Exit ->
+      copy (function
+          | Var {contents = Unbound u} when u.level = generic -> fresh_for u.id fresh
+          | ty -> ty)
+        ty
 
   (* Abstract types introduced within the current function, other than those
      already quantified by a nested function *)
@@ -301,16 +316,35 @@ module Type = struct
       Function {fn with exists = []; output}
     | ty -> ty
 
+  (* A type may only contain itself through a recursive type, and not within a
+     function's parameters, so recursive types stay strictly positive. Looking
+     through abstract types forbids recursion via their underlying types. *)
   let occurs var ty =
-    (* Looking through abstract types forbids recursion via their underlying
-       types, which could otherwise be negative *)
-    iter ~repr:true (function
-        | Var v when v == var -> raise (Compile_error "infinite type")
-        | _ -> ())
-      ty;
+    let seen = ref [] in
+    let rec go guarded positive ty =
+      match prune ty with
+      | Var v when v == var ->
+        if not (guarded && positive) then raise (Compile_error "infinite type")
+      | Record r | Variant r ->
+        List.iter (fun (_, ty) -> go guarded positive ty) r.fields;
+        Option.iter (go guarded positive) r.rest
+      | Function fn ->
+        go guarded false fn.inputs;
+        go guarded false fn.deps;
+        go guarded positive fn.output
+      | Recurs r when not (List.exists (fun (r', p) -> r' == r && p = positive) !seen) ->
+        seen := (r, positive) :: !seen;
+        go guarded positive r.index;
+        go true positive r.body
+      | Rigid r -> go false false r.repr
+      | _ -> ()
+    in
+    go false true ty;
+    (* Through underlying types too, so an abstract type can't carry a `recur`
+       index out of its scope *)
     match !var with
     | Unbound {level = lv; fun_level = fl; _} ->
-      iter (function
+      iter ~repr:true (function
           | Var {contents = Unbound u} ->
             u.level <- min u.level lv;
             u.fun_level <- min u.fun_level fl
@@ -333,13 +367,17 @@ module Type = struct
         go f1.inputs f2.inputs;
         go f1.deps f2.deps;
         go f1.output f2.output
-      | Recurs r1, Recurs r2 ->
+      | (Recurs r1 as a), (Recurs r2 as b) ->
         if r1 != r2 && not (List.exists (fun (x, y) -> x == r1 && y == r2) !seen) then begin
           seen := (r1, r2) :: !seen;
+          (try go r1.index r2.index with Compile_error _ -> mismatch a b);
           go r1.body r2.body
         end
       | Rigid r1, Rigid r2 when r1 == r2 -> ()
-      | a, b -> raise (Compile_error (Printf.sprintf "cannot unify %s with %s" (show a) (show b)))
+      | a, b -> mismatch a b
+
+    and mismatch a b =
+      raise (Compile_error (Printf.sprintf "cannot unify %s with %s" (show a) (show b)))
 
     (* Collects a row's fields through bound row variables; duplicate fields
        (from record extension) must agree *)
@@ -450,6 +488,13 @@ module Expr = struct
       }
 
     | Roll of typed
+    (* `recur name(p <- e, ...) -> body`: [params] start with `&p` *)
+    | Recur of {
+        name : Symbol.t;
+        params : (Symbol.t * Pat.typed) list;
+        args : (Symbol.t * typed) list;
+        body : typed
+      }
 
   and typed = {
     expr : t;
@@ -466,6 +511,7 @@ module Parsing = struct
     | Abstract
     | The
     | Rec
+    | Recur
     | Or
     | Underscore
     | LeftParen
@@ -476,6 +522,7 @@ module Parsing = struct
     | RightSquare
     | Comma
     | Arrow
+    | LeftArrow
     | Equal
     | Colon
     | Dot
@@ -496,6 +543,7 @@ module Parsing = struct
     | Abstract -> "abstract"
     | The -> "the"
     | Rec -> "rec"
+    | Recur -> "recur"
     | Or -> "or"
     | Underscore -> "_"
     | LeftParen -> "("
@@ -506,6 +554,7 @@ module Parsing = struct
     | RightSquare -> "]"
     | Comma -> ","
     | Arrow -> "->"
+    | LeftArrow -> "<-"
     | Equal -> "="
     | Colon -> ":"
     | Dot -> "."
@@ -584,6 +633,7 @@ module Parsing = struct
         | "abstract" -> Abstract
         | "the" -> The
         | "rec" -> Rec
+        | "recur" -> Recur
         | "or" -> Or
         | "_" -> Underscore
         | _ -> Ident sym
@@ -598,6 +648,7 @@ module Parsing = struct
     | '@' -> prefixed (fun sym -> Dep sym)
 
     | '-' when char (pos+1) = '>' -> Arrow, pos+2
+    | '<' when char (pos+1) = '-' -> LeftArrow, pos+2
     | ',' -> Comma, pos+1
     | '=' -> Equal, pos+1
     | ':' -> Colon, pos+1
@@ -756,7 +807,7 @@ module Parsing = struct
       | Rec, next ->
         begin match tokenize next with
           | TypeVar name, next ->
-            let r = {Type.body = Type.empty} in
+            let r = {Type.body = Type.empty; index = Type.fresh ()} in
             let body, pos =
               type_expr scope vars ((name, Some (Type.Recurs r)) :: binders) (expect Dot next)
             in
@@ -826,7 +877,7 @@ module Parsing = struct
 
       | Ampersand, next ->
         let p, pos = atomic_pattern scope binds next in
-        {Pat.pat = Roll p; ty = Recurs {body = p.ty}}, pos
+        {Pat.pat = Roll p; ty = Recurs {body = p.ty; index = Type.fresh ()}}, pos
 
       | The, next ->
         let ty, pos = annotation scope next in
@@ -945,7 +996,13 @@ module Parsing = struct
 
       | Ampersand, next ->
         let e, next = operand scope next in
-        {expr = Roll e; ty = Recurs {body = e.ty}}, next
+        {expr = Roll e; ty = Recurs {body = e.ty; index = Type.empty}}, next
+
+      | Recur, next ->
+        begin match tokenize next with
+          | Ident name, next -> recur scope name (expect LeftParen next)
+          | _ -> unexpected next
+        end
 
       | Abstract, next ->
         begin match tokenize next with
@@ -986,6 +1043,62 @@ module Parsing = struct
         fail pos "abstract type escapes through a parameter";
       let ty = Type.Function {inputs; deps = deps_ty; exists; output = body.ty} in
       {Expr.expr = Function {params; deps; body}; ty}, next
+
+    (* `recur name(p <- e, acc = init, ...) -> body`. Within body, [name]
+       continues with a subterm of e and new accumulators. p matches e's top
+       layer, whose subterms get a fresh index, so only they can be continued
+       with. The index can't escape into the accumulators or anything outside,
+       which is checked like an existential's level. On the way out it becomes
+       e's own index, since the subterms are still e's subterms. *)
+    and recur scope name pos =
+      let level = !Type.fun_level + 1 in
+      let binds = ref [] in
+      Type.fun_level := level;
+      let root, pos = pattern scope binds pos in
+      decr Type.fun_level;
+      let input, pos = expr scope (expect LeftArrow pos) in
+      let rec accs pos =
+        match tokenize pos with
+        | Comma, next ->
+          let p, pos = pattern scope binds next in
+          let init, pos = expr scope (expect Equal pos) in
+          unify pos p.Pat.ty init.Expr.ty;
+          let rest, pos = accs pos in
+          (p, init) :: rest, pos
+        | RightParen, next -> [], next
+        | _ -> unexpected pos
+      in
+      let accs, pos = accs pos in
+      Type.fun_level := level;
+      let k = match Type.rigid name Type.empty with Rigid k -> k | _ -> assert false in
+      let r = {Type.body = root.ty; index = Rigid k} in
+      let labelled xs = List.mapi (fun i x -> label i, x) xs in
+      let params = labelled ({Pat.pat = Roll root; ty = Recurs r} :: List.map fst accs) in
+      let output = Type.fresh () in
+      let ty = Type.Function {
+          inputs = Record {fields = List.map (fun (l, p) -> l, p.Pat.ty) params; rest = None};
+          deps = Type.empty;
+          exists = [];
+          output
+        }
+      in
+      let body, next =
+        expr {scope with vars = (name, ty) :: !binds @ scope.vars} (expect Arrow pos)
+      in
+      unify pos output body.ty;
+      decr Type.fun_level;
+      if k.fun_level < level then
+        fail pos "recursion index escapes";
+      let outer = Type.fresh () in
+      let input_ty, ty =
+        match Type.copy (function Rigid k' when k' == k -> outer | ty -> ty)
+            (Record {fields = [label 0, Recurs r; label 1, output]; rest = None}) with
+        | Record {fields = [_, input_ty; _, ty]; _} -> input_ty, ty
+        | _ -> assert false
+      in
+      unify pos input.ty input_ty;
+      let args = labelled (input :: List.map snd accs) in
+      {expr = Recur {name; params; args; body}; ty}, next
     in
 
     Type.level := 0;
@@ -1010,6 +1123,7 @@ end = struct
         body : Expr.typed;
         env : (Symbol.t * value) list
       }
+    | Native of ((Symbol.t * value) list -> value)
     | Roll of value
 
   (* The current function's dependencies are bound under a name that no
@@ -1028,7 +1142,7 @@ end = struct
         Printf.bprintf buf "#%s(" (Symbol.to_string tag);
         show_fields buf ~sep:"=" aux fields;
         Buffer.add_char buf ')'
-      | Closure _ -> Buffer.add_string buf "<function>"
+      | Closure _ | Native _ -> Buffer.add_string buf "<function>"
       | Roll value -> Buffer.add_char buf '&'; aux value
     in
     aux value;
@@ -1092,9 +1206,11 @@ end = struct
     | Expr.Function {params; deps; body} -> Closure {params; deps; body; env}
 
     | Expr.Apply {f; args; deps} ->
-      begin match eval env f with
+      let f = eval env f in
+      let args = List.map (fun (name, e) -> name, eval env e) args in
+      begin match f with
+        | Native f -> f args
         | Closure c ->
-          let args = List.map (fun (name, e) -> name, eval env e) args in
           let deps = match deps with Some e -> eval env e | None -> Record [] in
           let inner = must (bind_fields ((deps_name, deps) :: c.env) c.params args) in
           let inner = match c.deps with Some p -> must (bind inner p deps) | None -> inner in
@@ -1109,6 +1225,13 @@ end = struct
     | Expr.Let {pat; defn; body} -> eval (must (bind env pat (eval env defn))) body
 
     | Expr.Roll e -> Roll (eval env e)
+
+    (* Unlike a closure, keeps the enclosing function's dependencies *)
+    | Expr.Recur {name; params; args; body} ->
+      let rec continue args =
+        eval (must (bind_fields ((name, Native continue) :: env) params args)) body
+      in
+      continue (List.map (fun (name, e) -> name, eval env e) args)
 end
 
 let run code =
@@ -1119,87 +1242,6 @@ let run code =
     | exception Failure msg -> Error ("runtime error: " ^ msg)
     | value -> Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show value))
 
-let run_tests =
-  let tests = [
-    "{}", "the {} {}";
-    "{.x = #a}.x", "the [#a, ..'a] #a";
-    "{#a, #b}.2", "the [#b, ..'a] #b";
-    "let id = fun(x) -> x in {id(#a), id({})}", "the {[#a, ..'a], {}} {#a, {}}";
-    "let f = fun(a, .b = c) -> {c, a} in f(#x, .b = #y)",
-    "the {[#y, ..'a], [#x, ..'b]} {#y, #x}";
-    "#b [#a -> #yes, #b -> #no]", "the [#yes, #no, ..'a] #no";
-    "#b [#a or #b -> #yes, _ -> #no]", "the [#yes, #no, ..'a] #yes";
-    "#pair(#a, .x = #b) [#pair(a, .x = b) -> {b, a}]", "the {[#b, ..'a], [#a, ..'b]} {#b, #a}";
-    "let r = {.a = #a} in {.b = #b, ..r}", "the {.b : [#b, ..'a], .a : [#a, ..'b]} {.b = #b, .a = #a}";
-    "let r = {.a = #a, .b = #b} in {.a = #c, ..r}.a", "the [#c, #a, ..'a] #c";
-    "let f = fun(x) -> @wrap(x) in f(#a, using {.wrap = fun(y) -> {y}})", "the {[#a, ..'a]} {#a}";
-    "let f = fun(using d) -> d.k in f(using {.k = #v})", "the [#v, ..'a] #v";
-    "let f = fun() -> fun() -> @k in f()(using {.k = #v})", "the [#v, ..'a] #v";
-    "let mk = fun(x) -> abstract t in the t x in mk(#a)", "the t #a";
-    "abstract t in let v = the t #a in v [the t x -> x]", "the [#a, ..'a] #a";
-    "the fun('a) -> 'a fun(x) -> x", "the fun('a) -> 'a <function>";
-    "let l = &#cons(#a, &#nil) in l [&#cons(x, _) -> x, &#nil -> #none]", "the [#none, #a, ..'a] #a";
-    "the (rec 'l. [#nil, #cons('a, 'l)]) &#cons(#x, &#nil)",
-    "the rec 'a. [#nil, #cons([#x, ..'b], 'a)] &#cons(#x, &#nil)";
-    "; comment\n{}", "the {} {}";
-  "let id(x) = x in {id(#a), id({})}", "the {[#a, ..'a], {}} {#a, {}}";
-  "let pair(a, .b = c, using d) = {c, a, d.k} in pair(#x, .b = #y, using {.k = #z})",
-  "the {[#y, ..'a], [#x, ..'b], [#z, ..'c]} {#y, #x, #z}";
-  "let r = {.swap(p) = {p.2, p.1}, .n = #n} in r.swap({#a, #b})", "the {[#b, ..'a], [#a, ..'b]} {#b, #a}";
-  "{.f() = @k}.f(using {.k = #v})", "the [#v, ..'a] #v";
-  "abstract t in the fun([#a]) -> t fun(x) -> x", "the fun([#a]) -> t <function>";
-  "&#a [&x -> x]", "the [#a, ..'a] #a";
-  "let f(x) = x in &f(#a)", "the rec _. [#a, ..'a] &#a";
-  "&{.x = #a}.x [&y -> y]", "the [#a, ..'a] #a";
-  "the [#a, #b] #a [#a -> #x, #b -> #y]", "the [#x, #y, ..'a] #x";
-  "let m = abstract t in the {.make : fun() -> t, .get : fun(t) -> [#a]} {.make() = #a, .get(x) = x} in m.get(m.make())",
-  "the [#a] #a";
-  ] in
-
-  let failing = [
-    "{}.x", "no field .x";
-    "#c [#a -> {}]", "no tag #c";
-    "(the [#a, #b] #a) [#a -> {}]", "no tag #b";
-  "the [#a, #b] #a [#a -> {}]", "no tag #b";
-    "let f = fun() -> @k in f()", "no field .k";
-    "fun(x) -> x [&f -> f(x)]", "infinite type";
-    "the (rec 'l. [#f(fun('l) -> {})]) #f", "not strictly positive";
-    "fun(x) -> abstract t in #c [#c -> x, #d -> the t {}]", "escapes";
-    "let mk = fun(x) -> abstract t in the t x in let same = fun(a, b) -> #c [#c -> a, #d -> b] in same(mk(#a), mk(#a))",
-    "cannot unify t with t";
-    "fun(x) -> abstract t in the t fun(y) -> y [the t f -> f(x)]", "infinite type";
-    "{x}", "unbound variable x";
-    "fun(x, x) -> x", "bound twice";
-  "let f(x) = f(x) in {}", "unbound variable f";
-  "let m = abstract t in the {.make : fun() -> t, .get : fun(t) -> [#a]} {.make() = #a, .get(x) = x} in m.get(#a)",
-  "cannot unify t with [#a";
-  "let {f}(x) = x in {}", "unexpected (";
-  "{.f(x) -> x}", "unexpected ->";
-    "#a [#a or #b(x) -> x]", "same variables";
-  ] in
-
-  fun () ->
-    let contains s sub =
-      let n = String.length sub in
-      let rec aux i = i + n <= String.length s && (String.sub s i n = sub || aux (i+1)) in
-      aux 0
-    in
-    let check code ok expected =
-      match run code, ok with
-      | Ok out, true | Error out, false
-        when (if ok then String.equal out expected else contains out expected) -> true
-      | (Ok out | Error out), _ ->
-        Printf.printf "FAIL: %s\n  expected: %s\n  got:      %s\n" code expected out;
-        false
-    in
-    let results =
-      List.map (fun (code, expected) -> check code true expected) tests
-      @ List.map (fun (code, expected) -> check code false expected) failing
-    in
-    let failures = List.length (List.filter not results) in
-    Printf.printf "%i of %i tests passed\n" (List.length results - failures) (List.length results);
-    if failures = 0 then 0 else 1
-
 let main () =
   let cmd =
     match Sys.argv.(1) with
@@ -1207,8 +1249,6 @@ let main () =
     | "--help" -> `Usage
     | "-v"
     | "--version" -> `Version
-    | "-t"
-    | "--test" -> `RunTests
     | "-"
     | "--" ->`Prog In_channel.(input_all stdin)
     | "-e"
@@ -1222,7 +1262,6 @@ let main () =
     Printf.printf {|usage: %s [command]
 Available commands are:
   -h or --help		Print this help text.
-  -t or --test		Perform bootstrap tests.
   -e or --eval 'code'	Parse, typecheck, and evaluate 'code'.
   -v or --version	Show version information.
   - or --		Parse, typecheck, and evaluate code from stdin.
@@ -1233,8 +1272,6 @@ Available commands are:
   | `Version ->
     print_endline "Mu 0.0.0 alpha";
     0
-
-  | `RunTests -> run_tests ()
 
   | `Prog code ->
     match run code with

@@ -76,13 +76,15 @@ roll in the resulting type should be placed. Instead, a roll on its own doesn't 
 recursive type. Because of our focus on anonymous types, the two types
 `rec 'l. [#cons('l), #nil]` and `rec _. [#cons(rec _. [#nil, ..'a]), ..'b]` are
 compatible, so for `&#cons(&#nil)` we simply infer the latter. An actual recursive type
-comes from a type annotation, as in `the (rec 'l. [#cons('l), #nil]) &#cons(&#nil)`, or
-is inferred for the input of a `recur` expression (below).
+comes from a type annotation, as in `the (rec 'l. [#cons('l), #nil]) &#cons(&#nil)`, is
+inferred for the input of a `recur` expression (below), or arises when unification
+equates a type with a roll of itself.
 
-Recursive types must be strictly positive: in an annotation, the recursive variable may
-not occur within a function's parameter types. Recursion can't be introduced any other
-way - for example, applying an unrolled function to its own rolled form, as the Y
-combinator does, fails the occurs check of unification.
+Recursive types must be strictly positive. In an annotation, the recursive variable may
+not occur within a function's parameter types. In unification, a type may only contain
+itself through a `rec` type, and not within a function's parameter types. So applying an
+unrolled function to its own rolled form, as the Y combinator does, fails the occurs
+check.
 
 ### Recursion
 
@@ -108,9 +110,47 @@ index on a recursive type "at rest" is in the absent state. But within a `recur`
 expression, an abstract variable is introduced in the index on the recursive type of the
 input data being traversed. When unrolling a recursive type, the child form has the same
 type index as the parent; when rolling a new layer onto a recursive type, the index of
-the new parent is always in the absent state. There is also a `forget e` expression for
-moving from a present abstract type index to the absent state. Type inference and checking
-of the type index then uses plain unification.
+the new parent is always in the absent state. Type inference and checking of the type
+index then uses plain unification.
+
+The form is `recur go(p <- e, a = x, b = y) -> body`, with zero or more accumulators
+(here `a` and `b`, with initial values `x` and `y`):
+
+```
+recur go(l <- xs, last = #none) ->
+  l [#nil -> last, #cons(x, t) -> go(t, #some(x))]
+```
+
+The pattern `p` matches the top layer of `e`, already unrolled, and the accumulators are
+patterns too. Within `body`, `go` is an ordinary function value - it can be stored,
+passed around, or renamed - which continues the recursion with a subterm of `e` as its
+first argument, and new accumulator values as its following ones. Each `recur` names its
+own continuation, so a nested `recur` can still continue the outer one.
+
+The subterms of `e` get the fresh index, and `go` only accepts that index. `p`'s own type
+is the unrolled layer, and rolling always gives an absent index, so the only values `go`
+can be applied to are subterms of `e` - their subterms, found by unrolling deeper, are
+fine too. A few more rules keep that true:
+
+ - The index is shared by every iteration, so it may not occur in the accumulators' types.
+   Otherwise an accumulator could carry a subterm into the next iteration, where it would
+   be the current node rather than a subterm.
+ - It may not escape into anything defined outside of the `recur`, including through the
+   underlying type of an abstract type.
+ - On the way out of the `recur`, the index in the result's type becomes `e`'s own index.
+   Subterms of `e` returned by the `recur` are still subterms of `e`, so if `e` is itself
+   a subterm in an enclosing `recur`, that one can continue with them.
+
+A subterm only takes on the index when it's passed to `go`, which is also how the
+recursive type of `e` is inferred: passing a child to `go` gives it the type of `e`
+itself. Functions written outside of the `recur`, like a `length` function, take an
+index-polymorphic type, so they also work on subterms.
+
+There is also a `forget e` expression (not yet implemented) for moving from a present
+abstract type index to the absent state. This is needed when a value must be both
+recursed on and used as plain data - in merging two sorted lists, the inner `recur` over
+the second list must sometimes pass the whole remaining list on to the outer `recur`,
+while its tail is also recursed on.
 
 ### Existential types and type annotation
 
