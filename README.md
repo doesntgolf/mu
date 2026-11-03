@@ -41,8 +41,14 @@ types are written like `{'a, .x : 'b, ..'rest}`.
 Variants are eliminated by `match`, which is written as a list of clauses after the
 scrutinee, as in `x [#some(y) -> y, #none -> d]`. Patterns mirror expressions: variables,
 `_`, records (`{p, .x = q}`, or `{.x = q, ..}` to allow other fields), variants, and
-alternatives (`p or q`). A match without a catch-all clause gives the scrutinee a closed
-variant type, containing only the tags its clauses handle. The prefix forms `&e` and
+alternatives (`p or q`).
+
+Patterns must be exhaustive everywhere they occur - in a match, a `let`, a function's
+parameters, and a `recur`. Where a variant type is still open and a tag isn't handled, at
+any depth, the type is closed to just the tags the patterns handle. So
+`x [#some(#a) -> e1, #none -> e2]` gives `x` the type `[#some([#a]), #none]`, while adding
+a clause `#some(_) -> e3` leaves the payload's type open. A variant type that's already
+closed, like an annotated one, must have all of its tags handled. The prefix forms `&e` and
 `the T e` include field accesses and applications in `e`, but not a match, so
 `&x [&y -> y]` matches on `&x`.
 

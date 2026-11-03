@@ -1,0 +1,1 @@
+the fun([#a], {'a, [#b]}) -> 'a <function>

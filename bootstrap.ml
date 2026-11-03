@@ -423,7 +423,7 @@ module Type = struct
     in
     go a b
 
-  (* Closes a variant row matched without a catch-all clause *)
+  (* Closes a variant row, so it can't take more tags *)
   let rec close ty =
     match prune ty with
     | Variant {rest = Some rest; _} ->
@@ -432,6 +432,15 @@ module Type = struct
         | rest -> close rest
       end
     | _ -> ()
+
+  (* A variant row's tags with their payloads, and whether it's open *)
+  let rec tags ty =
+    match prune ty with
+    | Variant {fields; rest = Some rest} ->
+      let more, open_ = tags rest in
+      fields @ more, open_
+    | Variant {fields; rest = None} -> fields, false
+    | _ -> [], true
 end
 
 module Pat = struct
@@ -448,15 +457,111 @@ module Pat = struct
     ty : Type.t
   }
 
-  (* TODO: full exhaustiveness checking; for now a match needs a catch-all
-     clause or closes the scrutinee's outermost variant row *)
-  let rec irrefutable p =
-    match p.pat with
-    | Var _ | Wildcard -> true
-    | Record fields -> List.for_all (fun (_, p) -> irrefutable p) fields
-    | Variant _ -> false
-    | Roll p -> irrefutable p
-    | Or (p, q) -> irrefutable p || irrefutable q
+  (* Finds a value, as text, that no row of patterns matches, following
+     Maranget's usefulness algorithm. Where a variant row is open and only
+     closing it could make the patterns exhaustive, it's closed, so a match
+     with no catch-all clause gives the scrutinee only the tags it handles. *)
+  let missing rows =
+    let wild = {pat = Wildcard; ty = Type.empty} in
+    let rec row_type ty =
+      match Type.prune ty with
+      | Rigid r -> row_type r.repr (* under `the t`, matching t's underlying type *)
+      | ty -> ty
+    in
+    (* Field names in order of first appearance *)
+    let names fieldss =
+      List.fold_left (fun acc fields ->
+          acc @ List.filter (fun name -> not (List.memq name acc)) (List.map fst fields))
+        [] fieldss
+    in
+    let show_fields names ws =
+      String.concat ", " (List.mapi (fun i (name, w) ->
+          if Symbol.equal name (label i) then w else "." ^ Symbol.to_string name ^ " = " ^ w)
+          (List.combine names ws))
+    in
+    let rec go n rows =
+      let rec expand = function
+        | {pat = Or (p, q); _} :: rest -> expand (p :: rest) @ expand (q :: rest)
+        | row -> [row]
+      in
+      match List.concat_map expand rows with
+      | [] -> Some (List.init n (fun _ -> "_"))
+      | _ when n = 0 -> None
+      | rows ->
+        let is_wild p = match p.pat with Var _ | Wildcard -> true | _ -> false in
+        let heads = List.map List.hd rows in
+        (* Rows whose head is the constructor [sub] picks out, with its k
+           subpatterns in place of the head *)
+        let specialize k sub rebuild =
+          let rows = List.filter_map (function
+              | p :: rest when is_wild p -> Some (List.init k (fun _ -> wild) @ rest)
+              | p :: rest -> Option.map (fun ps -> ps @ rest) (sub p)
+              | [] -> None)
+              rows
+          in
+          Option.map (fun w -> rebuild (List.take k w) :: List.drop k w) (go (k + n - 1) rows)
+        in
+        let fields_of names fields =
+          List.map (fun name -> Option.value (List.assq_opt name fields) ~default:wild) names
+        in
+        match List.find_opt (fun p -> not (is_wild p)) heads with
+        | None -> Option.map (fun w -> "_" :: w) (go (n - 1) (List.map List.tl rows))
+
+        | Some {pat = Roll _; _} ->
+          specialize 1 (function {pat = Roll p; _} -> Some [p] | _ -> None)
+            (fun ws -> "&" ^ List.hd ws)
+
+        | Some {pat = Record _; _} ->
+          let names = names (List.filter_map (function
+              | {pat = Record fields; _} -> Some fields
+              | _ -> None)
+              heads)
+          in
+          specialize (List.length names)
+            (function {pat = Record fields; _} -> Some (fields_of names fields) | _ -> None)
+            (fun ws -> "{" ^ show_fields names ws ^ "}")
+
+        | Some p ->
+          let row = row_type p.ty in
+          let tags, open_ = Type.tags row in
+          let seen = List.filter_map (function
+              | {pat = Variant (tag, _); _} -> Some tag
+              | _ -> None)
+              heads
+          in
+          let case (tag, payload) =
+            let fieldss = List.filter_map (function
+                | {pat = Variant (tag', fields); _} when tag' == tag -> Some fields
+                | _ -> None)
+                heads
+            in
+            let names = names fieldss in
+            specialize (List.length names)
+              (function
+                | {pat = Variant (tag', fields); _} when tag' == tag -> Some (fields_of names fields)
+                | _ -> None)
+              (fun ws ->
+                 let tag = "#" ^ Symbol.to_string tag in
+                 match ws, Type.prune payload with
+                 | [], Record {fields = []; rest = None} -> tag
+                 | [], _ -> tag ^ "(..)"
+                 | ws, _ -> tag ^ "(" ^ show_fields names ws ^ ")")
+          in
+          let complete = not open_ && List.for_all (fun (tag, _) -> List.memq tag seen) tags in
+          let default () = go (n - 1) (List.filter_map (function
+              | p :: rest when is_wild p -> Some rest
+              | _ -> None)
+              rows)
+          in
+          if complete then List.find_map case tags
+          else match default () with
+            | None -> None
+            | Some _ when open_ ->
+              Type.close row;
+              List.find_map case (fst (Type.tags row))
+            | Some _ -> List.find_map case tags
+    in
+    Option.map List.hd (go 1 (List.map (fun p -> [p]) rows))
 end
 
 module Expr = struct
@@ -704,6 +809,12 @@ module Parsing = struct
       try Type.unify a b with Compile_error msg -> fail pos msg
     in
 
+    let exhaustive pos pats =
+      match Pat.missing pats with
+      | Some w -> fail pos ("patterns are not exhaustive, missing " ^ w)
+      | None -> ()
+    in
+
     (* Comma separated, up to [closer]: positional items, `.name <sep> item`,
        `.name(params) <sep> body` given [func], `..rest`, and `using item` *)
     let sequence ?func ?rest ?using ~sep item closer pos =
@@ -933,10 +1044,8 @@ module Parsing = struct
         in
         let clauses, _, _, next = sequence ~sep:Equal clause RightSquare next in
         let clauses = List.map snd clauses in
-        (* Close the clauses' row before the scrutinee can add to it *)
-        if not (List.exists (fun (p, _) -> Pat.irrefutable p) clauses) then
-          Type.close pats_ty;
         unify pos left.ty pats_ty;
+        exhaustive pos (List.map fst clauses);
         compound_expr scope {expr = Match (left, clauses); ty} next
 
       | _ -> left, pos
@@ -968,6 +1077,7 @@ module Parsing = struct
           | _ -> expr scope (expect Equal pos)
         in
         unify pos pat.ty defn.ty;
+        exhaustive pos [pat];
         decr Type.level;
         List.iter (fun (_, ty) -> Type.generalize ty) !binds;
         let body, next = expr {scope with vars = !binds @ scope.vars} (expect In next) in
@@ -1029,15 +1139,16 @@ module Parsing = struct
         sequence ~using:(pattern scope binds) ~sep:Equal (pattern scope binds) RightParen
           (expect LeftParen pos)
       in
+      let inputs =
+        Type.Record {fields = List.map (fun (name, p) -> name, p.Pat.ty) params; rest = None}
+      in
+      exhaustive pos [{pat = Record params; ty = inputs}];
       let deps_ty = Type.fresh () in
-      Option.iter (fun p -> unify pos deps_ty p.Pat.ty) deps;
+      Option.iter (fun p -> unify pos deps_ty p.Pat.ty; exhaustive pos [p]) deps;
       let body, next =
         expr {scope with vars = !binds @ scope.vars; deps = deps_ty} (expect arrow pos)
       in
       decr Type.fun_level;
-      let inputs =
-        Type.Record {fields = List.map (fun (name, p) -> name, p.Pat.ty) params; rest = None}
-      in
       let exists = Type.existentials body.ty in
       if Type.mentions exists inputs || Type.mentions exists deps_ty then
         fail pos "abstract type escapes through a parameter";
@@ -1055,6 +1166,7 @@ module Parsing = struct
       let binds = ref [] in
       Type.fun_level := level;
       let root, pos = pattern scope binds pos in
+      exhaustive pos [root];
       decr Type.fun_level;
       let input, pos = expr scope (expect LeftArrow pos) in
       let rec accs pos =
@@ -1063,6 +1175,7 @@ module Parsing = struct
           let p, pos = pattern scope binds next in
           let init, pos = expr scope (expect Equal pos) in
           unify pos p.Pat.ty init.Expr.ty;
+          exhaustive pos [p];
           let rest, pos = accs pos in
           (p, init) :: rest, pos
         | RightParen, next -> [], next

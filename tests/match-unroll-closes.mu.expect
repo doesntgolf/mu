@@ -1,0 +1,1 @@
+the fun(rec _. [#cons('a, rec _. [#cons('b, 'c), #nil]), #nil]) -> [#2, #1, #0, ..'d] <function>
