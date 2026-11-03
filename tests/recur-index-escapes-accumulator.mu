@@ -1,1 +1,1 @@
-recur go(l <- &#nil, prev = #none) -> prev [#some(p) -> go(p, prev), #none -> l [#cons(_, t) -> go(t, #some(t)), #nil -> {}]]
+recur (l <- &#nil, prev = #none) do prev [#some(p) -> continue(p, prev), #none -> l [#cons(_, t) -> continue(t, #some(t)), #nil -> {}]]

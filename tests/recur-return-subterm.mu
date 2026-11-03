@@ -1,1 +1,1 @@
-recur go(l <- &#cons(#a, &#cons(#b, &#cons(#c, &#nil)))) -> l [#nil -> #none, #cons(x, t) -> x [#b -> #some(t), _ -> go(t)]]
+recur (l <- &#cons(#a, &#cons(#b, &#cons(#c, &#nil)))) do l [#nil -> #none, #cons(x, t) -> x [#b -> #some(t), _ -> continue(t)]]

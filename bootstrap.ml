@@ -33,6 +33,10 @@ exception Compile_error of string
    List.assq and friends apply. Positional fields are labelled 1, 2, ... *)
 let label i = Symbol.of_string (string_of_int (i + 1))
 
+(* Bound within the body of a `recur` *)
+let continue_name = Symbol.of_string "continue"
+let forget_name = Symbol.of_string "forget"
+
 let show_fields buf ~sep show fields =
   List.iteri (fun i (name, x) ->
       if i <> 0 then
@@ -92,9 +96,9 @@ module Type = struct
   let generic = max_int
   let counter = ref 0
 
-  let fresh () =
+  let fresh ?(level = !level) () =
     incr counter;
-    Var (ref (Unbound {id = !counter; level = !level; fun_level = !fun_level}))
+    Var (ref (Unbound {id = !counter; level; fun_level = !fun_level}))
 
   let abstract name repr =
     incr counter;
@@ -676,9 +680,8 @@ module Expr = struct
       }
 
     | Roll of typed
-    (* `recur name(p <- e, ...) -> body`: [params] start with `&p` *)
+    (* `recur (p <- e, ...) do body`: [params] start with `&p` *)
     | Recur of {
-        name : Symbol.t;
         params : (Symbol.t * Pat.typed) list;
         args : (Symbol.t * typed) list;
         body : typed
@@ -700,6 +703,7 @@ module Parsing = struct
     | The
     | Rec
     | Recur
+    | Do
     | Or
     | Underscore
     | LeftParen
@@ -732,6 +736,7 @@ module Parsing = struct
     | The -> "the"
     | Rec -> "rec"
     | Recur -> "recur"
+    | Do -> "do"
     | Or -> "or"
     | Underscore -> "_"
     | LeftParen -> "("
@@ -822,6 +827,7 @@ module Parsing = struct
         | "the" -> The
         | "rec" -> Rec
         | "recur" -> Recur
+        | "do" -> Do
         | "or" -> Or
         | "_" -> Underscore
         | _ -> Ident sym
@@ -1194,11 +1200,7 @@ module Parsing = struct
         let e, next = operand scope next in
         {expr = Roll e; ty = Recurs {body = e.ty; index = Type.empty}}, next
 
-      | Recur, next ->
-        begin match tokenize next with
-          | Ident name, next -> recur scope name (expect LeftParen next)
-          | _ -> unexpected next
-        end
+      | Recur, next -> recur scope (expect LeftParen next)
 
       | Abstract, next ->
         begin match tokenize next with
@@ -1241,13 +1243,14 @@ module Parsing = struct
       let ty = Type.Function {inputs; deps = deps_ty; exists; output = body.ty} in
       {Expr.expr = Function {params; deps; body}; ty}, next
 
-    (* `recur name(p <- e, acc = init, ...) -> body`. Within body, [name]
+    (* `recur (p <- e, acc = init, ...) do body`. Within body, `continue`
        continues with a subterm of e and new accumulators. p matches e's top
        layer, whose subterms get a fresh index, so only they can be continued
        with. The index can't escape into the accumulators or anything outside,
        which is checked like an existential's level. On the way out it becomes
-       e's own index, since the subterms are still e's subterms. *)
-    and recur scope name pos =
+       e's own index, since the subterms are still e's subterms, and `forget`
+       does the same for a layer within body. *)
+    and recur scope pos =
       let level = !Type.fun_level + 1 in
       let binds = ref [] in
       Type.fun_level := level;
@@ -1269,7 +1272,7 @@ module Parsing = struct
       in
       let accs, pos = accs pos in
       Type.fun_level := level;
-      let k = Type.abstract name Type.empty in
+      let k = Type.abstract (Symbol.of_string "recur") Type.empty in
       let r = {Type.body = root.ty; index = Rigid {abs = k; view = Type.empty}} in
       let labelled xs = List.mapi (fun i x -> label i, x) xs in
       let params = labelled ({Pat.pat = Roll root; ty = Recurs r} :: List.map fst accs) in
@@ -1281,10 +1284,20 @@ module Parsing = struct
           output
         }
       in
-      let start = !Type.counter in
-      let body, next =
-        expr {scope with vars = (name, ty) :: !binds @ scope.vars} (expect Arrow pos)
+      (* Any index, so both subterms and the re-rolled layer can be forgotten *)
+      let forget = Type.Function {
+          inputs = Record {
+              fields = [label 0, Recurs {body = root.ty; index = Type.fresh ~level:Type.generic ()}];
+              rest = None
+            };
+          deps = Type.empty;
+          exists = [];
+          output = input.ty
+        }
       in
+      let start = !Type.counter in
+      let vars = !binds @ [continue_name, ty; forget_name, forget] @ scope.vars in
+      let body, next = expr {scope with vars} (expect Do pos) in
       unify pos output body.ty;
       decr Type.fun_level;
       if k.fun_level < level then
@@ -1307,7 +1320,7 @@ module Parsing = struct
       in
       unify pos input.ty input_ty;
       let args = labelled (input :: List.map snd accs) in
-      {expr = Recur {name; params; args; body}; ty}, next
+      {expr = Recur {params; args; body}; ty}, next
     in
 
     Type.level := 0;
@@ -1440,9 +1453,11 @@ end = struct
     | Expr.Roll e -> Roll (eval env e)
 
     (* Unlike a closure, keeps the enclosing function's dependencies *)
-    | Expr.Recur {name; params; args; body} ->
+    | Expr.Recur {params; args; body} ->
+      let forget = Native (fun args -> List.assq (label 0) args) in
       let rec continue args =
-        eval (must (bind_fields ((name, Native continue) :: env) params args)) body
+        let env = (continue_name, Native continue) :: (forget_name, forget) :: env in
+        eval (must (bind_fields env params args)) body
       in
       continue (List.map (fun (name, e) -> name, eval env e) args)
 end

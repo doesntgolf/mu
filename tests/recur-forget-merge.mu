@@ -1,0 +1,1 @@
+let merge(xs, ys) = recur (xl <- xs, ys = ys) do let outer = continue in let forget_outer = forget in xl [#nil -> ys, #cons(x, xt) -> recur (yl <- ys) do yl [#nil -> forget_outer(&xl), #cons(y, yt) -> {x, y} [{#lo, _} -> &#cons(x, outer(xt, forget(&yl))), _ -> &#cons(y, continue(yt))]]] in merge(&#cons(#lo, &#cons(#hi, &#nil)), &#cons(#mid, &#nil))

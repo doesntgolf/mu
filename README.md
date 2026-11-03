@@ -122,24 +122,25 @@ type index as the parent; when rolling a new layer onto a recursive type, the in
 the new parent is always in the absent state. Type inference and checking of the type
 index then uses plain unification.
 
-The form is `recur go(p <- e, a = x, b = y) -> body`, with zero or more accumulators
+The form is `recur (p <- e, a = x, b = y) do body`, with zero or more accumulators
 (here `a` and `b`, with initial values `x` and `y`):
 
 ```
-recur go(l <- xs, last = #none) ->
-  l [#nil -> last, #cons(x, t) -> go(t, #some(x))]
+recur (l <- xs, last = #none) do
+  l [#nil -> last, #cons(x, t) -> continue(t, #some(x))]
 ```
 
 The pattern `p` matches the top layer of `e`, already unrolled, and the accumulators are
-patterns too. Within `body`, `go` is an ordinary function value - it can be stored,
-passed around, or renamed - which continues the recursion with a subterm of `e` as its
-first argument, and new accumulator values as its following ones. Each `recur` names its
-own continuation, so a nested `recur` can still continue the outer one.
+patterns too. Within `body`, `continue` is a function which continues the recursion with
+a subterm of `e` as its first argument, and new accumulator values as its following ones.
+`continue` and `forget` (below) are ordinary values - they can be stored, passed around,
+or renamed. A nested `recur` binds its own, so to use the outer ones within it, bind them
+to other names first, as in `let outer = continue in recur ...`.
 
-The subterms of `e` get the fresh index, and `go` only accepts that index. `p`'s own type
-is the unrolled layer, and rolling always gives an absent index, so the only values `go`
-can be applied to are subterms of `e` - their subterms, found by unrolling deeper, are
-fine too. A few more rules keep that true:
+The subterms of `e` get the fresh index, and `continue` only accepts that index. `p`'s own
+type is the unrolled layer, and rolling always gives an absent index, so the only values
+`continue` can be applied to are subterms of `e` - their subterms, found by unrolling
+deeper, are fine too. A few more rules keep that true:
 
  - The index is shared by every iteration, so it may not occur in the accumulators' types.
    Otherwise an accumulator could carry a subterm into the next iteration, where it would
@@ -150,8 +151,8 @@ fine too. A few more rules keep that true:
    Subterms of `e` returned by the `recur` are still subterms of `e`, so if `e` is itself
    a subterm in an enclosing `recur`, that one can continue with them.
 
-A subterm only takes on the index when it's passed to `go`, which is also how the
-recursive type of `e` is inferred: passing a child to `go` gives it the type of `e`
+A subterm only takes on the index when it's passed to `continue`, which is also how the
+recursive type of `e` is inferred: passing a child to `continue` gives it the type of `e`
 itself. Functions written outside of the `recur`, like a `length` function, take an
 index-polymorphic type, so they also work on subterms.
 
@@ -161,13 +162,29 @@ existential types. So abstract types introduced in the body may not occur in the
 or the accumulators, which would carry them between iterations. Otherwise, an iteration
 could apply its own operations to another iteration's values, which may have a different
 underlying type. To pass such a value along, wrap it in a function that creates it, like
-`go(t, fun() -> k())`, or introduce the abstract type outside of the `recur`.
+`continue(t, fun() -> k())`, or introduce the abstract type outside of the `recur`.
 
-There is also a `forget e` expression (not yet implemented) for moving from a present
-abstract type index to the absent state. This is needed when a value must be both
-recursed on and used as plain data - in merging two sorted lists, the inner `recur` over
-the second list must sometimes pass the whole remaining list on to the outer `recur`,
-while its tail is also recursed on.
+Within `body`, `forget` turns a layer of `e` - a subterm passed to `continue`, or the
+current layer rolled back up as `&p` - into plain data, of `e`'s own type. Like the index
+in the result, the forgotten value is still a subterm of `e`. `forget` is needed when a
+value must be both recursed on and used as plain data. In merging two sorted lists, the
+inner `recur` over the second list must sometimes pass the whole remaining list on to the
+outer `recur`, while its tail is also recursed on:
+
+```
+let merge(xs, ys) =
+  recur (xl <- xs, ys = ys) do
+    let outer = continue in
+    let forget_outer = forget in
+    xl [#nil -> ys,
+        #cons(x, xt) ->
+          recur (yl <- ys) do
+            yl [#nil -> forget_outer(&xl),
+                #cons(y, yt) ->
+                  @less(x, y) [#true -> &#cons(x, outer(xt, forget(&yl))),
+                               #false -> &#cons(y, continue(yt))]]]
+in ...
+```
 
 ### Existential types and type annotation
 

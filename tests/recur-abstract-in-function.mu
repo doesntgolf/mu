@@ -1,1 +1,1 @@
-recur go(l <- &#nil) -> l [#nil -> fun() -> abstract T in the T #a]
+recur (l <- &#nil) do l [#nil -> fun() -> abstract T in the T #a]

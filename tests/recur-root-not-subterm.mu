@@ -1,1 +1,1 @@
-recur go(l <- &#nil) -> go(l)
+recur (l <- &#nil) do continue(l)

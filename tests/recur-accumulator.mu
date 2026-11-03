@@ -1,1 +1,1 @@
-let xs = the (rec 'l. [#nil, #cons('a, 'l)]) &#cons(#a, &#cons(#b, &#nil)) in recur go(l <- xs, last = #none) -> l [#nil -> last, #cons(x, t) -> go(t, #some(x))]
+let xs = the (rec 'l. [#nil, #cons('a, 'l)]) &#cons(#a, &#cons(#b, &#nil)) in recur (l <- xs, last = #none) do l [#nil -> last, #cons(x, t) -> continue(t, #some(x))]

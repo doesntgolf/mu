@@ -1,1 +1,1 @@
-let tree = &#node(&#node(&#leaf, &#leaf), &#leaf) in recur size(n <- tree) -> n [#leaf -> &#z, #node(a, b) -> recur add(m <- size(a), acc = size(b)) -> m [#z -> &#s(acc), #s(p) -> &#s(add(p, acc))]]
+let tree = &#node(&#node(&#leaf, &#leaf), &#leaf) in recur (n <- tree) do n [#leaf -> &#z, #node(a, b) -> recur (m <- continue(a), acc = continue(b)) do m [#z -> &#s(acc), #s(p) -> &#s(continue(p, acc))]]

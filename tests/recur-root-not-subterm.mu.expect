@@ -1,1 +1,1 @@
-line 1, column 22: cannot unify [#nil, ..'a] with rec 'a. 'a
+line 1, column 20: cannot unify [#nil, ..'a] with rec 'a. 'a

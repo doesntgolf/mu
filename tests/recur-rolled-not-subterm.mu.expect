@@ -1,1 +1,1 @@
-line 1, column 39: cannot unify rec [go] _. 'a with rec _. 'a
+line 1, column 43: cannot unify rec [recur] _. 'a with rec _. 'a

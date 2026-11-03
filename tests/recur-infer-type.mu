@@ -1,1 +1,1 @@
-fun(xs) -> recur go(l <- xs) -> l [#nil -> #nil, #cons(_, t) -> go(t)]
+fun(xs) -> recur (l <- xs) do l [#nil -> #nil, #cons(_, t) -> continue(t)]

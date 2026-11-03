@@ -1,1 +1,1 @@
-recur go(#cons(x, t) <- &#cons(#a, &#nil)) -> x
+recur (#cons(x, t) <- &#cons(#a, &#nil)) do x

@@ -1,1 +1,1 @@
-fun(k) -> recur go(l <- &#nil) -> l [#cons(_, t) -> k(t) [_ -> go(t)], #nil -> {}]
+fun(k) -> recur (l <- &#nil) do l [#cons(_, t) -> k(t) [_ -> continue(t)], #nil -> {}]

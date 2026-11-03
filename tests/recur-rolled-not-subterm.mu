@@ -1,1 +1,1 @@
-recur go(l <- &#cons(#a, &#nil)) -> go(&l)
+recur (l <- &#cons(#a, &#nil)) do continue(&l)

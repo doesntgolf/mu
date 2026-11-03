@@ -1,1 +1,1 @@
-recur go(l <- &#cons(#a, &#nil)) -> l [#nil -> #nil, #cons(x, t) -> let f = go in f(t)]
+recur (l <- &#cons(#a, &#nil)) do l [#nil -> #nil, #cons(x, t) -> let f = continue in f(t)]
