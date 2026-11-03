@@ -49,12 +49,15 @@ module Type = struct
     | Function of {
         inputs : t;
         deps : t;
-        exists : int list;
+        exists : abstract list; (* quantified in output, written `exists t.` *)
         output : t
       }
     | Recurs of recurs
     | Var of var ref
-    | Rigid of rigid
+    (* An occurrence of an abstract type, with its view of the underlying type.
+       The abstract type is parameterized by the variables of its underlying
+       type that get generalized, so [view] is an instance of [abs.repr]. *)
+    | Rigid of {abs : abstract; view : t}
 
   and row = {fields : (Symbol.t * t) list; rest : t option}
 
@@ -71,7 +74,7 @@ module Type = struct
       }
     | Link of t
 
-  and rigid = {
+  and abstract = {
     name : Symbol.t;
     id : int;
     mutable fun_level : int;
@@ -93,9 +96,11 @@ module Type = struct
     incr counter;
     Var (ref (Unbound {id = !counter; level = !level; fun_level = !fun_level}))
 
-  let rigid name repr =
+  let abstract name repr =
     incr counter;
-    Rigid {name; id = !counter; fun_level = !fun_level; repr}
+    {name; id = !counter; fun_level = !fun_level; repr}
+
+  let rigid name repr = Rigid {abs = abstract name repr; view = repr}
 
   let empty = Record {fields = []; rest = None}
 
@@ -103,10 +108,9 @@ module Type = struct
     | Var {contents = Link ty} -> prune ty
     | ty -> ty
 
-  (* Visits each node, following each cycle once. With ~repr, also visits the
-     underlying types of abstract types. *)
-  let iter ?(repr = false) f ty =
-    let recs = ref [] and rigids = ref [] in
+  (* Visits each node, following each cycle once *)
+  let iter f ty =
+    let recs = ref [] in
     let rec go ty =
       let ty = prune ty in
       f ty;
@@ -119,12 +123,33 @@ module Type = struct
         recs := r :: !recs;
         go r.index;
         go r.body
-      | Rigid r when repr && not (List.memq r !rigids) ->
-        rigids := r :: !rigids;
-        go r.repr
+      | Rigid r -> go r.view
       | _ -> ()
     in
     go ty
+
+  (* What each of an abstract type's parameters - the generalized variables of
+     its underlying type - is in an occurrence's [view] *)
+  let args abs view =
+    let found = ref [] and recs = ref [] in
+    let rec go a b =
+      match prune a, prune b with
+      | Var ({contents = Unbound {level; _}} as v), b when level = generic ->
+        if not (List.mem_assq v !found) then
+          found := !found @ [v, b]
+      | Record r1, Record r2 | Variant r1, Variant r2 ->
+        List.iter (fun (name, a) -> Option.iter (go a) (List.assq_opt name r2.fields)) r1.fields;
+        Option.iter (fun a -> Option.iter (go a) r2.rest) r1.rest
+      | Function f1, Function f2 -> go f1.inputs f2.inputs; go f1.deps f2.deps; go f1.output f2.output
+      | Recurs r1, Recurs r2 when not (List.memq r1 !recs) ->
+        recs := r1 :: !recs;
+        go r1.index r2.index;
+        go r1.body r2.body
+      | Rigid r1, Rigid r2 -> go r1.view r2.view
+      | _ -> ()
+    in
+    go abs.repr view;
+    List.map snd !found
 
   let show ty =
     let buf = Buffer.create 32 in
@@ -149,7 +174,15 @@ module Type = struct
         Buffer.add_string buf name
       | Var {contents = Link _} -> assert false
 
-      | Rigid r -> Buffer.add_string buf (Symbol.to_string r.name)
+      | Rigid {abs; view} ->
+        Buffer.add_string buf (Symbol.to_string abs.name);
+        begin match args abs view with
+          | [] -> ()
+          | args ->
+            Buffer.add_char buf '(';
+            List.iteri (fun i ty -> if i <> 0 then Buffer.add_string buf ", "; go ty) args;
+            Buffer.add_char buf ')'
+        end
 
       | Record r ->
         Buffer.add_char buf '{';
@@ -188,6 +221,9 @@ module Type = struct
             go deps
         end;
         Buffer.add_string buf ") -> ";
+        if fn.exists <> [] then
+          Printf.bprintf buf "exists %s. "
+            (String.concat ", " (List.map (fun abs -> Symbol.to_string abs.name) fn.exists));
         go fn.output
 
       | Recurs r ->
@@ -202,7 +238,7 @@ module Type = struct
           recs := (r, name) :: !recs;
           Buffer.add_string buf "rec ";
           begin match prune r.index with
-            | Rigid k -> Printf.bprintf buf "[%s] " (Symbol.to_string k.name)
+            | Rigid {abs; _} -> Printf.bprintf buf "[%s] " (Symbol.to_string abs.name)
             | _ -> ()
           end;
           Printf.bprintf buf "%s. " name;
@@ -232,7 +268,7 @@ module Type = struct
     Buffer.contents buf
 
   (* Copies a type, preserving cycles, with [leaf] choosing replacements for
-     variables *)
+     variables and abstract types *)
   let copy leaf ty =
     let recs = ref [] in
     let rec go ty =
@@ -250,7 +286,11 @@ module Type = struct
             r'.body <- go r.body;
             Recurs r'
         end
-      | ty -> leaf ty
+      | ty ->
+        match leaf ty, ty with
+        | Some ty, _ -> ty
+        | None, Rigid r -> Rigid {r with view = go r.view}
+        | None, ty -> ty
     and row {fields; rest} =
       {fields = List.map (fun (name, ty) -> name, go ty) fields; rest = Option.map go rest}
     in
@@ -283,8 +323,8 @@ module Type = struct
     | () -> ty
     | exception Exit ->
       copy (function
-          | Var {contents = Unbound u} when u.level = generic -> fresh_for u.id fresh
-          | ty -> ty)
+          | Var {contents = Unbound u} when u.level = generic -> Some (fresh_for u.id fresh)
+          | _ -> None)
         ty
 
   (* Abstract types introduced within the current function, other than those
@@ -292,28 +332,32 @@ module Type = struct
   let existentials ty =
     let found = ref [] and bound = ref [] in
     iter (function
-        | Rigid r when r.fun_level > !fun_level -> found := r.id :: !found
+        | Rigid {abs; _} when abs.fun_level > !fun_level && not (List.memq abs !found) ->
+          found := !found @ [abs]
         | Function fn -> bound := fn.exists @ !bound
         | _ -> ())
       ty;
-    List.sort_uniq Int.compare (List.filter (fun id -> not (List.mem id !bound)) !found)
+    List.filter (fun abs -> not (List.memq abs !bound)) !found
 
-  let mentions ids ty =
-    try iter (function Rigid r when List.mem r.id ids -> raise Exit | _ -> ()) ty; false
+  let mentions abss ty =
+    try iter (function Rigid {abs; _} when List.memq abs abss -> raise Exit | _ -> ()) ty; false
     with Exit -> true
 
-  (* At application, each existential gets a fresh abstract type *)
+  (* At application, each existential gets a fresh abstract type, keeping the
+     original underlying type to find its parameters *)
   let open_exists ty =
     match prune ty with
     | Function fn when fn.exists <> [] ->
-      let exists = fn.exists and fresh_for = memo () in
-      let output = copy (function
-          | Rigid r when List.mem r.id exists ->
-            fresh_for r.id (fun () -> rigid r.name (fresh ()))
-          | ty -> ty)
-          fn.output
+      let fresh_for = memo () in
+      let rec output ty =
+        copy (function
+            | Rigid r when List.memq r.abs fn.exists ->
+              let abs = fresh_for r.abs.id (fun () -> abstract r.abs.name r.abs.repr) in
+              Some (Rigid {abs; view = output r.view})
+            | _ -> None)
+          ty
       in
-      Function {fn with exists = []; output}
+      Function {fn with exists = []; output = output fn.output}
     | ty -> ty
 
   (* A type may only contain itself through a recursive type, and not within a
@@ -336,7 +380,7 @@ module Type = struct
         seen := (r, positive) :: !seen;
         go guarded positive r.index;
         go true positive r.body
-      | Rigid r -> go false false r.repr
+      | Rigid r -> go false false r.view
       | _ -> ()
     in
     go false true ty;
@@ -344,11 +388,11 @@ module Type = struct
        index out of its scope *)
     match !var with
     | Unbound {level = lv; fun_level = fl; _} ->
-      iter ~repr:true (function
+      iter (function
           | Var {contents = Unbound u} ->
             u.level <- min u.level lv;
             u.fun_level <- min u.fun_level fl
-          | Rigid r -> r.fun_level <- min r.fun_level fl
+          | Rigid {abs; _} -> abs.fun_level <- min abs.fun_level fl
           | _ -> ())
         ty
     | Link _ -> ()
@@ -362,7 +406,8 @@ module Type = struct
       | Record r1, Record r2 -> rows false r1 r2
       | Variant r1, Variant r2 -> rows true r1 r2
       | Function f1, Function f2 ->
-        if List.sort Int.compare f1.exists <> List.sort Int.compare f2.exists then
+        if List.compare_lengths f1.exists f2.exists <> 0
+        || not (List.for_all (fun abs -> List.memq abs f2.exists) f1.exists) then
           raise (Compile_error "functions with different existential types");
         go f1.inputs f2.inputs;
         go f1.deps f2.deps;
@@ -373,11 +418,17 @@ module Type = struct
           (try go r1.index r2.index with Compile_error _ -> mismatch a b);
           go r1.body r2.body
         end
-      | Rigid r1, Rigid r2 when r1 == r2 -> ()
+      | Rigid r1, Rigid r2 when r1.abs == r2.abs -> go r1.view r2.view
       | a, b -> mismatch a b
 
     and mismatch a b =
-      raise (Compile_error (Printf.sprintf "cannot unify %s with %s" (show a) (show b)))
+      let why =
+        match a, b with
+        | Rigid r1, Rigid r2 when Symbol.equal r1.abs.name r2.abs.name ->
+          ", a different abstract type"
+        | _ -> ""
+      in
+      raise (Compile_error (Printf.sprintf "cannot unify %s with %s%s" (show a) (show b) why))
 
     (* Collects a row's fields through bound row variables; duplicate fields
        (from record extension) must agree *)
@@ -465,7 +516,7 @@ module Pat = struct
     let wild = {pat = Wildcard; ty = Type.empty} in
     let rec row_type ty =
       match Type.prune ty with
-      | Rigid r -> row_type r.repr (* under `the t`, matching t's underlying type *)
+      | Rigid r -> row_type r.view (* under `the t`, matching t's underlying type *)
       | ty -> ty
     in
     (* Field names in order of first appearance *)
@@ -779,8 +830,8 @@ module Parsing = struct
      by its underlying type, so T can be a whole signature *)
   let repr ty =
     Type.copy (function
-        | Rigid r -> r.repr
-        | ty -> ty)
+        | Rigid r -> Some r.view
+        | _ -> None)
       ty
 
   let variant_type tag payload =
@@ -1183,8 +1234,8 @@ module Parsing = struct
       in
       let accs, pos = accs pos in
       Type.fun_level := level;
-      let k = match Type.rigid name Type.empty with Rigid k -> k | _ -> assert false in
-      let r = {Type.body = root.ty; index = Rigid k} in
+      let k = Type.abstract name Type.empty in
+      let r = {Type.body = root.ty; index = Rigid {abs = k; view = Type.empty}} in
       let labelled xs = List.mapi (fun i x -> label i, x) xs in
       let params = labelled ({Pat.pat = Roll root; ty = Recurs r} :: List.map fst accs) in
       let output = Type.fresh () in
@@ -1204,7 +1255,7 @@ module Parsing = struct
         fail pos "recursion index escapes";
       let outer = Type.fresh () in
       let input_ty, ty =
-        match Type.copy (function Rigid k' when k' == k -> outer | ty -> ty)
+        match Type.copy (function Rigid r when r.abs == k -> Some outer | _ -> None)
             (Record {fields = [label 0, Recurs r; label 1, output]; rest = None}) with
         | Record {fields = [_, input_ty; _, ty]; _} -> input_ty, ty
         | _ -> assert false
@@ -1218,7 +1269,11 @@ module Parsing = struct
     Type.fun_level := 0;
     let e, pos = expr {vars = []; types = []; deps = Type.empty} 0 in
     match tokenize pos with
-    | EOF, _ -> e
+    | EOF, _ ->
+      (* The implicit top-level `let` *)
+      decr Type.level;
+      Type.generalize e.ty;
+      e
     | _ -> unexpected pos
 end
 

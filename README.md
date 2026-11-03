@@ -185,7 +185,22 @@ At every function application, the existential quantifiers associated with the
 function type are instantiated, assigning new, unique type variables for each
 quantifier. Instead of being bound to the unpack scope, as in the Mitchell-Plotkin
 formulation, the existential quantifier naturally flows outward with the occurrence
-of the associated type variable.
+of the associated type variable. A function type's existential quantifiers are written
+before its result type, as in `fun('a) -> exists t. t('a)`.
+
+An abstract type is generalized along with its underlying type. If the underlying type
+contains type variables that get generalized at a `let`, the abstract type becomes a type
+constructor with those variables as its parameters:
+
+```
+let mod = abstract T in {.make(x) = the T x, .unwrap(the T x) = x} in ...
+```
+
+gives `mod` the type `{.make : fun('a) -> T('a), .unwrap : fun(T('a)) -> 'a}`, so
+`mod.make(#a)` and `mod.make({})` have the different types `T([#a, ..'b])` and `T({})`.
+Without the parameter, both would have type `T`, and `mod.unwrap` would return a value
+of any type at all. Within its `abstract` scope, an abstract type is written without
+parameters, since its underlying type isn't generalized until the scope has ended.
 
 Mu's type annotations - written `the <type> <expr>` - may be used in either expression
 or pattern position, and they actually have a simple typing rule which isn't simply
