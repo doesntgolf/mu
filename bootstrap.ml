@@ -27,804 +27,496 @@ end = struct
   let to_string s = s
 end
 
-module Assoc(M : sig
-    type t
-    val equal : t -> t -> bool
-  end) = struct
+exception Compile_error of string
 
-  type 'a t =
-    | Binding of {name : M.t; value : 'a; env : 'a t}
-    | Empty
+(* Fields, environments and rows are association lists keyed by symbols, so
+   List.assq and friends apply. Positional fields are labelled 1, 2, ... *)
+let label i = Symbol.of_string (string_of_int (i + 1))
 
-  let empty = Empty
-  let is_empty = function
-    | Binding _ -> false
-    | Empty -> true
-
-  let singleton name value = Binding {name; value; env = Empty}
-  let add name value env = Binding {name; value; env}
-
-  let remove key env =
-    let rec aux = function
-      | Binding {name; env; _} when M.equal name key -> env
-      | Binding {name; value; env} -> Binding {name; value; env = aux env}
-      | Empty -> Empty
-    in
-    aux env
-
-  let find_opt key env =
-    let rec aux = function
-      | Binding {name; value; _} when M.equal name key -> Some value
-      | Binding {env; _} -> aux env
-      | Empty -> None
-    in
-    aux env
-
-  let find key env = Option.get (find_opt key env)
-
-  let rev env =
-    let rec aux acc = function
-      | Binding {name; value; env} -> aux (Binding {name; value; env=acc}) env
-      | Empty -> acc
-    in
-    aux Empty env
-
-  let map f env =
-    let rec aux acc = function
-      | Binding {name; value; env} ->
-        let acc = Binding {name; value = f value; env = acc} in
-        aux acc env
-      | Empty ->
-        rev acc
-    in
-    aux Empty env
-
-  let fold f env init =
-    let rec aux acc = function
-      | Empty -> acc
-      | Binding {name; value; env} ->
-        let acc = f name value acc in
-        aux acc env
-    in
-    aux init env
-
-  let merge f xs ys =
-    let rec aux acc = function
-      | Binding {name; value; env} ->
-        let y = find_opt name ys in
-        let acc =
-          match f name (Some value) y with
-          | Some value -> Binding {name; value; env=acc}
-          | None       -> acc
-        in
-        aux acc env
-      | Empty -> acc
-    in
-    let acc = aux Empty xs in
-
-    let rec aux acc = function
-      | Binding {name; value; env} ->
-        let acc =
-          match find_opt name xs with
-          | Some _ -> acc
-          | None -> match f name None (Some value) with
-            | Some z -> add name z acc
-            | None -> acc
-        in
-        aux acc env
-      | Empty -> acc
-    in
-    aux acc ys
-
-  let iteri f env =
-    let rec aux i = function
-      | Binding {name; value; env} -> f name value i; aux (i+1) env
-      | Empty -> ()
-    in
-    aux 0 env
-end
-
-module Env = Assoc(Symbol)
-
-module Abelian = struct
-  type mult_expr =
-      Factor of Symbol.t
-    | One
-    | Mul of mult_expr * mult_expr
-    | Inv of mult_expr
-
-  let combine_exponents =
-    Env.merge (fun _ c1 c2 ->
-        let v1 = Option.value c1 ~default:0 in
-        let v2 = Option.value c2 ~default:0 in
-        match v1 + v2 with
-        | 0 -> None
-        | sum -> Some sum)
-
-  let invert_exponents =
-    Env.map (fun c -> -c)
-
-  let rec normalize = function
-    | One -> Env.empty
-    | Factor x -> Env.singleton x 1
-    | Mul (t1, t2) -> combine_exponents (normalize t1) (normalize t2)
-    | Inv t1 -> invert_exponents (normalize t1)
-
-  let apply_subst_to_term x t_sub t =
-    match Env.find_opt x t with
-    | None -> t
-    | Some cx ->
-      let without_x = Env.remove x t in
-      let scaled_sub = Env.map (fun c -> c * cx) t_sub in
-      combine_exponents without_x scaled_sub
-
-  let apply_subst_to_env x t_sub =
-    List.map (fun (y, ty) -> (y, apply_subst_to_term x t_sub ty))
-
-  let fresh_var =
-    let counter = ref 0 in
-    fun () ->
-      incr counter;
-      Symbol.of_string (Printf.sprintf "z_%i" !counter)
-
-  let rec solve_diophantine ratio =
-    if Env.is_empty ratio then []
-    else
-      let min_var, min_c =
-        Env.fold (fun v c (mv, mc) ->
-            let abs_c = abs c in
-            if abs_c > 0  && abs_c < mc then Some v, abs_c
-            else mv, mc)
-          ratio (None, max_int)
-      in
-      match min_var with
-      | None -> []
-      | Some xm ->
-        let cm = Env.find xm ratio in
-
-        if Int.equal (abs cm) 1 then
-          let sign = -cm in
-          let rhs = Env.fold
-              (fun v c acc ->
-                 if Symbol.equal v xm then acc
-                 else Env.add v (sign * c) acc)
-              ratio
-              Env.empty
-          in
-          [(xm, rhs)]
-        else
-          let fresh_z = fresh_var () in
-
-          let qs, rs = Env.fold
-              (fun v c (q_map, r_map) ->
-                 if Symbol.equal v xm then (q_map, r_map)
-                 else
-                   let q = c / cm in
-                   let r = c mod cm in
-                   let q, r =
-                     if r < 0 && cm > 0 then (q - 1, r + cm)
-                     else if r > 0 && cm < 0 then (q - 1, r - cm)
-                     else (q, r)
-                   in
-                   (Env.add v q q_map, Env.add v r r_map))
-              ratio
-              (Env.empty, Env.empty)
-          in
-
-          let xm_subst = Env.add fresh_z 1 (invert_exponents qs) in
-          let new_eq = Env.add fresh_z cm rs in
-          let deeper_substs = solve_diophantine new_eq in
-          let final_xm_subst =
-            List.fold_left
-              (fun acc (sv, srhs) -> apply_subst_to_term sv srhs acc)
-              xm_subst
-              deeper_substs
-          in
-
-          (xm, final_xm_subst) :: deeper_substs
-
-  let unify t1 t2 =
-    let ratio = normalize (Mul (t1, Inv t2)) in
-    solve_diophantine ratio
-
-  let factorize n =
-    if n <= 1 then []
-    else
-      let rec aux d n count acc =
-        if Int.equal n 1 then
-          if count > 0 then (d, count) :: acc
-          else acc
-        else if Int.equal (n mod d) 0 then
-          aux d (n / d) (count + 1) acc
-        else
-          let next_d = if Int.equal d 0 then 3 else d + 2 in
-          let new_acc =
-            if count > 0 then (d, count) :: acc
-            else acc
-          in
-          if d * d > n then (n, 1) :: new_acc
-          else aux next_d n 0 new_acc
-      in
-      aux 2 n 0 []
-
-  let rational_to_scale numer denom =
-    let add_factors factors sign map =
-      List.fold_left
-        (fun acc (p, exp) ->
-           let p_sym = string_of_int p |> Symbol.of_string in
-           let current = match Env.find_opt p_sym acc with
-             | Some c -> c
-             | None -> 0
-           in
-           let updated = current + (sign * exp) in
-           if Int.equal updated 0 then
-             Env.remove p_sym acc
-           else
-             Env.add p_sym updated acc)
-        map
-        factors
-    in
-    let map_num = add_factors (factorize (abs numer)) 1 Env.empty in
-    add_factors (factorize (abs denom)) (-1) map_num
-end
+let show_fields buf ~sep show fields =
+  List.iteri (fun i (name, x) ->
+      if i <> 0 then
+        Buffer.add_string buf ", ";
+      if not (Symbol.equal name (label i)) then
+        Printf.bprintf buf ".%s %s " (Symbol.to_string name) sep;
+      show x)
+    fields
 
 module Type = struct
-  type annotation =
-      Forall of Symbol.t * annotation
-    | Exists of Symbol.t * annotation
-    | Recurs of Symbol.t * annotation
-    | Var of Symbol.t
-    | Function of {
-        inputs : annotation Env.t;
-        output : annotation
-      }
-    | Record of {fields : annotation Env.t; row : annotation option}
-    | Variant of {variants : annotation Env.t Env.t; row : annotation option}
-
   type t =
-    | Record of {fields : t Env.t; row : t option}
-    | Variant of {variants : (t Env.t) Env.t; row : t option}
+    | Record of row
+    | Variant of row (* each tag's payload is a Record *)
     | Function of {
-        inputs : t Env.t;
+        inputs : t;
+        deps : t;
         exists : int list;
         output : t
       }
-    | Recurs of {
-        binder : Symbol.t;
-        body : t
-      }
-    | Repr of t
-    | PolyVar of polyvar ref
-    | RigidVar of {
+    | Recurs of recurs
+    | Var of var ref
+    | Rigid of rigid
+
+  and row = {fields : (Symbol.t * t) list; rest : t option}
+
+  (* A recursive type's binder is the Recurs node itself, so cyclic types are
+     cyclic graphs *)
+  and recurs = {mutable body : t}
+
+  and var =
+    | Unbound of {
         id : int;
+        mutable level : int;
         mutable fun_level : int
       }
-    | Error of string
+    | Link of t
 
-  and polyvar =
-      Unbound of {
-        id : int;
-        mutable let_level : int
-      }
-    | Forwarded of t
-
-  type scheme = Forall of int list * t
-
-  let type_of_annotation anno =
-    ()
-
-  let show ty = 
-    let buf = Buffer.create 16 in
-    let rec aux = function
-      | Record {fields; _} ->
-        Buffer.add_char buf '{';
-        Env.iteri
-          (fun name ty i ->
-             if i <> 0 then
-               Buffer.add_string buf ", ";
-             Printf.bprintf buf ".%s = " (Symbol.to_string name);
-             aux ty)
-          fields;
-        Buffer.add_char buf '}';
-
-      | PolyVar {contents = Unbound {id; _}} -> Printf.bprintf buf "`%i" id
-      | PolyVar {contents = Forwarded ty} -> aux ty
-
-      | RigidVar {id; _} -> Printf.bprintf buf "~%i" id
-
-      | Function {inputs; exists; output} ->
-        Buffer.add_string buf "fun(";
-        Env.iteri (fun name ty i ->
-            if i <> 0 then
-              Buffer.add_string buf ", ";
-            Printf.bprintf buf ".%s = " (Symbol.to_string name);
-            aux ty)
-          inputs;
-        Buffer.add_string buf ") -> ";
-        aux output
-
-      | Variant {variants; _} ->
-        Buffer.add_char buf '[';
-        Env.iteri (fun name fields i ->
-            if i <> 0 then
-              Buffer.add_string buf ", ";
-            match fields with
-            | Env.Empty -> Printf.bprintf buf "'%s" (Symbol.to_string name)
-            | fields ->
-              Printf.bprintf buf "'%s(" (Symbol.to_string name);
-              Env.iteri (fun name ty i ->
-                  if i <> 0 then
-                    Buffer.add_string buf ", ";
-                  aux ty)
-                fields;
-              Buffer.add_char buf ')')
-          variants;
-        Buffer.add_char buf ']'
-
-      | Recurs {binder; body} -> Printf.bprintf buf "μ %s. " (Symbol.to_string binder); aux body
-
-      | Error s -> Printf.bprintf buf "error: %s" s
-
-      | _ -> failwith "TODO: show type"
-    in
-    aux ty;
-    Buffer.contents buf
-
-  let rec occurs polyvar ty =
-    match ty with
-    | PolyVar var when polyvar == var -> Result.Error "occurs check"
-    | PolyVar ({contents = Unbound ({id; let_level} as unbound)}) ->
-      let min_level =
-        match !polyvar with
-        | Unbound {let_level = let_level'} -> Int.min let_level let_level'
-        | _ -> let_level
-      in
-      unbound.let_level <- min_level;
-      Ok ()
-    | PolyVar {contents = Forwarded ty} -> occurs polyvar ty
-
-    (* TODO: traverse other kinds *)
-    | _ -> Error "unimplemented"
-
-  let rec unify a b =
-    if a == b then Ok ()
-    else match a, b with
-      | PolyVar {contents = Forwarded t1}, t2
-      | t1, PolyVar {contents = Forwarded t2} ->
-        unify t1 t2
-
-      | PolyVar ({contents = Unbound _} as polyvar), t 
-      | t, PolyVar ({contents = Unbound _} as polyvar) ->
-        Result.bind (occurs polyvar t) (fun () ->
-            polyvar := Forwarded t;
-            Ok ())
-
-      | Record {fields = a_fields; _}, Record {fields = b_fields; _} ->
-        (* NOTE: incomplete *)
-        let rec aux a_fields =
-          match a_fields with
-          | Env.Binding {name; value = a_field; env = a_fields} ->
-            begin match Env.find_opt name b_fields with
-              | None -> Result.Error "TODO"
-              | Some b_field ->
-                let _ = unify a_field b_field in
-                aux a_fields
-            end
-          | Env.Empty -> Ok ()
-        in
-        aux a_fields
-
-      | Function {inputs=a_inputs; output=a_output; _}, Function {inputs=b_inputs; output=b_output; _} ->
-        let rec aux a_inputs =
-          match a_inputs with
-          | Env.Empty -> ()
-          | Env.Binding {name; value=a_input; env=a_rest} ->
-            let () =
-              match Env.find_opt name b_inputs with
-              | Some b_input ->
-                let _ = unify a_input b_input in ()
-              | None ->
-                ()
-            in
-            aux a_rest
-        in
-        let _ = aux a_inputs in
-        unify a_output b_output
-
-      (* TODO traverse other kinds *)
-      | _, _ ->
-        Printf.printf "Error unifying %s and %s\n" (show a) (show b);
-        Error "TODO"
-end
-
-module Pat = struct
-  type ('pat, 'sym) t =
-      Var of 'sym
-    | Wildcard
-    | Record of 'pat Env.t
-    | Variant of 'sym * 'pat Env.t
-    | Roll of 'pat
-    | Or of 'pat * 'pat
-    | The of Type.annotation * 'pat
-
-  type 'loc typed = {
-    pat : ('loc typed, Symbol.t) t;
-    location : 'loc;
-    ty : Type.t
-  }
-
-  let var env =
-    env
-
-  let wildcard env =
-    ({pat = Wildcard; location = (); ty = Type.Error "unimplemented"}, env)
-
-  let record env fields =
-    ({pat = Record fields; location = (); ty = Type.Record {fields = Env.empty; row = None}}, env)
-end
-
-module Expr = struct
-  (* The general structure of this type (and Pat.t) is described at
-     https://blog.ezyang.com/2013/05/the-ast-typing-problem/ as "two level types". *)
-  type ('expr, 'pat, 'sym) t =
-      Record of {fields : 'expr Env.t; row : 'expr option}
-    | Field of 'expr * 'sym
-
-    | Variant of 'sym * 'expr Env.t
-    | Match of {
-        scrutinee : 'expr;
-        clauses : ('pat * 'expr) list
-      }
-
-    | Function of {
-        param : 'pat Env.t;
-        body : 'expr
-      }
-    | Apply of {
-        f : 'expr;
-        args : 'expr Env.t
-      }
-
-    | Var of 'sym
-    | Let of {
-        pat : 'pat;
-        defn : 'expr;
-        body : 'expr
-      }
-
-    | Abstract of 'sym * 'expr
-    | The of Type.annotation * 'expr
-
-    | Roll of 'expr
-    | Loop of {
-        pat : 'pat;
-        from : 'expr;
-        body : 'expr
-      }
-
-  type 'loc typed = {
-    expr : ('loc typed, 'loc Pat.typed, Symbol.t) t;
-    location : 'loc;
-    ty : Type.t
+  and rigid = {
+    name : Symbol.t;
+    id : int;
+    mutable fun_level : int;
+    repr : t
   }
 
   (***
-   * The inference algorithm:
+   * Inference is done by the parser, in a single pass:
    *  - Algorithm J-style, using refs for type vars rather than a Map
-   *  - Algorithm M-style, passing down an expected type, rather than bottom-up W-style
-   *  - Attaches levels to type vars for generalization rather than scanning the environment
+   *  - Attaches levels to type vars for generalization rather than scanning the environment:
+   *    `let` depth for universal type variables, function depth for existential ones
    **)
-  let infer env expr =
-    let let_level = ref 0 in
-    let fun_level = ref 0 in (* fun_level(language_design) > 9000 *)
+  let level = ref 0
+  let fun_level = ref 0 (* fun_level(language_design) > 9000 *)
+  let generic = max_int
+  let counter = ref 0
 
-    let current_roll = ref None in
-    let constructor_env = ref Env.Empty in
+  let fresh () =
+    incr counter;
+    Var (ref (Unbound {id = !counter; level = !level; fun_level = !fun_level}))
 
-    let new_universal =
-      let n = ref 0 in
-      fun () ->
-        let id = !n in
-        incr n;
-        PolyVar (ref (Unbound {id; let_level = !let_level}))
+  let rigid name repr =
+    incr counter;
+    Rigid {name; id = !counter; fun_level = !fun_level; repr}
+
+  let empty = Record {fields = []; rest = None}
+
+  let rec prune = function
+    | Var {contents = Link ty} -> prune ty
+    | ty -> ty
+
+  (* Visits each node, following each cycle once. With ~repr, also visits the
+     underlying types of abstract types. *)
+  let iter ?(repr = false) f ty =
+    let recs = ref [] and rigids = ref [] in
+    let rec go ty =
+      let ty = prune ty in
+      f ty;
+      match ty with
+      | Record r | Variant r ->
+        List.iter (fun (_, ty) -> go ty) r.fields;
+        Option.iter go r.rest
+      | Function fn -> go fn.inputs; go fn.deps; go fn.output
+      | Recurs r when not (List.memq r !recs) ->
+        recs := r :: !recs;
+        go r.body
+      | Rigid r when repr && not (List.memq r !rigids) ->
+        rigids := r :: !rigids;
+        go r.repr
+      | _ -> ()
     in
-    let new_existential =
-      let n = ref 0 in
-      fun () ->
-        let id = !n in
-        incr n;
-        RigidVar {id; fun_level = !fun_level}
+    go ty
+
+  let show ty =
+    let buf = Buffer.create 32 in
+    let count = ref 0 and vars = ref [] and recs = ref [] in
+    let next () =
+      let n = !count in
+      incr count;
+      if n < 26 then Printf.sprintf "'%c" (Char.chr (97 + n))
+      else Printf.sprintf "'t%i" n
     in
-    let new_binder =
-      let n = ref 0 in
-      fun () ->
-        let id = !n in
-        incr n;
-        id
-    in
+    let rec go ty =
+      match prune ty with
+      | Var {contents = Unbound {id; _}} ->
+        let name =
+          match List.assoc_opt id !vars with
+          | Some name -> name
+          | None ->
+            let name = next () in
+            vars := (id, name) :: !vars;
+            name
+        in
+        Buffer.add_string buf name
+      | Var {contents = Link _} -> assert false
 
-    let generalize ty =
-      let rec aux acc ty =
-        match ty with
-        | Type.PolyVar {contents = Unbound {id; let_level=lev}}
-          when lev > !let_level && not (List.exists (Int.equal id) acc) ->
-          id :: acc
+      | Rigid r -> Buffer.add_string buf (Symbol.to_string r.name)
 
-        | PolyVar {contents = Forwarded ty} -> aux acc ty
+      | Record r ->
+        Buffer.add_char buf '{';
+        row (show_fields buf ~sep:":" go) r;
+        Buffer.add_char buf '}'
 
-        | Function {exists; inputs; output} ->
-          let rec fun_aux acc inputs =
-            match inputs with
-            | Env.Binding {name; value; env=inputs} ->
-              let acc = aux acc value in
-              fun_aux acc inputs
-            | Env.Empty ->
-              aux acc output
+      | Variant r ->
+        Buffer.add_char buf '[';
+        row (List.iteri (fun i (tag, payload) ->
+            if i <> 0 then
+              Buffer.add_string buf ", ";
+            Printf.bprintf buf "#%s" (Symbol.to_string tag);
+            match prune payload with
+            | Record {fields = []; rest = None} -> ()
+            | Record r ->
+              Buffer.add_char buf '(';
+              row (show_fields buf ~sep:":" go) r;
+              Buffer.add_char buf ')'
+            | ty -> go ty))
+          r;
+        Buffer.add_char buf ']'
+
+      | Function fn ->
+        Buffer.add_string buf "fun(";
+        let start = Buffer.length buf in
+        begin match prune fn.inputs with
+          | Record r -> row (show_fields buf ~sep:":" go) r
+          | ty -> go ty
+        end;
+        begin match prune fn.deps with
+          | Var _ | Record {fields = []; rest = None} -> ()
+          | deps ->
+            if Buffer.length buf > start then
+              Buffer.add_string buf ", ";
+            Buffer.add_string buf "using ";
+            go deps
+        end;
+        Buffer.add_string buf ") -> ";
+        go fn.output
+
+      | Recurs r ->
+        match List.assq_opt r !recs with
+        | Some name -> Buffer.add_string buf name
+        | None ->
+          let cyclic =
+            try iter (function Recurs r' when r' == r -> raise Exit | _ -> ()) r.body; false
+            with Exit -> true
           in
-          fun_aux acc inputs
+          let name = if cyclic then next () else "_" in
+          recs := (r, name) :: !recs;
+          Printf.bprintf buf "rec %s. " name;
+          go r.body
 
-        (* TODO: traverse record, variant *)
-        | _ -> acc
+    and row show_items {fields; rest} =
+      let rec flatten acc rest =
+        match Option.map prune rest with
+        | Some (Record r | Variant r) -> flatten (acc @ r.fields) r.rest
+        | rest -> acc, rest
       in
-      let vars = aux [] ty in
-      Type.Forall (vars, ty)
+      let fields, rest = flatten fields rest in
+      let fields =
+        List.fold_left (fun acc (name, ty) ->
+            if List.mem_assq name acc then acc else acc @ [name, ty])
+          [] fields
+      in
+      show_items fields;
+      Option.iter (fun rest ->
+          if fields <> [] then
+            Buffer.add_string buf ", ";
+          Buffer.add_string buf "..";
+          go rest)
+        rest
     in
+    go ty;
+    Buffer.contents buf
 
-    let no_generalize ty = Type.Forall ([], ty) in
-
-    let instantiate = function
-      | Type.Forall ([], ty) -> ty
-      | Type.Forall (vars, ty) ->
-        let mapping = List.map
-            (fun var -> (var, new_universal ()))
-            vars
-        in
-        let rec aux ty =
-          match ty with
-          | Type.PolyVar {contents = Unbound {id; _}} ->
-            begin match List.assoc_opt id mapping with
-              | Some replacement -> replacement
-              | None -> ty
-            end
-          | PolyVar {contents = Forwarded ty} -> aux ty
-
-          | Record {fields; _} ->
-            Type.Record {fields = Env.map aux fields; row = None}
-
-          | Variant {variants; _} ->
-            Variant {variants =
-                       (Env.map
-                          (fun variant -> Env.map aux variant)
-                          variants);
-                     row = None}
-
-          | Function {exists; inputs; output} ->
-            Function {
-              exists;
-              inputs = Env.map aux inputs;
-              output = aux output
-            }
-
-          | Recurs {binder; body} ->
-            Recurs {binder; body = aux body}
-
-          | _ -> ty
-        in
-        aux ty
+  (* Copies a type, preserving cycles, with [leaf] choosing replacements for
+     variables *)
+  let copy leaf ty =
+    let recs = ref [] in
+    let rec go ty =
+      match prune ty with
+      | Record r -> Record (row r)
+      | Variant r -> Variant (row r)
+      | Function fn ->
+        Function {fn with inputs = go fn.inputs; deps = go fn.deps; output = go fn.output}
+      | Recurs r ->
+        begin match List.assq_opt r !recs with
+          | Some r' -> Recurs r'
+          | None ->
+            let r' = {body = r.body} in
+            recs := (r, r') :: !recs;
+            r'.body <- go r.body;
+            Recurs r'
+        end
+      | ty -> leaf ty
+    and row {fields; rest} =
+      {fields = List.map (fun (name, ty) -> name, go ty) fields; rest = Option.map go rest}
     in
+    go ty
 
-    let rec aux env ~expected expr =
-      match expr with
-      | Record {fields; _} ->
-        let fields = Env.map
-            (fun field -> aux env ~expected:(new_universal ()) field)
-            fields
-        in
-        let ty = Type.Record {fields = Env.map (fun field -> field.ty) fields; row = None} in
-        let _ = Type.unify expected ty in
-        {expr = Record {fields; row = None}; location = (); ty}
+  let memo () =
+    let table = ref [] in
+    fun id make ->
+      match List.assoc_opt id !table with
+      | Some ty -> ty
+      | None ->
+        let ty = make () in
+        table := (id, ty) :: !table;
+        ty
 
-      | Field (expr, name) ->
-        let rec_expected = Type.Record {fields = Env.Binding {name; value = expected; env = Env.Empty}; row = None} in
-        let rec_expr = aux env ~expected:rec_expected expr in
-        {expr = Field (rec_expr, name); location = (); ty = expected}
+  let generalize ty =
+    iter (function
+        | Var {contents = Unbound u} when u.level > !level -> u.level <- generic
+        | _ -> ())
+      ty
 
-      | Let {pat; defn; body} ->
-        incr let_level;
-        let defn_node = aux env ~expected:(new_universal ()) defn in
-        decr let_level;
-        let (pat_node, body_env) = Pat.infer env ~expected:defn_node.ty ~generalize pat in
-        let body_node = aux body_env ~expected body in
-        {
-          expr = Let {pat = pat_node; defn = defn_node; body = body_node};
-          location = ();
-          ty = body_node.ty
-        }
+  let instantiate ty =
+    let fresh_for = memo () in
+    copy (function
+        | Var {contents = Unbound u} when u.level = generic -> fresh_for u.id fresh
+        | ty -> ty)
+      ty
 
-      | Var sym ->
-        let ty =
-          match Env.find_opt sym env with
-          | Some scheme -> instantiate scheme
-          | None -> Error "var not found"
-        in
-        let _ = Type.unify expected ty in
-        {expr = Var sym; location = (); ty}
+  (* Abstract types introduced within the current function, other than those
+     already quantified by a nested function *)
+  let existentials ty =
+    let found = ref [] and bound = ref [] in
+    iter (function
+        | Rigid r when r.fun_level > !fun_level -> found := r.id :: !found
+        | Function fn -> bound := fn.exists @ !bound
+        | _ -> ())
+      ty;
+    List.sort_uniq Int.compare (List.filter (fun id -> not (List.mem id !bound)) !found)
 
-      | Function {param; body} ->
-        (* TODO: this is all hardcoded for a single parameter *)
-        let first_param = Symbol.of_string "1" in
-        let input = new_universal () in
-        let output = new_universal () in
-        let found = Type.Function {
-            exists = [];
-            inputs = Env.Binding {
-                name = first_param;
-                value = input;
-                env = Env.Empty
-              };
-            output
-          }
-        in
-        let _ = Type.unify expected found in
-        let [@warning "-8"] Env.Binding {value = param; _} = param in
-        let (pat_node, inner_env) = Pat.infer env ~expected:input ~generalize:no_generalize param in
-        let body_node = aux inner_env ~expected:output body in
-        let expr = Function {
-            param = Env.Binding {name = first_param; value = pat_node; env = Env.Empty};
-            body = body_node
-          }
-        in
-        {expr; location = (); ty = found}
+  let mentions ids ty =
+    try iter (function Rigid r when List.mem r.id ids -> raise Exit | _ -> ()) ty; false
+    with Exit -> true
 
-      | Apply {f; args} ->
-        (* TODO: this is all hardcoded for a single parameter *)
-        let first_param = Symbol.of_string "1" in
-        let arg_expected = new_universal () in
-        let inputs = Env.Binding {
-            name = first_param;
-            value = arg_expected;
-            env = Env.Empty
-          }
-        in
-        let f_ty = Type.Function {
-            exists = [];
-            inputs;
-            output = expected
-          }
-        in
-        let f_node = aux env ~expected:f_ty f in
-        let [@warning "-8"] Env.Binding {value = arg; _} = args in
-        let arg_node = aux env ~expected:arg_expected arg in
-        {
-          expr = Apply {
-              f = f_node;
-              args = Binding {
-                  name = first_param;
-                  value = arg_node;
-                  env = Env.Empty
-                }
-            };
-          location = ();
-          ty = expected
-        }
+  (* At application, each existential gets a fresh abstract type *)
+  let open_exists ty =
+    match prune ty with
+    | Function fn when fn.exists <> [] ->
+      let exists = fn.exists and fresh_for = memo () in
+      let output = copy (function
+          | Rigid r when List.mem r.id exists ->
+            fresh_for r.id (fun () -> rigid r.name (fresh ()))
+          | ty -> ty)
+          fn.output
+      in
+      Function {fn with exists = []; output}
+    | ty -> ty
 
-      | Variant (tag, fields) ->
-        let fields = Env.map (aux env ~expected:(new_universal ())) fields in
-        let field_types = Env.map (fun node -> node.ty) fields in
-        let found =
-          Type.Variant {variants = (Binding {
-              name = tag;
-              value = field_types;
-              env = Empty
-            });
-             row = None}
-        in
-        let _ = Type.unify expected found in
-        {
-          expr = Variant (tag, fields);
-          location = ();
-          ty = found
-        }
+  let occurs var ty =
+    (* Looking through abstract types forbids recursion via their underlying
+       types, which could otherwise be negative *)
+    iter ~repr:true (function
+        | Var v when v == var -> raise (Compile_error "infinite type")
+        | _ -> ())
+      ty;
+    match !var with
+    | Unbound {level = lv; fun_level = fl; _} ->
+      iter (function
+          | Var {contents = Unbound u} ->
+            u.level <- min u.level lv;
+            u.fun_level <- min u.fun_level fl
+          | Rigid r -> r.fun_level <- min r.fun_level fl
+          | _ -> ())
+        ty
+    | Link _ -> ()
 
-      | Roll expr ->
-        let inner_ty = new_universal () in
-        let id = new_binder () in
+  let unify a b =
+    let seen = ref [] in
+    let rec go a b =
+      match prune a, prune b with
+      | Var v1, Var v2 when v1 == v2 -> ()
+      | Var v, ty | ty, Var v -> occurs v ty; v := Link ty
+      | Record r1, Record r2 -> rows false r1 r2
+      | Variant r1, Variant r2 -> rows true r1 r2
+      | Function f1, Function f2 ->
+        if List.sort Int.compare f1.exists <> List.sort Int.compare f2.exists then
+          raise (Compile_error "functions with different existential types");
+        go f1.inputs f2.inputs;
+        go f1.deps f2.deps;
+        go f1.output f2.output
+      | Recurs r1, Recurs r2 ->
+        if r1 != r2 && not (List.exists (fun (x, y) -> x == r1 && y == r2) !seen) then begin
+          seen := (r1, r2) :: !seen;
+          go r1.body r2.body
+        end
+      | Rigid r1, Rigid r2 when r1 == r2 -> ()
+      | a, b -> raise (Compile_error (Printf.sprintf "cannot unify %s with %s" (show a) (show b)))
 
-        let prev_roll = !current_roll in
-        current_roll := Some id;
-        let inner_node = aux env ~expected:inner_ty expr in
-        current_roll := prev_roll;
+    (* Collects a row's fields through bound row variables; duplicate fields
+       (from record extension) must agree *)
+    and flatten variant {fields; rest} =
+      let add acc (name, ty) =
+        match List.assq_opt name acc with
+        | Some ty' -> go ty ty'; acc
+        | None -> acc @ [name, ty]
+      in
+      let rec aux acc rest =
+        match Option.map prune rest with
+        | Some (Record r) when not variant -> aux (List.fold_left add acc r.fields) r.rest
+        | Some (Variant r) when variant -> aux (List.fold_left add acc r.fields) r.rest
+        | Some (Var _) | None as rest -> acc, rest
+        | Some ty -> raise (Compile_error ("expected a row, found " ^ show ty))
+      in
+      aux (List.fold_left add [] fields) rest
 
-        let found_ty = Type.Recurs {exists = []; id; body = inner_node.ty} in
-        let _ = Type.unify expected found_ty in
-        {expr = Roll inner_node; location = (); ty = found_ty}
-
-      | Abstract (sym, body) ->
-        let prev_cons_env = !constructor_env in
-        constructor_env := Env.Binding {name=sym; value = new_existential (); env = prev_cons_env};
-        let body_node = aux env ~expected body in
-        constructor_env := prev_cons_env;
-        {expr = Abstract (sym, body_node); location = (); ty = body_node.ty}
-
-      | The (anno, expr) ->
-        failwith "TODO infer the"
-
+    and rows variant r1 r2 =
+      let wrap row = if variant then Variant row else Record row in
+      let f1, rest1 = flatten variant r1 in
+      let f2, rest2 = flatten variant r2 in
+      List.iter (fun (name, ty) -> Option.iter (go ty) (List.assq_opt name f2)) f1;
+      let extra fs others = List.filter (fun (name, _) -> not (List.mem_assq name others)) fs in
+      let extra1 = extra f1 f2 and extra2 = extra f2 f1 in
+      let missing = function
+        | [] -> ()
+        | (name, _) :: _ ->
+          raise (Compile_error (Printf.sprintf "no %s%s" (if variant then "tag #" else "field .")
+                                  (Symbol.to_string name)))
+      in
+      match rest1, rest2 with
+      | Some (Var v1), Some (Var v2) when v1 == v2 -> missing extra1; missing extra2
       | _ ->
-        failwith "TODO Expr.infer"
+        let tail = if Option.is_some rest1 && Option.is_some rest2 then Some (fresh ()) else None in
+        let extend rest extra =
+          match rest with
+          | Some rest -> go rest (wrap {fields = extra; rest = tail})
+          | None -> missing extra
+        in
+        extend rest1 extra2;
+        extend rest2 extra1
     in
-    aux env ~expected:(new_universal ()) expr
+    go a b
 
-  type state = {
-    mutable let_level : int;
-    mutable fun_level : int
+  (* Closes a variant row matched without a catch-all clause *)
+  let rec close ty =
+    match prune ty with
+    | Variant {rest = Some rest; _} ->
+      begin match prune rest with
+        | Var _ -> unify rest (Variant {fields = []; rest = None})
+        | rest -> close rest
+      end
+    | _ -> ()
+end
+
+module Pat = struct
+  type t =
+      Var of Symbol.t
+    | Wildcard
+    | Record of (Symbol.t * typed) list
+    | Variant of Symbol.t * (Symbol.t * typed) list
+    | Roll of typed
+    | Or of typed * typed
+
+  and typed = {
+    pat : t;
+    ty : Type.t
   }
 
-  let record fields row =
-    let expr = Record {fields; row} in
-    {expr; location = (); ty = Type.Error ""}
+  (* TODO: full exhaustiveness checking; for now a match needs a catch-all
+     clause or closes the scrutinee's outermost variant row *)
+  let rec irrefutable p =
+    match p.pat with
+    | Var _ | Wildcard -> true
+    | Record fields -> List.for_all (fun (_, p) -> irrefutable p) fields
+    | Variant _ -> false
+    | Roll p -> irrefutable p
+    | Or (p, q) -> irrefutable p || irrefutable q
+end
 
-  let field expr name =
-    let expr = Field (expr, name) in
-    {expr; location = (); ty = Type.Error ""}
+module Expr = struct
+  (* `the` and `abstract` only affect typing, so they don't appear here *)
+  type t =
+      Record of {fields : (Symbol.t * typed) list; rest : typed option}
+    | Field of typed * Symbol.t
+
+    | Variant of Symbol.t * (Symbol.t * typed) list
+    | Match of typed * (Pat.typed * typed) list
+
+    | Function of {
+        params : (Symbol.t * Pat.typed) list;
+        deps : Pat.typed option;
+        body : typed
+      }
+    | Apply of {
+        f : typed;
+        args : (Symbol.t * typed) list;
+        deps : typed option
+      }
+    | Dep of Symbol.t
+
+    | Var of Symbol.t
+    | Let of {
+        pat : Pat.typed;
+        defn : typed;
+        body : typed
+      }
+
+    | Roll of typed
+
+  and typed = {
+    expr : t;
+    ty : Type.t
+  }
 end
 
 module Parsing = struct
   type token =
       Let
+    | In
+    | Fun
+    | Using
+    | Abstract
+    | The
+    | Rec
+    | Or
+    | Underscore
     | LeftParen
     | RightParen
     | LeftCurly
     | RightCurly
     | LeftSquare
     | RightSquare
-    | Greater
-    | Less
-    | Ident of Symbol.t
-    | Field of Symbol.t
-    | Tag of Symbol.t
     | Comma
     | Arrow
     | Equal
-    | Abstract
-    | The
-    | In
-    | Or
+    | Colon
+    | Dot
+    | DotDot
     | Ampersand
-    | Pipe
-    | ForwardSlash
-    | Int of int
-    | Underscore
+    | Ident of Symbol.t
+    | Field of Symbol.t
+    | Tag of Symbol.t
+    | TypeVar of Symbol.t
+    | Dep of Symbol.t
     | EOF
-    | TokenError of string
-    | UnexpectedChar of char
 
   let string_of_token = function
     | Let -> "let"
+    | In -> "in"
+    | Fun -> "fun"
+    | Using -> "using"
+    | Abstract -> "abstract"
+    | The -> "the"
+    | Rec -> "rec"
+    | Or -> "or"
+    | Underscore -> "_"
     | LeftParen -> "("
     | RightParen -> ")"
     | LeftCurly -> "{"
     | RightCurly -> "}"
     | LeftSquare -> "["
     | RightSquare -> "]"
-    | Greater -> ">"
-    | Less -> "<"
-    | Ident sym -> Printf.sprintf "ident %s" (Symbol.to_string sym)
-    | Field sym -> Printf.sprintf "field %s" (Symbol.to_string sym)
-    | Tag sym -> Printf.sprintf "tag %s" (Symbol.to_string sym)
     | Comma -> ","
     | Arrow -> "->"
     | Equal -> "="
-    | Abstract -> "abstract"
-    | The -> "the"
-    | In -> "in"
-    | Or -> "or"
-    | Ampersand -> ";"
-    | Pipe -> "|"
-    | ForwardSlash -> "\\"
-    | Int i -> string_of_int i
-    | Underscore -> "_"
-    | EOF -> "EOF"
-    | _ -> "unimplemented string_of_token"
+    | Colon -> ":"
+    | Dot -> "."
+    | DotDot -> ".."
+    | Ampersand -> "&"
+    | Ident sym -> Symbol.to_string sym
+    | Field sym -> "." ^ Symbol.to_string sym
+    | Tag sym -> "#" ^ Symbol.to_string sym
+    | TypeVar sym -> "'" ^ Symbol.to_string sym
+    | Dep sym -> "@" ^ Symbol.to_string sym
+    | EOF -> "end of input"
 
   let line_and_col_of_pos input target =
     let rec aux pos line col =
@@ -837,499 +529,676 @@ module Parsing = struct
     in
     aux 0 1 1
 
-  let tokenize input =
-    let rec skip_comment pos =
-      match input.[pos] with
-      | exception (Invalid_argument _) -> pos
-      | '\n'                           -> pos+1
-      | _                              -> skip_comment (pos+1)
+  let fail input pos msg =
+    let line, col = line_and_col_of_pos input pos in
+    raise (Compile_error (Printf.sprintf "line %i, column %i: %s" line col msg))
+
+  let rec skip input pos =
+    match input.[pos] with
+    | ' ' | '\b' | '\012'
+    | '\t' | '\011'
+    | '\n' | '\r' -> skip input (pos+1)
+    | ';' ->
+      begin match String.index_from_opt input pos '\n' with
+        | Some pos -> skip input pos
+        | None -> String.length input
+      end
+    | _ -> pos
+    | exception (Invalid_argument _) -> pos
+
+  let is_symbol_char = function
+    | 'a'..'z'
+    | 'A'..'Z'
+    | '0'..'9'
+    | '-' | '_' -> true
+    | _ -> false
+
+  (* TODO parse numbers, via notation *)
+  let tokenize input pos =
+    let pos = skip input pos in
+    let char pos = if pos < String.length input then input.[pos] else '\000' in
+
+    let symbol start =
+      let stop = ref start in
+      while is_symbol_char (char !stop) do incr stop done;
+      Symbol.of_string (String.sub input start (!stop - start)), !stop
     in
 
-    (* TODO parse decimal, unit, scientific notation *)
-    let rec number pos =
-      let rec aux acc pos =
-        match input.[pos] with
-        | '0'..'9' as c ->
-          let acc = acc * 10 in
-          let i = int_of_char c - 48 in
-          aux (acc + i) (pos + 1)
+    let prefixed token =
+      match symbol (pos+1) with
+      | _, next when Int.equal next (pos+1) -> fail input pos "expected a name"
+      | sym, next -> token sym, next
+    in
 
-        | exception (Invalid_argument _)
-        | _ -> Int acc, pos
+    match char pos with
+    | 'a'..'z'
+    | 'A'..'Z'
+    | '_' ->
+      let sym, next = symbol pos in
+      let token =
+        match Symbol.to_string sym with
+        | "let" -> Let
+        | "in" -> In
+        | "fun" -> Fun
+        | "using" -> Using
+        | "abstract" -> Abstract
+        | "the" -> The
+        | "rec" -> Rec
+        | "or" -> Or
+        | "_" -> Underscore
+        | _ -> Ident sym
       in
-      aux 0 pos
-    in
+      token, next
 
-    let symbol =
-      let buf = Buffer.create 16 in
-      let rec aux pos =
-        match input.[pos] with
-        | 'a'..'z'
-        | 'A'..'Z'
-        | '0'..'9'
-        | '-' | '_' as c ->
-          Buffer.add_char buf c;
-          aux (pos+1)
+    | '.' when char (pos+1) = '.' -> DotDot, pos+2
+    | '.' when is_symbol_char (char (pos+1)) -> prefixed (fun sym -> Field sym)
+    | '.' -> Dot, pos+1
+    | '#' -> prefixed (fun sym -> Tag sym)
+    | '\'' -> prefixed (fun sym -> TypeVar sym)
+    | '@' -> prefixed (fun sym -> Dep sym)
 
-        | exception (Invalid_argument _)
-        | _ ->
-          let str = Buffer.contents buf in
-          Buffer.reset buf;
-          str, pos
-      in
-      aux
-    in
+    | '-' when char (pos+1) = '>' -> Arrow, pos+2
+    | ',' -> Comma, pos+1
+    | '=' -> Equal, pos+1
+    | ':' -> Colon, pos+1
+    | '&' -> Ampersand, pos+1
 
-    let keyword = function
-      | "let" -> Let
-      | "abstract" -> Abstract
-      | "the" -> The
-      | "in" -> In
-      | "or" -> Or
-      | "_" -> Underscore
-      | s -> Ident (Symbol.of_string s)
-    in
+    | '(' -> LeftParen, pos+1
+    | ')' -> RightParen, pos+1
+    | '{' -> LeftCurly, pos+1
+    | '}' -> RightCurly, pos+1
+    | '[' -> LeftSquare, pos+1
+    | ']' -> RightSquare, pos+1
 
-    let rec aux pos =
-      match input.[pos] with
-      | ' ' | '\b' | '\012'
-      | '\t' | '\011'
-      | '\n' | '\r' -> aux (pos+1)
+    | '\000' when pos >= String.length input -> EOF, pos
+    | c -> fail input pos (Printf.sprintf "unexpected character '%c'" c)
 
-      | ',' -> Comma, (pos+1)
-      | ';' ->
-        let pos = skip_comment (pos+1) in
-        aux pos
+  type scope = {
+    vars : (Symbol.t * Type.t) list;
+    types : (Symbol.t * Type.t) list; (* names bound by `abstract` *)
+    deps : Type.t                      (* dependencies of the innermost function *)
+  }
 
-      | '0'..'9' -> number pos
+  (* For `the T e`, e has type T with each abstract type written in T replaced
+     by its underlying type, so T can be a whole signature *)
+  let repr ty =
+    Type.copy (function
+        | Rigid r -> r.repr
+        | ty -> ty)
+      ty
 
-      | 'a'..'z'
-      | 'A'..'Z'
-      | '_' ->
-        let str, pos = symbol pos in
-        keyword str, pos
+  let variant_type tag payload =
+    Type.Variant {
+      fields = [tag, Record {fields = payload; rest = None}];
+      rest = Some (Type.fresh ())
+    }
 
-      | '.' ->
-        let str, pos = symbol (pos+1) in
-        begin match keyword str with
-          | Ident sym -> Field sym, pos
-          | _ -> TokenError "unexpected keyword", pos
-        end
-
-      | '\'' ->
-        let str, pos = symbol (pos+1) in
-        begin match keyword str with
-          | Ident sym -> Tag sym, pos
-          | _ -> TokenError "unexpected keyword", pos
-        end
-
-      | '-' -> begin match input.[pos+1] with
-          | '>' -> Arrow, pos+2
-          | '0'..'9' -> number pos
-          | _ -> UnexpectedChar '-', pos+1
-        end
-
-      | '=' -> Equal, pos+1
-      | '<' -> Less, pos+1
-      | '>' -> Greater, pos+1
-
-      | '(' -> LeftParen, pos+1
-      | ')' -> RightParen, pos+1
-      | '{' -> LeftCurly, pos+1
-      | '}' -> RightCurly, pos+1
-      | '[' -> LeftSquare, pos+1
-      | ']' -> RightSquare, pos+1
-
-      | '\\' -> ForwardSlash, pos+1
-      | '|' -> Pipe, pos+1
-      | '&' -> Ampersand, pos+1
-
-      | c -> UnexpectedChar c, pos+1
-      | exception (Invalid_argument _) -> EOF, pos
-    in
-    aux
-
+  (* Parses and typechecks in a single pass *)
   let parse input =
     let tokenize = tokenize input in
+    let fail pos = fail input (skip input pos) in
 
-    let unexpected_token token pos =
-      let line, col = line_and_col_of_pos input pos in
-      failwith (Printf.sprintf "found unexpected token '%s' at line %i col %i"
-                  (string_of_token token) line col)
+    let unexpected pos =
+      let token, _ = tokenize pos in
+      fail pos (Printf.sprintf "unexpected %s" (string_of_token token))
     in
 
-    let assume token pos =
-      let found, pos = tokenize pos in
-      if token = found then
-        pos
-      else
-        unexpected_token found pos
+    let expect token pos =
+      match tokenize pos with
+      | found, next when found = token -> next
+      | _ -> unexpected pos
     in
 
-    let comma_sep what closer pos =
-      let token, next_pos = tokenize pos in
-      if token = closer then
-        [], next_pos
-      else
-        let rec aux acc pos =
-          let item = what pos in
-          let token, next_pos = tokenize pos in
-          if token = Comma then
-            aux (item :: acc) next_pos
-          else if token = closer then
-            List.rev acc, next_pos
-          else
-            unexpected_token token pos
-        in
-        aux [] pos
+    let unify pos a b =
+      try Type.unify a b with Compile_error msg -> fail pos msg
     in
 
-    let rec whole_pat pos =
-      let token, pos = tokenize pos in
-      match token with
-      | LeftParen ->
-        let pat, pos = whole_pat pos in
-        let pos = assume RightParen pos in
-        pat, pos
-
-      | Ident sym -> Pat.(Bare (Var sym)), pos
-      | Underscore -> Pat.(Bare Wildcard), pos
-
-      | Ampersand ->
-        let pat, pos = whole_pat pos in
-        Pat.(Bare (Roll pat)), pos
-
-      | token ->
-        unexpected_token token pos
-    in
-
-    let rec type_expr pos =
-      let token, pos = tokenize pos in
-      match token with
-      | Ident sym -> Type.Expr.Var sym, pos
-      | LeftParen ->
-        let inner, pos = type_expr (pos+1) in
-        let pos = assume RightParen pos in
-        inner, pos
-
-      | LeftCurly ->
-        let rec aux acc pos =
-          failwith "TODO"
-        in
-        aux Env.Empty (pos+1)
-
-      | _ ->
-        failwith "TODO"
-    in
-
-    let rec atomic_expr pos =
-      let token, pos = tokenize pos in
-      match token with
-      | LeftParen ->
-        let expr, pos = whole_expr pos in
-        let pos = assume RightParen pos in
-        expr, pos
-
-      | Ident sym -> Expr.(Bare (Var sym)), pos
-
-      | Let ->
-        let pat, pos = whole_pat pos in
-        let pos = assume Equal pos in
-        let defn, pos = whole_expr pos in
-        let pos = assume In pos in
-        let body, pos = whole_expr pos in
-        let expr = Expr.(Bare (Let {pat; defn; body})) in
-        expr, pos
-
-      | ForwardSlash ->
-        let pat, pos = whole_pat pos in
-        let pos = assume Arrow pos in
-        let body, pos = whole_expr pos in
-        let param = Env.Binding {
-            name = Symbol.of_string "1";
-            value = pat;
-            env = Env.Empty
-          } in
-        let expr = Expr.(Bare (Function {param; body})) in
-        expr, pos
-
-      | LeftCurly ->
-        let rec aux acc pos =
-          let token, pos = tokenize pos in
-          match token with
-          | Field name ->
-            let pos = assume Equal pos in
-            let expr, pos = whole_expr pos in
-            let acc = Env.Binding {name; value = expr; env = acc} in
-            aux acc pos
-          | Comma -> aux acc pos
-          | RightCurly -> Expr.Bare (Record {fields = acc; row = None}), pos
-          | token ->
-            unexpected_token token pos
-        in
-        aux Env.Empty pos
-
-      | Tag tag ->
-        let token, next_pos = tokenize pos in
-        begin match token with
-          | LeftParen ->
-            let rec aux acc pos =
-              (* TODO: this just parses one payload field *)
-              let expr, pos = whole_expr pos in
-              let pos = assume RightParen pos in
-              let expr = Expr.(Bare (Variant (tag, Env.Binding {
-                  name = Symbol.of_string "1";
-                  value = expr;
-                  env = Env.Empty
-                })))
-              in
-              expr, pos
+    (* Comma separated, up to [closer]: positional items, `.name <sep> item`,
+       `.name(params) <sep> body` given [func], `..rest`, and `using item` *)
+    let sequence ?func ?rest ?using ~sep item closer pos =
+      let rec aux i fields tail deps pos =
+        let i, fields, tail, deps, pos =
+          match tokenize pos, rest, using with
+          | (Field name, next), _, _ ->
+            if List.mem_assq name fields then
+              fail pos "duplicate field";
+            let x, pos =
+              match tokenize next, func with
+              | (LeftParen, _), Some func -> func next
+              | _ -> item (expect sep next)
             in
-            aux Env.Empty next_pos
-
+            i, (name, x) :: fields, tail, deps, pos
+          | (DotDot, next), Some rest, _ ->
+            let x, pos = rest next in
+            i, fields, Some x, deps, pos
+          | (Using, next), _, Some using ->
+            let x, pos = using next in
+            i, fields, tail, Some x, pos
           | _ ->
-            Expr.(Bare (Variant (tag, Env.Empty))), pos
+            let x, pos = item pos in
+            i+1, (label i, x) :: fields, tail, deps, pos
+        in
+        match tokenize pos with
+        | Comma, next -> aux i fields tail deps next
+        | token, next when token = closer -> List.rev fields, tail, deps, next
+        | _ -> unexpected pos
+      in
+      match tokenize pos with
+      | token, next when token = closer -> [], None, None, next
+      | _ -> aux 0 [] None None pos
+    in
+
+    let payload item pos =
+      match tokenize pos with
+      | LeftParen, next ->
+        let fields, _, _, pos = sequence ~sep:Equal item RightParen next in
+        fields, pos
+      | _ -> [], pos
+    in
+
+    (* [vars] holds the annotation's type variables. [binders] holds the
+       enclosing `rec` binders, as None where an occurrence would not be
+       strictly positive. *)
+    let rec type_expr scope vars binders pos =
+      let ty = type_expr scope vars binders in
+      match tokenize pos with
+      | TypeVar name, next ->
+        begin match List.assq_opt name binders with
+          | Some (Some ty) -> ty, next
+          | Some None -> fail pos "recursive type is not strictly positive"
+          | None ->
+            match List.assq_opt name !vars with
+            | Some ty -> ty, next
+            | None ->
+              let ty = Type.fresh () in
+              vars := (name, ty) :: !vars;
+              ty, next
         end
 
-      | Ampersand ->
-        let expr, pos = whole_expr pos in
-        Expr.(Bare (Roll expr)), pos
+      | Ident name, next ->
+        begin match List.assq_opt name scope.types with
+          | Some ty -> ty, next
+          | None -> fail pos ("unknown type " ^ Symbol.to_string name)
+        end
 
-      | Abstract ->
-        let sym, pos =
+      | LeftParen, next ->
+        let inner, pos = ty next in
+        inner, expect RightParen pos
+
+      | LeftCurly, next ->
+        let fields, rest, _, pos = sequence ~rest:ty ~sep:Colon ty RightCurly next in
+        Type.Record {fields; rest}, pos
+
+      | LeftSquare, next ->
+        let tag pos =
           match tokenize pos with
-          | Ident sym, pos -> sym, pos
-          | token, _ ->
-            unexpected_token token pos
+          | Tag name, next ->
+            let fields, rest, _, pos =
+              match tokenize next with
+              | LeftParen, next -> sequence ~rest:ty ~sep:Colon ty RightParen next
+              | _ -> [], None, None, next
+            in
+            (name, Type.Record {fields; rest}), pos
+          | _ -> unexpected pos
         in
-        let pos = assume In pos in
-        let body, pos = whole_expr pos in
-        let expr = Expr.(Bare (Abstract (sym, body))) in
-        expr, pos
+        let tags, rest, _, pos = sequence ~rest:ty ~sep:Colon tag RightSquare next in
+        Type.Variant {fields = List.map snd tags; rest}, pos
 
-      | The ->
-        let ty_expr, pos = type_expr pos in
-        let body, pos = whole_expr pos in
-        let expr : Expr.typed = {
-          expr = The (ty_expr, body);
-          ty = Type.Error "TODO"
-        } in
-        expr, pos
+      | Fun, next ->
+        let input = type_expr scope vars (List.map (fun (name, _) -> name, None) binders) in
+        let fields, rest, deps, pos =
+          sequence ~rest:input ~using:input ~sep:Colon input RightParen (expect LeftParen next)
+        in
+        let output, pos = ty (expect Arrow pos) in
+        let deps = Option.value deps ~default:Type.empty in
+        Type.Function {inputs = Record {fields; rest}; deps; exists = []; output}, pos
 
-      | token ->
-        unexpected_token token pos
+      | Rec, next ->
+        begin match tokenize next with
+          | TypeVar name, next ->
+            let r = {Type.body = Type.empty} in
+            let body, pos =
+              type_expr scope vars ((name, Some (Type.Recurs r)) :: binders) (expect Dot next)
+            in
+            r.body <- body;
+            Type.Recurs r, pos
+          | _ -> unexpected next
+        end
 
-    and compound_expr left pos =
-      let token, next_pos = tokenize pos in
-      match token with
-      | Field name ->
-        let expr = Expr.Bare (Field (left, name)) in
-        compound_expr expr next_pos
+      | _ -> unexpected pos
+    in
 
-      | LeftParen ->
-        let arg, pos = whole_expr next_pos in
-        let pos = assume RightParen pos in
-        let args = Env.Binding {
-            name = Symbol.of_string "1";
-            value = arg;
-            env = Env.Empty
+    let annotation scope pos = type_expr scope (ref []) [] pos in
+
+    let rec pattern scope binds pos =
+      let left = ref [] in
+      let p, pos = atomic_pattern scope left pos in
+      let p, pos =
+        match tokenize pos with
+        | Or, next ->
+          let right = ref [] in
+          let q, next_pos = pattern scope right next in
+          unify next p.Pat.ty q.Pat.ty;
+          if List.compare_lengths !left !right <> 0 then
+            fail pos "both sides of `or` must bind the same variables";
+          List.iter (fun (name, ty) ->
+              match List.assq_opt name !right with
+              | Some ty' -> unify next ty ty'
+              | None -> fail pos "both sides of `or` must bind the same variables")
+            !left;
+          {Pat.pat = Or (p, q); ty = p.ty}, next_pos
+        | _ -> p, pos
+      in
+      List.iter (fun (name, ty) ->
+          if List.mem_assq name !binds then
+            fail pos (Symbol.to_string name ^ " is bound twice");
+          binds := (name, ty) :: !binds)
+        !left;
+      p, pos
+
+    and atomic_pattern scope binds pos =
+      let types = List.map (fun (name, p) -> name, p.Pat.ty) in
+      match tokenize pos with
+      | Ident name, next ->
+        if List.mem_assq name !binds then
+          fail pos (Symbol.to_string name ^ " is bound twice");
+        let ty = Type.fresh () in
+        binds := (name, ty) :: !binds;
+        {Pat.pat = Var name; ty}, next
+
+      | Underscore, next ->
+        {Pat.pat = Wildcard; ty = Type.fresh ()}, next
+
+      | LeftParen, next ->
+        let p, pos = pattern scope binds next in
+        p, expect RightParen pos
+
+      | LeftCurly, next ->
+        let fields, rest, _, pos =
+          sequence ~rest:(fun pos -> (), pos) ~sep:Equal (pattern scope binds) RightCurly next
+        in
+        let ty = Type.Record {fields = types fields; rest = Option.map Type.fresh rest} in
+        {Pat.pat = Record fields; ty}, pos
+
+      | Tag tag, next ->
+        let fields, pos = payload (pattern scope binds) next in
+        {Pat.pat = Variant (tag, fields); ty = variant_type tag (types fields)}, pos
+
+      | Ampersand, next ->
+        let p, pos = atomic_pattern scope binds next in
+        {Pat.pat = Roll p; ty = Recurs {body = p.ty}}, pos
+
+      | The, next ->
+        let ty, pos = annotation scope next in
+        let p, next_pos = pattern scope binds pos in
+        unify pos (repr ty) p.ty;
+        {p with ty}, next_pos
+
+      | _ -> unexpected pos
+    in
+
+    let rec expr scope pos =
+      let e, pos = atomic_expr scope pos in
+      compound_expr scope e pos
+
+    (* The operand of `&` and `the T` takes field accesses and applications,
+       but not a match, so `&e [clauses]` matches on `&e` *)
+    and operand scope pos =
+      let e, pos = atomic_expr scope pos in
+      compound_expr ~matches:false scope e pos
+
+    and compound_expr ?(matches = true) scope left pos =
+      match tokenize pos with
+      | Field name, next ->
+        let ty = Type.fresh () in
+        unify pos left.Expr.ty (Record {fields = [name, ty]; rest = Some (Type.fresh ())});
+        compound_expr ~matches scope {expr = Field (left, name); ty} next
+
+      | LeftParen, next ->
+        let args, _, deps, next =
+          sequence ~using:(expr scope) ~sep:Equal (expr scope) RightParen next
+        in
+        let ty = Type.fresh () in
+        let found = Type.Function {
+            inputs = Record {fields = List.map (fun (name, e) -> name, e.Expr.ty) args; rest = None};
+            deps = (match deps with Some e -> e.Expr.ty | None -> Type.empty);
+            exists = [];
+            output = ty
           }
         in
-        let expr = Expr.(Bare (Apply {
-            f = left;
-            args;
-            dependency = None
-          }))
+        unify pos (Type.open_exists left.ty) found;
+        compound_expr ~matches scope {expr = Apply {f = left; args; deps}; ty} next
+
+      | LeftSquare, next when matches ->
+        let ty = Type.fresh () and pats_ty = Type.fresh () in
+        let clause pos =
+          let binds = ref [] in
+          let pat, pos = pattern scope binds pos in
+          unify pos pats_ty pat.ty;
+          let pos = expect Arrow pos in
+          let body, next = expr {scope with vars = !binds @ scope.vars} pos in
+          unify pos ty body.ty;
+          (pat, body), next
         in
-        compound_expr expr pos
+        let clauses, _, _, next = sequence ~sep:Equal clause RightSquare next in
+        let clauses = List.map snd clauses in
+        (* Close the clauses' row before the scrutinee can add to it *)
+        if not (List.exists (fun (p, _) -> Pat.irrefutable p) clauses) then
+          Type.close pats_ty;
+        unify pos left.ty pats_ty;
+        compound_expr scope {expr = Match (left, clauses); ty} next
 
       | _ -> left, pos
 
-    and whole_expr pos =
-      let inner, outer_pos = atomic_expr pos in
-      compound_expr inner outer_pos
+    and atomic_expr scope pos =
+      match tokenize pos with
+      | Ident name, next ->
+        begin match List.assq_opt name scope.vars with
+          | Some ty -> {Expr.expr = Var name; ty = Type.instantiate ty}, next
+          | None -> fail pos ("unbound variable " ^ Symbol.to_string name)
+        end
+
+      | Dep name, next ->
+        let ty = Type.fresh () in
+        unify pos scope.deps (Record {fields = [name, ty]; rest = Some (Type.fresh ())});
+        {expr = Dep name; ty}, next
+
+      | LeftParen, next ->
+        let e, pos = expr scope next in
+        e, expect RightParen pos
+
+      | Let, next ->
+        incr Type.level;
+        let binds = ref [] in
+        let pat, pos = pattern scope binds next in
+        let defn, next =
+          match pat.pat, tokenize pos with
+          | Var _, (LeftParen, _) -> lambda scope Equal pos (* `let f(x) = e` *)
+          | _ -> expr scope (expect Equal pos)
+        in
+        unify pos pat.ty defn.ty;
+        decr Type.level;
+        List.iter (fun (_, ty) -> Type.generalize ty) !binds;
+        let body, next = expr {scope with vars = !binds @ scope.vars} (expect In next) in
+        {expr = Let {pat; defn; body}; ty = body.ty}, next
+
+      | Fun, next -> lambda scope Arrow next
+
+      | LeftCurly, next ->
+        let fields, rest, _, next =
+          sequence ~func:(lambda scope Equal) ~rest:(expr scope) ~sep:Equal (expr scope)
+            RightCurly next
+        in
+        let tail = Option.map (fun r ->
+            let tail = Type.fresh () in
+            unify pos r.Expr.ty (Record {fields = []; rest = Some tail});
+            tail)
+            rest
+        in
+        let fields_ty = List.map (fun (name, e) -> name, e.Expr.ty) fields in
+        {expr = Record {fields; rest}; ty = Record {fields = fields_ty; rest = tail}}, next
+
+      | Tag tag, next ->
+        let fields, next = payload (expr scope) next in
+        let ty = variant_type tag (List.map (fun (name, e) -> name, e.Expr.ty) fields) in
+        {expr = Variant (tag, fields); ty}, next
+
+      | Ampersand, next ->
+        let e, next = operand scope next in
+        {expr = Roll e; ty = Recurs {body = e.ty}}, next
+
+      | Abstract, next ->
+        begin match tokenize next with
+          | Ident name, next ->
+            let ty = Type.rigid name (Type.fresh ()) in
+            expr {scope with types = (name, ty) :: scope.types} (expect In next)
+          | _ -> unexpected next
+        end
+
+      | The, next ->
+        let ty, pos = annotation scope next in
+        let e, next = operand scope pos in
+        unify pos (repr ty) e.ty;
+        {e with ty}, next
+
+      | _ -> unexpected pos
+
+    (* `(params) <arrow> body`: [arrow] is `->` after `fun`, and `=` in the
+       sugar `let f(x) = e` and `{.f(x) = e}` *)
+    and lambda scope arrow pos =
+      incr Type.fun_level;
+      let binds = ref [] in
+      let params, _, deps, pos =
+        sequence ~using:(pattern scope binds) ~sep:Equal (pattern scope binds) RightParen
+          (expect LeftParen pos)
+      in
+      let deps_ty = Type.fresh () in
+      Option.iter (fun p -> unify pos deps_ty p.Pat.ty) deps;
+      let body, next =
+        expr {scope with vars = !binds @ scope.vars; deps = deps_ty} (expect arrow pos)
+      in
+      decr Type.fun_level;
+      let inputs =
+        Type.Record {fields = List.map (fun (name, p) -> name, p.Pat.ty) params; rest = None}
+      in
+      let exists = Type.existentials body.ty in
+      if Type.mentions exists inputs || Type.mentions exists deps_ty then
+        fail pos "abstract type escapes through a parameter";
+      let ty = Type.Function {inputs; deps = deps_ty; exists; output = body.ty} in
+      {Expr.expr = Function {params; deps; body}; ty}, next
     in
 
-    let expr, _ = whole_expr 0 in
-    Ok expr
-
-  let read_file fname =
-    let ch = open_in fname in
-    let s = really_input_string ch (in_channel_length ch) in
-    close_in ch;
-    s
+    Type.level := 0;
+    Type.fun_level := 0;
+    let e, pos = expr {vars = []; types = []; deps = Type.empty} 0 in
+    match tokenize pos with
+    | EOF, _ -> e
+    | _ -> unexpected pos
 end
 
 module Runtime : sig
   type value
-  val show : Type.t -> value -> string
-  val eval : value Env.t -> 'a Expr.typed -> value
+  val show : value -> string
+  val eval : (Symbol.t * value) list -> Expr.typed -> value
 end = struct
   type value =
-      Number of {
-        value : int;
-        exp : int;
-        unit : (Symbol.t * int) list
+      Record of (Symbol.t * value) list
+    | Variant of Symbol.t * (Symbol.t * value) list
+    | Closure of {
+        params : (Symbol.t * Pat.typed) list;
+        deps : Pat.typed option;
+        body : Expr.typed;
+        env : (Symbol.t * value) list
       }
-    | Record of value Env.t
-    | Variant of {
-        tag : Symbol.t;
-        payload : value Env.t
-      }
-    | Function of {
-        param : Type.typed_pat Env.t;
-        body_env : value Env.t;
-        body : Type.typed_expr
-      }
-    | Roll of {
-        env : value Env.t;
-        body : Type.typed_expr
-      }
+    | Roll of value
 
-  module Frame = Hashtbl.Make(Symbol)
+  (* The current function's dependencies are bound under a name that no
+     variable can have *)
+  let deps_name = Symbol.of_string "@"
 
-  let show ty value =
+  let show value =
     let buf = Buffer.create 32 in
-    let rec aux ty value =
-      match ty with
-      | Type.Variant vars ->
-        let Variant {tag; payload} = value in
-        if Env.is_empty payload then
-          Printf.bprintf buf "'%s" (Symbol.to_string tag)
-        else begin
-          let Some payload_ty = Env.find_opt tag vars in
-          Printf.bprintf buf "'%s(" (Symbol.to_string tag);
-          Env.iteri (fun name ty i ->
-              if i <> 0 then
-                Buffer.add_string buf ", ";
-              Printf.bprintf buf ".%s = " (Symbol.to_string name);
-              let Some field_val = Env.find_opt name payload in
-              aux ty field_val)
-            payload_ty;
-          Buffer.add_char buf ')'
-        end
-
-      | Type.Record fields ->
-        let Record field_vals = value in
+    let rec aux = function
+      | Record fields ->
         Buffer.add_char buf '{';
-        Env.iteri
-          (fun name ty i ->
-             if i <> 0 then
-               Buffer.add_string buf ", ";
-             Printf.bprintf buf ".%s = " (Symbol.to_string name);
-             let Some field_val = Env.find_opt name field_vals in
-             aux ty field_val)
-          fields;
+        show_fields buf ~sep:"=" aux fields;
         Buffer.add_char buf '}'
-
-      | Type.Function _ -> Buffer.add_string buf "<function>"
-      | Type.Recurs _ -> Buffer.add_string buf "<roll>"
-
-      | Type.PolyVar {contents = Forwarded ty} -> aux ty value
+      | Variant (tag, []) -> Printf.bprintf buf "#%s" (Symbol.to_string tag)
+      | Variant (tag, fields) ->
+        Printf.bprintf buf "#%s(" (Symbol.to_string tag);
+        show_fields buf ~sep:"=" aux fields;
+        Buffer.add_char buf ')'
+      | Closure _ -> Buffer.add_string buf "<function>"
+      | Roll value -> Buffer.add_char buf '&'; aux value
     in
-    aux ty value;
+    aux value;
     Buffer.contents buf
 
-  let rec match_ env (typed_pat : Type.typed_pat) value =
-    match typed_pat.pat with
-    | Pat.Var name -> Env.Binding {name; value; env}
-    | Pat.Wildcard -> env
+  let fields_of = function
+    | Record fields -> fields
+    | _ -> failwith "expected a record"
 
-    | Pat.Roll pat ->
-      begin match value with
-        | Roll {env = roll_env; body; _} ->
-          begin match eval roll_env body with
-            | Ok forced_val -> match_ env pat forced_val
-            | Error _ -> failwith "force roll failure"
-          end
-        | _ -> failwith "Expected Roll value in Pat.Roll match"
+  let rec bind env (p : Pat.typed) value =
+    match p.pat, value with
+    | Pat.Var name, _ -> Some ((name, value) :: env)
+    | Pat.Wildcard, _ -> Some env
+    | Pat.Record ps, Record values -> bind_fields env ps values
+    | Pat.Variant (tag, ps), Variant (tag', values) when Symbol.equal tag tag' ->
+      bind_fields env ps values
+    | Pat.Roll p, Roll value -> bind env p value
+    | Pat.Or (p, q), _ ->
+      begin match bind env p value with
+        | None -> bind env q value
+        | found -> found
+      end
+    | _ -> None
+
+  and bind_fields env ps values =
+    List.fold_left (fun env (name, p) ->
+        Option.bind env (fun env -> bind env p (List.assq name values)))
+      (Some env) ps
+
+  let must = function
+    | Some env -> env
+    | None -> failwith "pattern did not match"
+
+  let rec eval env (node : Expr.typed) =
+    match node.expr with
+    | Expr.Record {fields; rest} ->
+      let fields = List.map (fun (name, e) -> name, eval env e) fields in
+      let rest =
+        match rest with
+        | Some e ->
+          List.filter (fun (name, _) -> not (List.mem_assq name fields)) (fields_of (eval env e))
+        | None -> []
+      in
+      Record (fields @ rest)
+
+    | Expr.Field (e, name) -> List.assq name (fields_of (eval env e))
+
+    | Expr.Variant (tag, fields) ->
+      Variant (tag, List.map (fun (name, e) -> name, eval env e) fields)
+
+    | Expr.Match (e, clauses) ->
+      let value = eval env e in
+      begin match List.find_map (fun (p, body) ->
+          Option.map (fun env -> env, body) (bind env p value))
+          clauses
+        with
+        | Some (env, body) -> eval env body
+        | None -> failwith "no clause matched"
       end
 
-  and eval env node =
-    let frame = Frame.create 16 in
+    | Expr.Function {params; deps; body} -> Closure {params; deps; body; env}
 
-    let rec aux env (node : Type.typed_expr) ~frame k =
-      match node.ty with
-      | Error str -> Error (Printf.sprintf "Type error: %s" str)
-      | _ ->
-        match node.expr with
-        | Expr.Record {fields; _} ->
-          let rec field_aux acc = function
-            | Env.Empty -> k (Record acc)
-            | Env.Binding {name; value; env = rec_env} ->
-              aux env value ~frame (fun field_val ->
-                  let acc = Env.Binding {name; value=field_val; env=acc} in
-                  field_aux acc rec_env)
-          in
-          field_aux Env.Empty fields
+    | Expr.Apply {f; args; deps} ->
+      begin match eval env f with
+        | Closure c ->
+          let args = List.map (fun (name, e) -> name, eval env e) args in
+          let deps = match deps with Some e -> eval env e | None -> Record [] in
+          let inner = must (bind_fields ((deps_name, deps) :: c.env) c.params args) in
+          let inner = match c.deps with Some p -> must (bind inner p deps) | None -> inner in
+          eval inner c.body
+        | _ -> failwith "expected a function"
+      end
 
-        | Expr.Field (record, name) ->
-          aux env record ~frame (fun (Record fields) ->
-              match Env.find_opt name fields with
-              | Some value -> k value
-              | None -> Error (Printf.sprintf "Field error: %s" (Symbol.to_string name)))
+    | Expr.Dep name -> List.assq name (fields_of (List.assq deps_name env))
 
-        | Expr.Let {pat; defn; body} ->
-          aux env defn ~frame (fun defn_val ->
-              let env = match_ env pat defn_val in
-              aux env body ~frame k)
+    | Expr.Var name -> List.assq name env
 
-        | Expr.Var sym ->
-          begin match Env.find_opt sym env with
-            | Some value -> k value
-            | None -> Error (Printf.sprintf "Variable not in env: %s" (Symbol.to_string sym))
-          end
+    | Expr.Let {pat; defn; body} -> eval (must (bind env pat (eval env defn))) body
 
-        | Expr.Function {param; body} ->
-          k (Function {param; body_env = env; body})
-
-        | Expr.Apply {f; args; dependency} ->
-          let outer_env = env in
-          aux outer_env f ~frame (fun (Function {param; body_env; body}) ->
-              let rec apply_aux env_acc args =
-                match args with
-                | Env.Binding {name; value=arg; env=args} ->
-                  aux outer_env arg ~frame (fun arg_value ->
-                      let env_acc =
-                        match Env.find_opt name param with
-                        | Some param -> match_ env_acc param arg_value
-                        | None ->
-                          Printf.printf "Missing parameter: %s\n" (Symbol.to_string name);
-                          env_acc
-                      in
-                      apply_aux env_acc args)
-                | Env.Empty ->
-                  let inner_frame = Frame.create 16 in
-                  aux env_acc body ~frame:inner_frame k
-              in
-              apply_aux body_env args)
-
-        | Expr.Variant (tag, fields) ->
-          let rec field_aux acc = function
-            | Env.Binding {name; value; env=rest} ->
-              aux env value ~frame (fun value ->
-                  let acc = Env.Binding {name; value; env = acc} in
-                  field_aux acc rest)
-            | Env.Empty ->
-              k (Variant {tag; payload = acc})
-          in
-          field_aux Env.Empty fields
-
-        | Expr.Roll body ->
-          let id =
-            match node.ty with
-            | Type.Recurs {id; _} -> id
-            | _ -> failwith "Expected Recurs type for Roll"
-          in
-          k (Roll {id; env; body})
-
-        | Expr.Abstract (_, body) ->
-          aux env body ~frame k
-
-        | _ -> Error ("unimplemented eval for expression")
-    in
-    aux env node ~frame (fun res -> Ok res)
+    | Expr.Roll e -> Roll (eval env e)
 end
+
+let run code =
+  match Parsing.parse code with
+  | exception Compile_error msg -> Error msg
+  | e ->
+    match Runtime.eval [] e with
+    | exception Failure msg -> Error ("runtime error: " ^ msg)
+    | value -> Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show value))
+
+let run_tests =
+  let tests = [
+    "{}", "the {} {}";
+    "{.x = #a}.x", "the [#a, ..'a] #a";
+    "{#a, #b}.2", "the [#b, ..'a] #b";
+    "let id = fun(x) -> x in {id(#a), id({})}", "the {[#a, ..'a], {}} {#a, {}}";
+    "let f = fun(a, .b = c) -> {c, a} in f(#x, .b = #y)",
+    "the {[#y, ..'a], [#x, ..'b]} {#y, #x}";
+    "#b [#a -> #yes, #b -> #no]", "the [#yes, #no, ..'a] #no";
+    "#b [#a or #b -> #yes, _ -> #no]", "the [#yes, #no, ..'a] #yes";
+    "#pair(#a, .x = #b) [#pair(a, .x = b) -> {b, a}]", "the {[#b, ..'a], [#a, ..'b]} {#b, #a}";
+    "let r = {.a = #a} in {.b = #b, ..r}", "the {.b : [#b, ..'a], .a : [#a, ..'b]} {.b = #b, .a = #a}";
+    "let r = {.a = #a, .b = #b} in {.a = #c, ..r}.a", "the [#c, #a, ..'a] #c";
+    "let f = fun(x) -> @wrap(x) in f(#a, using {.wrap = fun(y) -> {y}})", "the {[#a, ..'a]} {#a}";
+    "let f = fun(using d) -> d.k in f(using {.k = #v})", "the [#v, ..'a] #v";
+    "let f = fun() -> fun() -> @k in f()(using {.k = #v})", "the [#v, ..'a] #v";
+    "let mk = fun(x) -> abstract t in the t x in mk(#a)", "the t #a";
+    "abstract t in let v = the t #a in v [the t x -> x]", "the [#a, ..'a] #a";
+    "the fun('a) -> 'a fun(x) -> x", "the fun('a) -> 'a <function>";
+    "let l = &#cons(#a, &#nil) in l [&#cons(x, _) -> x, &#nil -> #none]", "the [#none, #a, ..'a] #a";
+    "the (rec 'l. [#nil, #cons('a, 'l)]) &#cons(#x, &#nil)",
+    "the rec 'a. [#nil, #cons([#x, ..'b], 'a)] &#cons(#x, &#nil)";
+    "; comment\n{}", "the {} {}";
+  "let id(x) = x in {id(#a), id({})}", "the {[#a, ..'a], {}} {#a, {}}";
+  "let pair(a, .b = c, using d) = {c, a, d.k} in pair(#x, .b = #y, using {.k = #z})",
+  "the {[#y, ..'a], [#x, ..'b], [#z, ..'c]} {#y, #x, #z}";
+  "let r = {.swap(p) = {p.2, p.1}, .n = #n} in r.swap({#a, #b})", "the {[#b, ..'a], [#a, ..'b]} {#b, #a}";
+  "{.f() = @k}.f(using {.k = #v})", "the [#v, ..'a] #v";
+  "abstract t in the fun([#a]) -> t fun(x) -> x", "the fun([#a]) -> t <function>";
+  "&#a [&x -> x]", "the [#a, ..'a] #a";
+  "let f(x) = x in &f(#a)", "the rec _. [#a, ..'a] &#a";
+  "&{.x = #a}.x [&y -> y]", "the [#a, ..'a] #a";
+  "the [#a, #b] #a [#a -> #x, #b -> #y]", "the [#x, #y, ..'a] #x";
+  "let m = abstract t in the {.make : fun() -> t, .get : fun(t) -> [#a]} {.make() = #a, .get(x) = x} in m.get(m.make())",
+  "the [#a] #a";
+  ] in
+
+  let failing = [
+    "{}.x", "no field .x";
+    "#c [#a -> {}]", "no tag #c";
+    "(the [#a, #b] #a) [#a -> {}]", "no tag #b";
+  "the [#a, #b] #a [#a -> {}]", "no tag #b";
+    "let f = fun() -> @k in f()", "no field .k";
+    "fun(x) -> x [&f -> f(x)]", "infinite type";
+    "the (rec 'l. [#f(fun('l) -> {})]) #f", "not strictly positive";
+    "fun(x) -> abstract t in #c [#c -> x, #d -> the t {}]", "escapes";
+    "let mk = fun(x) -> abstract t in the t x in let same = fun(a, b) -> #c [#c -> a, #d -> b] in same(mk(#a), mk(#a))",
+    "cannot unify t with t";
+    "fun(x) -> abstract t in the t fun(y) -> y [the t f -> f(x)]", "infinite type";
+    "{x}", "unbound variable x";
+    "fun(x, x) -> x", "bound twice";
+  "let f(x) = f(x) in {}", "unbound variable f";
+  "let m = abstract t in the {.make : fun() -> t, .get : fun(t) -> [#a]} {.make() = #a, .get(x) = x} in m.get(#a)",
+  "cannot unify t with [#a";
+  "let {f}(x) = x in {}", "unexpected (";
+  "{.f(x) -> x}", "unexpected ->";
+    "#a [#a or #b(x) -> x]", "same variables";
+  ] in
+
+  fun () ->
+    let contains s sub =
+      let n = String.length sub in
+      let rec aux i = i + n <= String.length s && (String.sub s i n = sub || aux (i+1)) in
+      aux 0
+    in
+    let check code ok expected =
+      match run code, ok with
+      | Ok out, true | Error out, false
+        when (if ok then String.equal out expected else contains out expected) -> true
+      | (Ok out | Error out), _ ->
+        Printf.printf "FAIL: %s\n  expected: %s\n  got:      %s\n" code expected out;
+        false
+    in
+    let results =
+      List.map (fun (code, expected) -> check code true expected) tests
+      @ List.map (fun (code, expected) -> check code false expected) failing
+    in
+    let failures = List.length (List.filter not results) in
+    Printf.printf "%i of %i tests passed\n" (List.length results - failures) (List.length results);
+    if failures = 0 then 0 else 1
 
 let main () =
   let cmd =
@@ -1344,7 +1213,7 @@ let main () =
     | "--" ->`Prog In_channel.(input_all stdin)
     | "-e"
     | "--eval" -> `Prog Sys.argv.(2)
-    | fname -> `Prog (Parsing.read_file fname)
+    | fname -> `Prog In_channel.(with_open_bin fname input_all)
     | exception (Invalid_argument _) -> `Usage
   in
   match cmd with
@@ -1365,25 +1234,12 @@ Available commands are:
     print_endline "Mu 0.0.0 alpha";
     0
 
-  | `RunTests ->
-    print_endline "No tests currently implemented";
-    38
+  | `RunTests -> run_tests ()
 
   | `Prog code ->
-    match Parsing.parse code with
-    | Error (`UnexpectedToken (token, pos)) ->
-      let (line, col) = Parsing.line_and_col_of_pos code pos in
-      Printf.printf
-        "Unexpected token at line %i, column %i\n"
-        line col;
-      1
-    | Ok ast ->
-      match Runtime.eval Env.Empty ast with
-      | exception _ -> 1
-      | Error s -> print_endline s; 1
-      | Ok value ->
-        Printf.printf "the %s %s\n" (Type.show ast.ty) (Runtime.show ast.ty value);
-        0
+    match run code with
+    | Ok out -> print_endline out; 0
+    | Error msg -> print_endline msg; 1
 
 let () =
   if not !Sys.interactive then

@@ -15,7 +15,8 @@ The language is paired with and designed for a dedicated editing and evaluation
 environment.
 
 **Status:** The language design is still somewhat in flux. The bootstrapping type checker
-and interpreter in OCaml is still in the beginning stages.
+and interpreter in OCaml is still in the beginning stages. It type checks while parsing,
+which keeps the language honest about being checkable in a single pass.
 
 ## Type system
 
@@ -24,24 +25,43 @@ and interpreter in OCaml is still in the beginning stages.
 Record and variant expressions don't need their types to be pre-declared - the types
 inferred for their introduction and elimination forms are anonymous and use row
 polymorphism for flexibility of the inferred types. Instead of tuples as a separate
-construct, Records can begin with 0 or more positional fields.
+construct, records begin with 0 or more positional fields, followed by 0 or more named
+fields, as in `{a, b, .x = c}`. Positional fields are labelled from 1, so the fields of
+that record are `.1`, `.2` and `.x`. A record can be extended with the fields of another
+record, as in `{.x = c, ..r}`; fields given explicitly replace those of `r`, and must have
+the same type.
 
-Variant literals are written with a leading apostrophe, as in `'ok(a, b)` or `'true`.
-Variant types are written with square brackets, like `['one, 'two(Int, Int), ..rest]`,
-with `..rest` denoting the row variable. The optional payload of a variant is written
-in parentheses after the tag, and is itself a product type, with fields separated by
-commas, and can also themselves contain a row variable.
+Variant literals are written with a leading `#`, as in `#ok(a, b)` or `#true`. Variant
+types are written with square brackets, like `[#one, #two({}, {}), ..'rest]`, with
+`..'rest` denoting the row variable. Type variables, row variables included, are written
+with a leading apostrophe. The optional payload of a variant is written in parentheses
+after the tag, and is itself a record, which can also contain a row variable. Record
+types are written like `{'a, .x : 'b, ..'rest}`.
 
-Functions are applied with the Algol-form (`f(a, b, g(c))`), rather than the curried ML-form
-(`f a b (g c)`), and - like records - begin with 0 or more positional parameters, followed
-by 0 or more named parameters, and then an optional row variable.
+Variants are eliminated by `match`, which is written as a list of clauses after the
+scrutinee, as in `x [#some(y) -> y, #none -> d]`. Patterns mirror expressions: variables,
+`_`, records (`{p, .x = q}`, or `{.x = q, ..}` to allow other fields), variants, and
+alternatives (`p or q`). A match without a catch-all clause gives the scrutinee a closed
+variant type, containing only the tags its clauses handle. The prefix forms `&e` and
+`the T e` include field accesses and applications in `e`, but not a match, so
+`&x [&y -> y]` matches on `&x`.
+
+Functions are written `fun(a, b, .c = d) -> body`, where the parameters are patterns.
+They're applied with the Algol-form (`f(a, b, .c = g(x))`), rather than the curried
+ML-form (`f a b (g x)`), and - like records - take 0 or more positional parameters,
+followed by 0 or more named parameters. Function types are written like
+`fun('a, .c : 'b) -> 'c`, and may also end the parameters with a row variable.
+
+Bindings are written `let p = e1 in e2`, where `p` is a pattern. Two forms of sugar
+define functions: `let f(x, y) = body in rest` means `let f = fun(x, y) -> body in rest`,
+and the record field `{.f(x) = body}` means `{.f = fun(x) -> body}`.
 
 ### Explicit iso-recursive types
 
 In the type system literature for iso-recursive types, explicit `roll e` and `unroll
-e` expressions are used to convert back and forth between a wrapped form like `rec
-nat. [Succ(nat), Zero]`, and the one-level-unwrapping `[Succ(rec nat. [Succ(nat),
-Zero]), Zero]`. The two forms are isomorphic.
+e` expressions are used to convert back and forth between a wrapped form like
+`rec 'nat. [#succ('nat), #zero]`, and the one-level-unwrapping
+`[#succ(rec 'nat. [#succ('nat), #zero]), #zero]`. The two forms are isomorphic.
 
 But in most languages that have iso-recursive types, the roll and unroll operations
 are made implicit in the data constructors of the language. For example, in OCaml we
@@ -52,10 +72,17 @@ respectively.
 In Mu - because of its focus on anonymous types - the roll is made explicit with the
 `&e` form. Unrolling is using the same form in a pattern. There are typically difficulties
 inferring recursive types with an explicit roll, because of ambiguity with where the
-fold in the resulting type should be placed. Instead, we don't try to infer a
-recursive type. Because of our focus on anonymous types, the two types `rec t. [Cons(t), Nil]`
-and `rec _. [Cons(rec _. [Nil, ..'a], ..'b]` are compatible, so we simply infer the
-latter.
+roll in the resulting type should be placed. Instead, a roll on its own doesn't infer a
+recursive type. Because of our focus on anonymous types, the two types
+`rec 'l. [#cons('l), #nil]` and `rec _. [#cons(rec _. [#nil, ..'a]), ..'b]` are
+compatible, so for `&#cons(&#nil)` we simply infer the latter. An actual recursive type
+comes from a type annotation, as in `the (rec 'l. [#cons('l), #nil]) &#cons(&#nil)`, or
+is inferred for the input of a `recur` expression (below).
+
+Recursive types must be strictly positive: in an annotation, the recursive variable may
+not occur within a function's parameter types. Recursion can't be introduced any other
+way - for example, applying an unrolled function to its own rolled form, as the Y
+combinator does, fails the occurs check of unification.
 
 ### Recursion
 
@@ -95,18 +122,18 @@ they're a component of function types. Existential type variables are instantiat
 by the introduction form (`abstract t in <body>`), generalized at function boundaries,
 and re-instantiated at function application.
 
-The introduction expression for existential types is `abstract <T> in <body>`.  Within
-`<body>`, `<T>` may be used in a type annotation, denoting
-occurrences of the abstract type-to-be. After `<body>`, a fresh existential type variable
-is allocated for the abstract type, which unifies with nothing but itself. Then,
-when inferring the type for a function, when we see an existential type variable, we check
-if it occurs in the environment of the function; if so, it remains a simple
-constant. If not, it means that variable was introduced within the function,
-and the existential quantifier for that variable thus becomes part of the function type.
-This mirrors the environment check for generalization of universal type variables at
-`let`. (And likewise, the environment check can be optimized by tracking the "level"
-or "rank" of the respective type variables - `let` depth for universal type variables,
-and function depth for existential type variables.)
+The introduction expression for existential types is `abstract <T> in <body>`. It
+allocates a fresh existential type variable for the abstract type, which unifies with
+nothing but itself. Within `<body>`, `<T>` may be used in type annotations to refer to
+it, and after `<body>` the name is out of scope, so the type is sealed.
+Then, when inferring the type for a function, when we see an existential type variable, we check
+whether it was introduced within the function, rather than in an enclosing scope. If
+not, it remains a simple constant. If so, the existential quantifier for that variable
+becomes part of the function type. This mirrors generalization of universal type
+variables at `let`, and both are implemented by tracking the "level" of each type
+variable - `let` depth for universal type variables, and function depth for existential
+type variables. An existential type variable introduced within a function may occur in
+its result type, but not in its parameter types.
 
 At every function application, the existential quantifiers associated with the
 function type are instantiated, assigning new, unique type variables for each
@@ -119,13 +146,24 @@ or pattern position, and they actually have a simple typing rule which isn't sim
 checking whether the annotated type and the inferred type of the expression match. In
 `the ty x`, the whole annotated expression (`the ty x`) is given type `ty`, and the
 subexpression `x` is constrained to have type `repr(ty)`. `repr` is a type-level
-operation which doesn't occur in the surface level type language, and for most structural
-types it is the identity function - i.e. `repr({}) = {}`. But for an abstract type `t`,
-`repr(t)` denotes its underlying type. This makes a type annotation usable as a sort of
-type constructor for an abstract type, which can be used to either construct the abstract
-type (in expression position) or deconstruct it (in pattern position). This also allows
-for simply annotating the whole type from the outside, similar to writing a module
-signature in ML.
+operation which doesn't occur in the surface level type language. For an abstract type
+`t`, `repr(t)` denotes its underlying type, which is inferred from the uses of `t` within
+its `abstract` scope. For other types, `repr` goes through the structure of the type,
+replacing each abstract type written in it by its underlying type - e.g. `repr({}) = {}`
+and `repr(fun(t) -> [#a]) = fun(repr(t)) -> [#a]`. This makes a type annotation usable as
+a sort of type constructor for an abstract type, which can be used to either construct
+the abstract type (in expression position) or deconstruct it (in pattern position). This
+also allows for simply annotating the whole type from the outside, similar to writing a
+module signature in ML:
+
+```
+abstract t in
+  the {.make : fun() -> t, .get : fun(t) -> [#a]}
+      {.make() = #a, .get(x) = x}
+```
+
+The underlying type of an abstract type may not refer back to the abstract type itself;
+recursion goes through `rec` types instead.
 
 ### Dependencies
 
@@ -137,10 +175,13 @@ Rust, typeclasses and traits are used to accomplish this. In OCaml, we may use f
 (like `Set.Make`) or normal arguments (like the first argument to `List.equal`).
 In Mu, we use dependencies. Every function takes a dependency argument, which is
 always a record. In the body of the function, you can use the form `@<label>`, as in
-`@compare(a, b)`, or `@mul(x, y)`. The type of the dependency parameter is inferred
-via normal type inference. In the application form, the dependency is specified as the
-last argument, with the keyword `using`, as in `f(a, b, using c)`. Not including the
-dependency argument is the same as passing an empty record.
+`@compare(a, b)`, or `@mul(x, y)`, which refers to a field of the innermost enclosing
+function's dependencies. The whole dependency record can also be bound by a pattern,
+as the last parameter with the keyword `using`, as in `fun(a, b, using deps) -> body`.
+The type of the dependency parameter is inferred via normal type inference. In the
+application form, the dependency is specified as the last argument, again with
+`using`, as in `f(a, b, using c)`. Dependencies are never passed along implicitly: not
+including the dependency argument is the same as passing an empty record.
 
 #### Package dependencies
 
