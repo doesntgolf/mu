@@ -1,0 +1,1 @@
+let rect() = abstract T in {.state = the T {.x = #two, .y = #three}, .area(the T d) = #times(d.x, d.y)} in let circle() = abstract T in {.state = the T {.r = #one}, .area(the T d) = #pi_r2(d.r)} in let shapes = &#cons(rect, &#cons(circle, &#nil)) in shapes [&#cons(s, _) -> let p = s() in p.area(p.state)]

@@ -204,7 +204,8 @@ let mod = abstract T in {.make(x) = the T x, .unwrap(the T x) = x} in ...
 gives `mod` the type `{.make : fun('a) -> T('a), .unwrap : fun(T('a)) -> 'a}`, so
 `mod.make(#a)` and `mod.make({})` have the different types `T([#a, ..'b])` and `T({})`.
 Without the parameter, both would have type `T`, and `mod.unwrap` would return a value
-of any type at all. Within its `abstract` scope, an abstract type is written without
+of any type at all. Row variables aren't parameters, since they'd expose the shape of the
+underlying type - `abstract T in the T #a` has type `T`, not `T('a)`. Within its `abstract` scope, an abstract type is written without
 parameters, since its underlying type isn't generalized until the scope has ended.
 
 Mu's type annotations - written `the <type> <expr>` - may be used in either expression

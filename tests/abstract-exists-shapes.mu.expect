@@ -1,0 +1,1 @@
+the [#times([#two, ..'a], [#three, ..'b]), #pi_r2([#one, ..'c]), ..'d] #times(#two, #three)

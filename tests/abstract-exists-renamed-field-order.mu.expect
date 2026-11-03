@@ -1,1 +1,1 @@
-the fun() -> exists t, u. {.a : t('a), .b : u('b)} <function>
+the fun() -> exists t, u. {.a : t, .b : u} <function>

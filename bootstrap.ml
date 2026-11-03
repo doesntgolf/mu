@@ -129,7 +129,8 @@ module Type = struct
     go ty
 
   (* What each of an abstract type's parameters - the generalized variables of
-     its underlying type - is in an occurrence's [view] *)
+     its underlying type - is in an occurrence's [view]. Row variables aren't
+     parameters, since they'd expose the shape of the underlying type. *)
   let args abs view =
     let found = ref [] and recs = ref [] in
     let rec go a b =
@@ -138,8 +139,7 @@ module Type = struct
         if not (List.mem_assq v !found) then
           found := !found @ [v, b]
       | Record r1, Record r2 | Variant r1, Variant r2 ->
-        List.iter (fun (name, a) -> Option.iter (go a) (List.assq_opt name r2.fields)) r1.fields;
-        Option.iter (fun a -> Option.iter (go a) r2.rest) r1.rest
+        List.iter (fun (name, a) -> Option.iter (go a) (List.assq_opt name r2.fields)) r1.fields
       | Function f1, Function f2 -> go f1.inputs f2.inputs; go f1.deps f2.deps; go f1.output f2.output
       | Recurs r1, Recurs r2 when not (List.memq r1 !recs) ->
         recs := r1 :: !recs;
@@ -1105,11 +1105,12 @@ module Parsing = struct
         compound_expr ~matches scope {expr = Apply {f = left; args; deps}; ty} next
 
       | LeftSquare, next when matches ->
-        let ty = Type.fresh () and pats_ty = Type.fresh () in
+        let ty = Type.fresh () in
         let clause pos =
           let binds = ref [] in
           let pat, pos = pattern scope binds pos in
-          unify pos pats_ty pat.ty;
+          (* Before the body, so its variables' types are known there *)
+          unify pos left.ty pat.ty;
           let pos = expect Arrow pos in
           let body, next = expr {scope with vars = !binds @ scope.vars} pos in
           unify pos ty body.ty;
@@ -1117,7 +1118,6 @@ module Parsing = struct
         in
         let clauses, _, _, next = sequence ~sep:Equal clause RightSquare next in
         let clauses = List.map snd clauses in
-        unify pos left.ty pats_ty;
         exhaustive pos (List.map fst clauses);
         compound_expr scope {expr = Match (left, clauses); ty} next
 
