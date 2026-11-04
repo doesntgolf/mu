@@ -332,6 +332,11 @@ module Type = struct
       Function {fn with exists = []; output = output fn.output}
     | ty -> ty
 
+  (* Undoes the changes made by the current unification, so a failed one
+     leaves types as they were *)
+  let trail = ref []
+  let save undo = trail := undo :: !trail
+
   (* A type may only contain itself through a recursive type, and not within a
      function's parameters, so recursive types stay strictly positive. Looking
      through abstract types forbids recursion via their underlying types. *)
@@ -362,9 +367,14 @@ module Type = struct
     | Unbound {level = lv; fun_level = fl; _} ->
       iter (function
           | Var {contents = Unbound u} ->
-            u.level <- min u.level lv;
-            u.fun_level <- min u.fun_level fl
-          | Rigid {abs; _} -> abs.fun_level <- min abs.fun_level fl
+            let level = u.level and fun_level = u.fun_level in
+            save (fun () -> u.level <- level; u.fun_level <- fun_level);
+            u.level <- min level lv;
+            u.fun_level <- min fun_level fl
+          | Rigid {abs; _} ->
+            let fun_level = abs.fun_level in
+            save (fun () -> abs.fun_level <- fun_level);
+            abs.fun_level <- min fun_level fl
           | _ -> ())
         ty
     | Link _ -> ()
@@ -374,7 +384,11 @@ module Type = struct
     let rec go a b =
       match prune a, prune b with
       | Var v1, Var v2 when v1 == v2 -> ()
-      | Var v, ty | ty, Var v -> occurs v ty; v := Link ty
+      | Var v, ty | ty, Var v ->
+        occurs v ty;
+        let old = !v in
+        save (fun () -> v := old);
+        v := Link ty
       | Record r1, Record r2 -> rows false r1 r2
       | Variant r1, Variant r2 -> rows true r1 r2
       | Function f1, Function f2 ->
@@ -462,7 +476,8 @@ module Type = struct
         extend rest1 extra2;
         extend rest2 extra1
     in
-    go a b
+    trail := [];
+    try go a b with Compile_error _ as e -> List.iter (fun undo -> undo ()) !trail; raise e
 
   (* A variant row's tags with their payloads, and its tail variable if it's
      open, which identifies the row *)
@@ -486,6 +501,7 @@ module Pat = struct
     | Variant of string * (string * typed) list
     | Roll of typed
     | Or of typed * typed
+    | Error of {pos : int; msg : string; p : typed} (* a type error *)
 
   and typed = {
     pat : t;
@@ -529,7 +545,8 @@ module Pat = struct
       | [] -> Some (List.init n (fun _ -> "_"))
       | _ when n = 0 -> None
       | rows ->
-        let is_wild p = match p.pat with Var _ | Wildcard -> true | _ -> false in
+        (* An erroneous pattern doesn't count as missing anything *)
+        let is_wild p = match p.pat with Var _ | Wildcard | Error _ -> true | _ -> false in
         let heads = List.map List.hd rows in
         (* Rows whose head is the constructor [sub] picks out, with its k
            subpatterns in place of the head *)
@@ -651,6 +668,10 @@ module Expr = struct
         body : typed
       }
 
+    | Hole (* `_` *)
+    (* A type error in [e], which makes it evaluate to a hole *)
+    | Error of {pos : int; msg : string; e : typed}
+
   and typed = {
     expr : t;
     ty : Type.t
@@ -735,9 +756,11 @@ module Parsing = struct
     in
     aux 0 1 1
 
-  let fail input pos msg =
+  let describe input pos msg =
     let line, col = line_and_col_of_pos input pos in
-    raise (Compile_error (Printf.sprintf "line %i, column %i: %s" line col msg))
+    Printf.sprintf "line %i, column %i: %s" line col msg
+
+  let fail input pos msg = raise (Compile_error (describe input pos msg))
 
   let rec skip input pos =
     match input.[pos] with
@@ -842,7 +865,9 @@ module Parsing = struct
       rest = Some (Type.fresh ())
     }
 
-  (* Parses and typechecks in a single pass *)
+  (* Parses and typechecks in a single pass. Syntax errors stop parsing, but
+     type errors are marked in the tree, which goes on being checked, and
+     returned with their positions. *)
   let parse input =
     let tokenize = tokenize input in
     let fail pos = fail input (skip input pos) in
@@ -858,17 +883,31 @@ module Parsing = struct
       | _ -> unexpected pos
     in
 
-    let unify pos a b =
-      try Type.unify a b with Compile_error msg -> fail pos msg
+    let errors = ref [] in
+    let error pos msg =
+      let pos = skip input pos in
+      errors := (pos, msg) :: !errors;
+      pos
+    in
+    let mark pos msg (e : Expr.typed) = {e with expr = Error {pos = error pos msg; msg; e}} in
+    let pmark pos msg (p : Pat.typed) = {p with pat = Error {pos = error pos msg; msg; p}} in
+    let check pos problem e = Option.fold ~none:e ~some:(fun msg -> mark pos msg e) problem in
+    let pcheck pos problem p = Option.fold ~none:p ~some:(fun msg -> pmark pos msg p) problem in
+
+    (* Checks return the problem they find, if any *)
+    let unify a b =
+      match Type.unify a b with
+      | () -> None
+      | exception Compile_error msg -> Some msg
     in
 
-    let exhaustive pos pats =
+    let exhaustive pats =
       match Pat.check pats with
-      | Exhaustive -> ()
-      | Missing w -> fail pos ("patterns are not exhaustive, missing " ^ w)
+      | Exhaustive -> None
+      | Missing w -> Some ("patterns are not exhaustive, missing " ^ w)
       | Ambiguous ->
-        fail pos "patterns are only exhaustive if more variant types are closed, \
-                  and which ones is ambiguous: add a catch-all clause or a type annotation"
+        Some "patterns are only exhaustive if more variant types are closed, \
+              and which ones is ambiguous: add a catch-all clause or a type annotation"
     in
 
     (* Comma separated, up to [closer]: positional items, `.name <sep> item`,
@@ -923,7 +962,9 @@ module Parsing = struct
       | TypeVar name, next ->
         begin match List.assoc_opt name binders with
           | Some (Some ty) -> ty, next
-          | Some None -> fail pos "recursive type is not strictly positive"
+          | Some None ->
+            ignore (error pos "recursive type is not strictly positive");
+            Type.fresh (), next
           | None ->
             match List.assoc_opt name !vars with
             | Some ty -> ty, next
@@ -936,7 +977,9 @@ module Parsing = struct
       | Ident name, next ->
         begin match List.assoc_opt name scope.types with
           | Some ty -> ty, next
-          | None -> fail pos ("unknown type " ^ name)
+          | None ->
+            ignore (error pos ("unknown type " ^ name));
+            Type.fresh (), next
         end
 
       | LeftParen, next ->
@@ -986,7 +1029,12 @@ module Parsing = struct
       | _ -> unexpected pos
     in
 
-    let annotation scope pos = type_expr scope (ref []) [] pos in
+    (* An annotation with an error is ignored *)
+    let annotation scope pos =
+      let before = !errors in
+      let ty, pos = type_expr scope (ref []) [] pos in
+      (if !errors == before then ty else Type.fresh ()), pos
+    in
 
     let rec pattern scope binds pos =
       let left = ref [] in
@@ -996,33 +1044,40 @@ module Parsing = struct
         | Or, next ->
           let right = ref [] in
           let q, next_pos = pattern scope right next in
-          unify next p.Pat.ty q.Pat.ty;
-          if List.compare_lengths !left !right <> 0 then
-            fail pos "both sides of `or` must bind the same variables";
-          List.iter (fun (name, ty) ->
-              match List.assoc_opt name !right with
-              | Some ty' -> unify next ty ty'
-              | None -> fail pos "both sides of `or` must bind the same variables")
-            !left;
-          {Pat.pat = Or (p, q); ty = p.ty}, next_pos
+          let same = List.compare_lengths !left !right = 0
+                     && List.for_all (fun (name, _) -> List.mem_assoc name !right) !left in
+          let p = pcheck next (unify p.Pat.ty q.Pat.ty) {Pat.pat = Or (p, q); ty = p.ty} in
+          if not same then begin
+            (* All of them, so the body doesn't find them unbound *)
+            left := !left @ List.filter (fun (name, _) -> not (List.mem_assoc name !left)) !right;
+            pmark pos "both sides of `or` must bind the same variables" p, next_pos
+          end
+          else
+            let unify_var (name, ty) = unify ty (List.assoc name !right) in
+            pcheck next (List.find_map unify_var !left) p, next_pos
         | _ -> p, pos
       in
-      List.iter (fun (name, ty) ->
+      List.fold_left (fun p (name, ty) ->
           if List.mem_assoc name !binds then
-            fail pos (name ^ " is bound twice");
-          binds := (name, ty) :: !binds)
-        !left;
-      p, pos
+            pmark pos (name ^ " is bound twice") p
+          else begin
+            binds := (name, ty) :: !binds;
+            p
+          end)
+        p !left,
+      pos
 
     and atomic_pattern scope binds pos =
       let types = List.map (fun (name, p) -> name, p.Pat.ty) in
       match tokenize pos with
       | Ident name, next ->
+        let p = {Pat.pat = Var name; ty = Type.fresh ()} in
         if List.mem_assoc name !binds then
-          fail pos (name ^ " is bound twice");
-        let ty = Type.fresh () in
-        binds := (name, ty) :: !binds;
-        {Pat.pat = Var name; ty}, next
+          pmark pos (name ^ " is bound twice") p, next
+        else begin
+          binds := (name, p.ty) :: !binds;
+          p, next
+        end
 
       | Underscore, next ->
         {Pat.pat = Wildcard; ty = Type.fresh ()}, next
@@ -1049,8 +1104,7 @@ module Parsing = struct
       | The, next ->
         let ty, pos = annotation scope next in
         let p, next_pos = pattern scope binds pos in
-        unify pos (repr ty) p.ty;
-        {p with ty}, next_pos
+        {(pcheck pos (unify (repr ty) p.ty) p) with ty}, next_pos
 
       | _ -> unexpected pos
     in
@@ -1069,8 +1123,9 @@ module Parsing = struct
       match tokenize pos with
       | Field name, next ->
         let ty = Type.fresh () in
-        unify pos left.Expr.ty (Record {fields = [name, ty]; rest = Some (Type.fresh ())});
-        compound_expr ~matches scope {expr = Field (left, name); ty} next
+        let record = Type.Record {fields = [name, ty]; rest = Some (Type.fresh ())} in
+        let problem = unify left.Expr.ty record in
+        compound_expr ~matches scope (check pos problem {expr = Field (left, name); ty}) next
 
       | LeftParen, next ->
         let args, _, deps, next =
@@ -1084,8 +1139,9 @@ module Parsing = struct
             output = ty
           }
         in
-        unify pos (Type.open_exists left.ty) found;
-        compound_expr ~matches scope {expr = Apply {f = left; args; deps}; ty} next
+        let problem = unify (Type.open_exists left.ty) found in
+        compound_expr ~matches scope (check pos problem {expr = Apply {f = left; args; deps}; ty})
+          next
 
       | LeftSquare, next when matches ->
         let ty = Type.fresh () in
@@ -1093,16 +1149,15 @@ module Parsing = struct
           let binds = ref [] in
           let pat, pos = pattern scope binds pos in
           (* Before the body, so its variables' types are known there *)
-          unify pos left.ty pat.ty;
+          let pat = pcheck pos (unify left.ty pat.ty) pat in
           let pos = expect Arrow pos in
           let body, next = expr {scope with vars = !binds @ scope.vars} pos in
-          unify pos ty body.ty;
-          (pat, body), next
+          (pat, check pos (unify ty body.ty) body), next
         in
         let clauses, _, _, next = sequence ~sep:Equal clause RightSquare next in
         let clauses = List.map snd clauses in
-        exhaustive pos (List.map fst clauses);
-        compound_expr scope {expr = Match (left, clauses); ty} next
+        let problem = exhaustive (List.map fst clauses) in
+        compound_expr scope (check pos problem {expr = Match (left, clauses); ty}) next
 
       | _ -> left, pos
 
@@ -1111,13 +1166,17 @@ module Parsing = struct
       | Ident name, next ->
         begin match List.assoc_opt name scope.vars with
           | Some ty -> {Expr.expr = Var name; ty = Type.instantiate ty}, next
-          | None -> fail pos ("unbound variable " ^ name)
+          | None ->
+            mark pos ("unbound variable " ^ name) {expr = Var name; ty = Type.fresh ()}, next
         end
+
+      | Underscore, next -> {expr = Hole; ty = Type.fresh ()}, next
 
       | Dep name, next ->
         let ty = Type.fresh () in
-        unify pos scope.deps (Record {fields = [name, ty]; rest = Some (Type.fresh ())});
-        {expr = Dep name; ty}, next
+        let record = Type.Record {fields = [name, ty]; rest = Some (Type.fresh ())} in
+        let problem = unify scope.deps record in
+        check pos problem {expr = Dep name; ty}, next
 
       | LeftParen, next ->
         let e, pos = expr scope next in
@@ -1132,8 +1191,8 @@ module Parsing = struct
           | Var _, (LeftParen, _) -> lambda scope Equal pos (* `let f(x) = e` *)
           | _ -> expr scope (expect Equal pos)
         in
-        unify pos pat.ty defn.ty;
-        exhaustive pos [pat];
+        let defn = check pos (unify pat.ty defn.ty) defn in
+        let pat = pcheck pos (exhaustive [pat]) pat in
         decr Type.level;
         List.iter (fun (_, ty) -> Type.generalize ty) !binds;
         let body, next = expr {scope with vars = !binds @ scope.vars} (expect In next) in
@@ -1146,10 +1205,9 @@ module Parsing = struct
           sequence ~func:(lambda scope Equal) ~rest:(expr scope) ~sep:Equal (expr scope)
             RightCurly next
         in
-        let tail = Option.map (fun r ->
-            let tail = Type.fresh () in
-            unify pos r.Expr.ty (Record {fields = []; rest = Some tail});
-            tail)
+        let tail = Option.map (fun _ -> Type.fresh ()) rest in
+        let rest = Option.map (fun r ->
+            check pos (unify r.Expr.ty (Record {fields = []; rest = tail})) r)
             rest
         in
         let fields_ty = List.map (fun (name, e) -> name, e.Expr.ty) fields in
@@ -1177,8 +1235,7 @@ module Parsing = struct
       | The, next ->
         let ty, pos = annotation scope next in
         let e, next = operand scope pos in
-        unify pos (repr ty) e.ty;
-        {e with ty}, next
+        {(check pos (unify (repr ty) e.ty) e) with ty}, next
 
       | _ -> unexpected pos
 
@@ -1194,18 +1251,26 @@ module Parsing = struct
       let inputs =
         Type.Record {fields = List.map (fun (name, p) -> name, p.Pat.ty) params; rest = None}
       in
-      exhaustive pos [{pat = Record params; ty = inputs}];
+      let problem = exhaustive [{pat = Record params; ty = inputs}] in
       let deps_ty = Type.fresh () in
-      Option.iter (fun p -> unify pos deps_ty p.Pat.ty; exhaustive pos [p]) deps;
+      let deps = Option.map (fun p ->
+          let p = pcheck pos (unify deps_ty p.Pat.ty) p in
+          pcheck pos (exhaustive [p]) p)
+          deps
+      in
       let body, next =
         expr {scope with vars = !binds @ scope.vars; deps = deps_ty} (expect arrow pos)
       in
       decr Type.fun_level;
       let exists = Type.existentials body.ty in
-      if Type.mentions exists inputs || Type.mentions exists deps_ty then
-        fail pos "abstract type escapes through a parameter";
+      let escapes =
+        if Type.mentions exists inputs || Type.mentions exists deps_ty then
+          Some "abstract type escapes through a parameter"
+        else None
+      in
       let ty = Type.Function {inputs; deps = deps_ty; exists; output = body.ty} in
-      {Expr.expr = Function {params; deps; body}; ty}, next
+      let e = {Expr.expr = Function {params; deps; body}; ty} in
+      check pos (if problem = None then escapes else problem) e, next
 
     (* `recur (p <- e, acc = init, ...) do body`. Within body, `continue`
        continues with a subterm of e and new accumulators. p matches e's top
@@ -1219,7 +1284,7 @@ module Parsing = struct
       let binds = ref [] in
       Type.fun_level := level;
       let root, pos = pattern scope binds pos in
-      exhaustive pos [root];
+      let root = pcheck pos (exhaustive [root]) root in
       decr Type.fun_level;
       let input, pos = expr scope (expect LeftArrow pos) in
       let rec accs pos =
@@ -1227,8 +1292,8 @@ module Parsing = struct
         | Comma, next ->
           let p, pos = pattern scope binds next in
           let init, pos = expr scope (expect Equal pos) in
-          unify pos p.Pat.ty init.Expr.ty;
-          exhaustive pos [p];
+          let init = check pos (unify p.Pat.ty init.Expr.ty) init in
+          let p = pcheck pos (exhaustive [p]) p in
           let rest, pos = accs pos in
           (p, init) :: rest, pos
         | RightParen, next -> [], next
@@ -1263,25 +1328,24 @@ module Parsing = struct
       let continue_name = "continue" and forget_name = "forget" in
       let vars = !binds @ [continue_name, ty; forget_name, forget] @ scope.vars in
       let body, next = expr {scope with vars} (expect Do pos) in
-      unify pos output body.ty;
+      let body = check pos (unify output body.ty) body in
       decr Type.fun_level;
-      if k.fun_level < level then
-        fail pos "recursion index escapes";
       (* Each iteration introduces its own abstract types, so they can't be
          passed between iterations, through the result or the accumulators *)
       let carried = output :: List.map (fun (p, _) -> p.Pat.ty) accs in
-      begin match List.find_opt (fun abs -> abs.Type.id > start)
-                    (List.concat_map Type.abstracts carried) with
-      | Some abs ->
-        fail pos ("abstract type " ^ abs.name ^ " escapes the recursion")
-      | None -> ()
-      end;
+      let problem =
+        if k.fun_level < level then Some "recursion index escapes"
+        else
+          List.find_opt (fun abs -> abs.Type.id > start) (List.concat_map Type.abstracts carried)
+          |> Option.map (fun abs -> "abstract type " ^ abs.Type.name ^ " escapes the recursion")
+      in
       let outer = Type.fresh () in
       let copy = Type.copy (function Rigid r when r.abs == k -> Some outer | _ -> None) in
       let input_ty = copy (Recurs r) and ty = copy output in
-      unify pos input.ty input_ty;
+      let problem = if problem = None then unify input.ty input_ty else problem in
       let args = labelled (input :: List.map snd accs) in
-      {expr = Recur {continue = continue_name; forget = forget_name; params; args; body}; ty}, next
+      let recur = Expr.Recur {continue = continue_name; forget = forget_name; params; args; body} in
+      check pos problem {expr = recur; ty}, next
     in
 
     Type.level := 0;
@@ -1292,7 +1356,7 @@ module Parsing = struct
       (* The implicit top-level `let` *)
       decr Type.level;
       Type.generalize e.ty;
-      e
+      e, List.sort (fun (a, _) (b, _) -> Int.compare a b) (List.rev !errors)
     | _ -> unexpected pos
 end
 
@@ -1312,6 +1376,11 @@ end = struct
       }
     | Native of ((string * value) list -> value)
     | Roll of value
+    | Hole
+
+  (* Raised when evaluation needs to know more about a hole than that it is
+     one, making the expression being evaluated a hole too *)
+  exception Indeterminate
 
   (* The current function's dependencies are bound under a name that no
      variable can have *)
@@ -1331,14 +1400,17 @@ end = struct
         Buffer.add_char buf ')'
       | Closure _ | Native _ -> Buffer.add_string buf "<function>"
       | Roll value -> Buffer.add_char buf '&'; aux value
+      | Hole -> Buffer.add_char buf '_'
     in
     aux value;
     Buffer.contents buf
 
-  (* Programs are well typed and patterns exhaustive, so evaluation can't go
-     wrong: the failures below are assertions *)
+  (* Programs are well typed and patterns exhaustive, except where marked as
+     erroneous, which evaluates to a hole. So evaluation can't go wrong: the
+     failures below are assertions. *)
   let fields_of = function
     | Record fields -> fields
+    | Hole -> raise Indeterminate
     | _ -> assert false
 
   let rec bind env (p : Pat.typed) value =
@@ -1354,6 +1426,9 @@ end = struct
         | None -> bind env q value
         | found -> found
       end
+    | Pat.Record ps, Hole -> bind_fields env ps (List.map (fun (name, _) -> name, Hole) ps)
+    | Pat.Roll p, Hole -> bind env p Hole
+    | Pat.Variant _, Hole | Pat.Error _, _ -> raise Indeterminate
     | _ -> None
 
   and bind_fields env ps values =
@@ -1361,7 +1436,10 @@ end = struct
         Option.bind env (fun env -> bind env p (List.assoc name values)))
       (Some env) ps
 
-  let rec eval env (node : Expr.typed) =
+  let rec eval env node =
+    try step env node with Indeterminate -> Hole
+
+  and step env (node : Expr.typed) =
     match node.expr with
     | Expr.Record {fields; rest} ->
       let fields = List.map (fun (name, e) -> name, eval env e) fields in
@@ -1394,6 +1472,7 @@ end = struct
       let args = List.map (fun (name, e) -> name, eval env e) args in
       begin match f with
         | Native f -> f args
+        | Hole -> raise Indeterminate
         | Closure c ->
           let deps = match deps with Some e -> eval env e | None -> Record [] in
           let inner = Option.get (bind_fields ((deps_name, deps) :: c.env) c.params args) in
@@ -1418,9 +1497,13 @@ end = struct
         eval (Option.get (bind_fields env params args)) body
       in
       loop (List.map (fun (name, e) -> name, eval env e) args)
+
+    | Expr.Hole | Expr.Error _ -> Hole
 end
 
 let run code =
   match Parsing.parse code with
   | exception Compile_error msg -> Error msg
-  | e -> Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show (Runtime.eval [] e)))
+  | e, [] -> Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show (Runtime.eval [] e)))
+  | _, errors ->
+    Error (String.concat "\n" (List.map (fun (pos, msg) -> Parsing.describe code pos msg) errors))

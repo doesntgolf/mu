@@ -298,6 +298,20 @@ The canonical format for storing and communicating code is not the text format u
 bootstrap system, but a simple binary format (yet to be designed) so that content hashing
 is unaffected by code formatting concerns.
 
+### Holes and errors
+
+Programs being edited are usually incomplete or wrong somewhere, so the environment keeps
+checking and running them anyway. A hole, written `_` where an expression goes, stands for
+code that hasn't been written yet. It can have any type, and is inferred the type its
+context needs. A type error doesn't stop checking either: the expression it's found in is
+marked with it, keeping whatever type it has, and the rest of the program goes on being
+checked. Failed unifications are undone, so an error doesn't spread into other types.
+
+Holes and erroneous expressions both evaluate to holes. Evaluation carries on around them,
+and an expression that needs more of a hole than to pass it along, like `_.x`, `_(a)`, or
+matching `_` against tags, evaluates to a hole too. So `let f(x) = x [#a -> #b, #b -> #a]
+in {f(#a), f(_)}` evaluates to `{#b, _}`.
+
 ### Notation
 
 On top of the language, we introduce a "notation" system, present both in the literal forms
