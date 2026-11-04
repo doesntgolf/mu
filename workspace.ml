@@ -138,7 +138,15 @@ let trim_end s =
 (* Set below, once drawing the whole workspace is defined *)
 let redraw = ref (fun () -> ())
 
-let rec render st path (node : Syntax.t) : Dom.node Js.t =
+(* Each value is shown in the gutter, level with the line its node starts *)
+let value (s, title) =
+  let el = Dom_html.createSpan doc in
+  el##.className := Js.string "value";
+  el##.title := Js.string title;
+  Dom.appendChild el (text s);
+  (el :> Dom.node Js.t)
+
+let rec render st values path (node : Syntax.t) : Dom.node Js.t =
   match st.editing with
   | Some area when path = st.cursor -> (area :> Dom.node Js.t)
   | _ ->
@@ -197,7 +205,8 @@ let rec render st path (node : Syntax.t) : Dom.node Js.t =
           if i = 0 && bracketed && String.trim gap <> "" then String.trim gap ^ " " else gap
         in
         put gap break;
-        Dom.appendChild !line (render st (path @ [i]) child);
+        Option.iter (fun v -> Dom.appendChild !line (value v)) (List.assoc_opt (path @ [i]) values);
+        Dom.appendChild !line (render st values (path @ [i]) child);
         after_block := is_block child;
         pos := child.stop)
       node.children;
@@ -419,16 +428,44 @@ let parse_or_hole source =
   | parsed -> source, parsed
   | exception Compile_error _ -> "_", Parsing.parse "_"
 
-let output st =
-  let {Parsing.expr; errors; _} = st.parsed in
-  let value =
-    match Runtime.eval [] expr with
-    | value -> Runtime.show value
-    | exception e -> "evaluation failed: " ^ Printexc.to_string e
+(* The values bound by the program's top-level lets, and the value of the
+   whole program, by the paths of the bindings and the final body. Each has
+   a tooltip, which for the whole program includes its type. *)
+let values st =
+  let show_bound env env' =
+    let bound = List.filteri (fun i _ -> i < List.length env' - List.length env) env' in
+    String.concat ", " (List.rev_map (fun (name, v) -> name ^ " = " ^ Runtime.show v) bound)
   in
-  String.concat "\n"
-    (Printf.sprintf "the %s %s" (Type.show expr.ty) value
-     :: List.map (fun (pos, msg) -> Parsing.describe st.source pos msg) errors)
+  let rec bindings env path (node : Syntax.t) =
+    match node.form, node.info with
+    | "let", Expr {expr = Let {pat; defn; _}; _} ->
+      begin match Runtime.define env pat defn with
+        | Some env' -> (path @ [0], show_bound env env') :: bindings env' (path @ [1]) (List.nth node.children 1)
+        | None -> []
+      end
+    | "abstract", _ -> bindings env (path @ [0]) (List.hd node.children)
+    | _ -> []
+  in
+  let rec body path (node : Syntax.t) =
+    match node.form with
+    | "let" -> body (path @ [1]) (List.nth node.children 1)
+    | "abstract" -> body (path @ [0]) (List.hd node.children)
+    | _ -> path
+  in
+  let expr = st.parsed.expr in
+  let result =
+    match Runtime.show (Runtime.eval [] expr) with
+    | value -> value, Printf.sprintf "the %s %s" (Type.show expr.ty) value
+    | exception e -> let msg = "evaluation failed: " ^ Printexc.to_string e in msg, msg
+  in
+  match st.parsed.syntax.children with
+  | [program] ->
+    let bound = List.filter (fun (_, v) -> v <> "") (bindings [] [0] program) in
+    (body [0] program, result) :: List.map (fun (path, v) -> path, (v, v)) bound
+  | _ -> []
+
+let output st =
+  String.concat "\n" (List.map (fun (pos, msg) -> Parsing.describe st.source pos msg) st.parsed.errors)
 
 let status st =
   let node = selected st in
@@ -440,7 +477,12 @@ let status st =
 let draw st =
   let editor = Dom_html.getElementById "editor" in
   editor##.innerHTML := Js.string "";
-  Dom.appendChild editor (render st [] st.parsed.syntax);
+  Dom.appendChild editor (render st (values st) [] st.parsed.syntax);
+  (* The gutter is as wide as the widest value, up to a limit *)
+  let values = Dom.list_of_nodeList (editor##querySelectorAll (Js.string ".value")) in
+  let width = List.fold_left (fun w (v : Dom_html.element Js.t) -> max w v##.offsetWidth) 0 values in
+  List.iter (fun (v : Dom_html.element Js.t) -> v##.style##.width := Js.string (Printf.sprintf "%dpx" width)) values;
+  editor##.style##.paddingRight := Js.string (Printf.sprintf "calc(%dpx + 3ch)" width);
   let set id s = (Dom_html.getElementById id)##.textContent := Js.some (Js.string s) in
   set "status" (status st);
   set "output" (output st);

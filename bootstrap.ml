@@ -1450,6 +1450,9 @@ module Runtime : sig
   type value
   val show : value -> string
   val eval : (string * value) list -> Expr.typed -> value
+  (* The environment within `let p = e in ...`, unless binding it depends on
+     a hole *)
+  val define : (string * value) list -> Pat.typed -> Expr.typed -> (string * value) list option
 end = struct
   type value =
       Record of (string * value) list
@@ -1585,6 +1588,9 @@ end = struct
       loop (List.map (fun (name, e) -> name, eval env e) args)
 
     | Expr.Hole | Expr.Error _ -> Hole
+
+  let define env pat defn =
+    try bind env pat (eval env defn) with Indeterminate -> None
 end
 
 let run code =

@@ -17,7 +17,11 @@
     }
     body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
            font: 15px/1.5 ui-monospace, Menlo, Consolas, monospace; }
-    #editor { white-space: pre; padding: 8px 0; min-height: 4em; overflow-x: auto; }
+    #editor { white-space: pre; padding: 8px 0; min-height: 4em; overflow-x: auto;
+              position: relative; }
+    /* In the gutter, at the height of the line they're placed in */
+    .value { position: absolute; right: 0; max-width: 40ch; overflow: hidden;
+             text-overflow: ellipsis; color: var(--dim); }
     .node { border-radius: 3px; }
     .node:hover { background: var(--hover); }
     .node.selected, .node.selected .line { background: var(--select); }
@@ -29,6 +33,7 @@
     #status, #output { white-space: pre-wrap; background: var(--panel); padding: 6px 8px;
                        border-radius: 4px; margin: 8px 0; }
     #status { color: var(--dim); }
+    #output:empty { display: none; }
     details { color: var(--dim); }
     #source { white-space: pre-wrap; }
     .help { color: var(--dim); font-size: 13px; }
