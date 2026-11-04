@@ -9,6 +9,14 @@ open Bootstrap
 
 let doc = Dom_html.document
 
+(* The prelude, or if it doesn't load, an empty one and why *)
+let prelude, prelude_error =
+  match load_prelude Prelude.source with
+  | Ok prelude -> prelude, ""
+  | Error msg -> {vars = []; env = []}, msg
+
+let parse source = Parsing.parse ~vars:prelude.vars source
+
 type state = {
   mutable source : string;
   mutable parsed : Parsing.result;
@@ -241,7 +249,7 @@ let reparse st edits =
         String.sub source 0 start ^ text ^ String.sub source stop (String.length source - stop))
       st.source edits
   in
-  match Parsing.parse source with
+  match parse source with
   | parsed -> Ok (source, parsed)
   | exception Compile_error msg -> Error msg
 
@@ -424,9 +432,9 @@ let insert_row st after =
       edit st
 
 let parse_or_hole source =
-  match Parsing.parse source with
+  match parse source with
   | parsed -> source, parsed
-  | exception Compile_error _ -> "_", Parsing.parse "_"
+  | exception Compile_error _ -> "_", parse "_"
 
 (* The values bound by the program's top-level lets, and the value of the
    whole program, by the paths of the bindings and the final body. Each has
@@ -454,18 +462,18 @@ let values st =
   in
   let expr = st.parsed.expr in
   let result =
-    match Runtime.show (Runtime.eval [] expr) with
+    match Runtime.show (Runtime.eval prelude.env expr) with
     | value -> value, Printf.sprintf "the %s %s" (Type.show expr.ty) value
     | exception e -> let msg = "evaluation failed: " ^ Printexc.to_string e in msg, msg
   in
   match st.parsed.syntax.children with
   | [program] ->
-    let bound = List.filter (fun (_, v) -> v <> "") (bindings [] [0] program) in
+    let bound = List.filter (fun (_, v) -> v <> "") (bindings prelude.env [0] program) in
     (body [0] program, result) :: List.map (fun (path, v) -> path, (v, v)) bound
   | _ -> []
 
 let output st =
-  String.concat "\n" (List.map (fun (pos, msg) -> Parsing.describe st.source pos msg) st.parsed.errors)
+  String.concat "\n" (List.filter (( <> ) "") [prelude_error; describe_errors st.source st.parsed.errors])
 
 let status st =
   let node = selected st in

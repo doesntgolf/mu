@@ -892,9 +892,10 @@ module Parsing = struct
     syntax : Syntax.t
   }
 
-  (* Parses and typechecks in a single pass. Syntax errors stop parsing, but
-     type errors are marked in the tree, which goes on being checked. *)
-  let parse input =
+  (* Parses and typechecks in a single pass, with [vars] in scope. Syntax
+     errors stop parsing, but type errors are marked in the tree, which goes
+     on being checked. *)
+  let parse ?(vars = []) input =
     let tokenize = tokenize input in
     let fail pos = fail input (skip input pos) in
 
@@ -1434,7 +1435,7 @@ module Parsing = struct
 
     Type.level := 0;
     Type.fun_level := 0;
-    let expr, pos = expr {vars = []; types = []; deps = Type.empty} 0 in
+    let expr, pos = expr {vars; types = []; deps = Type.empty} 0 in
     match tokenize pos with
     | EOF, _ ->
       (* The implicit top-level `let` *)
@@ -1453,6 +1454,8 @@ module Runtime : sig
   (* The environment within `let p = e in ...`, unless binding it depends on
      a hole *)
   val define : (string * value) list -> Pat.typed -> Expr.typed -> (string * value) list option
+  (* A record's field, which is a hole if the record is *)
+  val field : value -> string -> value
 end = struct
   type value =
       Record of (string * value) list
@@ -1591,12 +1594,32 @@ end = struct
 
   let define env pat defn =
     try bind env pat (eval env defn) with Indeterminate -> None
+
+  let field value name =
+    try List.assoc name (fields_of value) with Indeterminate -> Hole
 end
 
-let run code =
-  match Parsing.parse code with
+(* The names in scope in every program, with their types and values: the
+   fields of the prelude, which must be a record *)
+type prelude = {vars : (string * Type.t) list; env : (string * Runtime.value) list}
+
+let describe_errors code errors =
+  String.concat "\n" (List.map (fun (pos, msg) -> Parsing.describe code pos msg) errors)
+
+let load_prelude source =
+  match Parsing.parse source with
+  | exception Compile_error msg -> Error ("in the prelude, " ^ msg)
+  | {errors = _ :: _ as errors; _} -> Error ("in the prelude, " ^ describe_errors source errors)
+  | {expr; _} ->
+    match Type.prune expr.ty with
+    | Record {fields; _} ->
+      let value = Runtime.eval [] expr in
+      Ok {vars = fields; env = List.map (fun (name, _) -> name, Runtime.field value name) fields}
+    | ty -> Error ("the prelude must be a record, but it's a " ^ Type.show ty)
+
+let run prelude code =
+  match Parsing.parse ~vars:prelude.vars code with
   | exception Compile_error msg -> Error msg
   | {expr = e; errors = []; _} ->
-    Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show (Runtime.eval [] e)))
-  | {errors; _} ->
-    Error (String.concat "\n" (List.map (fun (pos, msg) -> Parsing.describe code pos msg) errors))
+    Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show (Runtime.eval prelude.env e)))
+  | {errors; _} -> Error (describe_errors code errors)

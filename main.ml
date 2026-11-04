@@ -30,7 +30,7 @@ Available commands are:
     0
 
   | `Prog code ->
-    match Bootstrap.run code with
+    match Result.bind (Bootstrap.load_prelude Prelude.source) (fun p -> Bootstrap.run p code) with
     | Ok out -> print_endline out; 0
     | Error msg -> print_endline msg; 1
 

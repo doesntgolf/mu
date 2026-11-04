@@ -19,6 +19,8 @@ and interpreter in OCaml is still in the beginning stages. It type checks while 
 which keeps the language honest about being checkable in a single pass. `make` builds
 `mu`, the command-line interpreter, and `workspace.js` for the editing environment
 prototype in `index.html`, using `ocamlfind` and `js_of_ocaml`. `make test` runs the tests.
+Both load the prelude in `prelude.ml`: a Mu record, as an OCaml string, whose fields are
+in scope in every program.
 
 ## Type system
 
