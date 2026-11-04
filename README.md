@@ -16,7 +16,9 @@ environment.
 
 **Status:** The language design is still somewhat in flux. The bootstrapping type checker
 and interpreter in OCaml is still in the beginning stages. It type checks while parsing,
-which keeps the language honest about being checkable in a single pass.
+which keeps the language honest about being checkable in a single pass. `make` builds
+`mu`, the command-line interpreter, and `workspace.js` for the editing environment
+prototype in `index.html`, using `ocamlfind` and `js_of_ocaml`. `make test` runs the tests.
 
 ## Type system
 

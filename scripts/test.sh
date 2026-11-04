@@ -4,9 +4,9 @@
 # the changes with `git diff tests/`.
 #
 # usage: scripts/test.sh [--update] [tests/foo.mu ...]
-# The interpreter is $MU, or ./a.out by default.
+# The interpreter is $MU, or ./mu by default.
 
-mu=${MU:-./a.out}
+mu=${MU:-./mu}
 update=
 if [ "$1" = --update ]; then
   update=1

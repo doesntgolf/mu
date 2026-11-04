@@ -1,5 +1,3 @@
-*.cmi
-*.cmo
-*.cmx
-bootstrap.o
-a.out
+_build/
+mu
+workspace.js

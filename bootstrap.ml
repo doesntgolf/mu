@@ -1,40 +1,15 @@
-module Symbol : sig
-  (* Strings backed by a WeakSet *)
-  type t
-  val equal : t -> t -> bool
-  val of_string : string -> t
-  val to_string : t -> string
-end = struct
-  type t = string
-
-  let equal a b = a == b
-
-  let of_string =
-    let module Table = Weak.Make(String) in
-    let table = Table.create 64 in
-
-    fun str ->
-      match Table.find_opt table str with
-      | Some s -> s
-      | None ->
-        Table.add table str;
-        str
-
-  let to_string s = s
-end
-
 exception Compile_error of string
 
-(* Fields, environments and rows are association lists keyed by symbols, so
-   List.assq and friends apply. Positional fields are labelled 1, 2, ... *)
-let label i = Symbol.of_string (string_of_int (i + 1))
+(* Fields, environments and rows are association lists keyed by name.
+   Positional fields are labelled 1, 2, ... *)
+let label i = string_of_int (i + 1)
 
 let show_fields buf ~sep show fields =
   List.iteri (fun i (name, x) ->
       if i <> 0 then
         Buffer.add_string buf ", ";
-      if not (Symbol.equal name (label i)) then
-        Printf.bprintf buf ".%s %s " (Symbol.to_string name) sep;
+      if not (String.equal name (label i)) then
+        Printf.bprintf buf ".%s %s " name sep;
       show x)
     fields
 
@@ -55,7 +30,7 @@ module Type = struct
        type that get generalized, so [view] is an instance of [abs.repr]. *)
     | Rigid of {abs : abstract; view : t}
 
-  and row = {fields : (Symbol.t * t) list; rest : t option}
+  and row = {fields : (string * t) list; rest : t option}
 
   (* A recursive type's binder is the Recurs node itself, so cyclic types are
      cyclic graphs. The index is shared by every layer of a cycle: [empty] when
@@ -71,7 +46,7 @@ module Type = struct
     | Link of t
 
   and abstract = {
-    name : Symbol.t;
+    name : string;
     id : int;
     mutable fun_level : int;
     repr : t
@@ -148,7 +123,7 @@ module Type = struct
         if not (List.mem_assq v !found) then
           found := !found @ [v, b]
       | Record r1, Record r2 | Variant r1, Variant r2 ->
-        List.iter (fun (name, a) -> Option.iter (go a) (List.assq_opt name r2.fields)) r1.fields
+        List.iter (fun (name, a) -> Option.iter (go a) (List.assoc_opt name r2.fields)) r1.fields
       | Function f1, Function f2 -> go f1.inputs f2.inputs; go f1.deps f2.deps; go f1.output f2.output
       | Recurs r1, Recurs r2 when not (List.memq r1 !recs) ->
         recs := r1 :: !recs;
@@ -184,7 +159,7 @@ module Type = struct
       | Var {contents = Link _} -> assert false
 
       | Rigid {abs; view} ->
-        Buffer.add_string buf (Symbol.to_string abs.name);
+        Buffer.add_string buf abs.name;
         begin match args abs view with
           | [] -> ()
           | args ->
@@ -203,7 +178,7 @@ module Type = struct
         row true (List.iteri (fun i (tag, payload) ->
             if i <> 0 then
               Buffer.add_string buf ", ";
-            Printf.bprintf buf "#%s" (Symbol.to_string tag);
+            Printf.bprintf buf "#%s" tag;
             match prune payload with
             | Record {fields = []; rest = None} -> ()
             | Record r ->
@@ -232,7 +207,7 @@ module Type = struct
         Buffer.add_string buf ") -> ";
         if fn.exists <> [] then
           Printf.bprintf buf "exists %s. "
-            (String.concat ", " (List.map (fun abs -> Symbol.to_string abs.name) fn.exists));
+            (String.concat ", " (List.map (fun abs -> abs.name) fn.exists));
         go fn.output
 
       | Recurs r ->
@@ -244,7 +219,7 @@ module Type = struct
           recs := (r, name) :: !recs;
           Buffer.add_string buf "rec ";
           begin match prune r.index with
-            | Rigid {abs; _} -> Printf.bprintf buf "[%s] " (Symbol.to_string abs.name)
+            | Rigid {abs; _} -> Printf.bprintf buf "[%s] " abs.name
             | _ -> ()
           end;
           Printf.bprintf buf "%s. " name;
@@ -254,7 +229,7 @@ module Type = struct
       let fields, rest = flatten variant r in
       let fields =
         List.fold_left (fun acc (name, ty) ->
-            if List.mem_assq name acc then acc else acc @ [name, ty])
+            if List.mem_assoc name acc then acc else acc @ [name, ty])
           [] fields
       in
       show_items fields;
@@ -443,7 +418,7 @@ module Type = struct
       let why =
         match a, b with
         | Rigid r1, Rigid r2
-          when Symbol.equal r1.abs.name r2.abs.name && not (rename r1.abs r2.abs) ->
+          when String.equal r1.abs.name r2.abs.name && not (rename r1.abs r2.abs) ->
           ", a different abstract type"
         | _ -> ""
       in
@@ -457,7 +432,7 @@ module Type = struct
         | Some ty -> raise (Compile_error ("expected a row, found " ^ show ty))
       end;
       List.fold_left (fun acc (name, ty) ->
-          match List.assq_opt name acc with
+          match List.assoc_opt name acc with
           | Some ty' -> go ty ty'; acc
           | None -> acc @ [name, ty])
         [] fields,
@@ -467,14 +442,13 @@ module Type = struct
       let wrap row = if variant then Variant row else Record row in
       let f1, rest1 = fields variant r1 in
       let f2, rest2 = fields variant r2 in
-      List.iter (fun (name, ty) -> Option.iter (go ty) (List.assq_opt name f2)) f1;
-      let extra fs others = List.filter (fun (name, _) -> not (List.mem_assq name others)) fs in
+      List.iter (fun (name, ty) -> Option.iter (go ty) (List.assoc_opt name f2)) f1;
+      let extra fs others = List.filter (fun (name, _) -> not (List.mem_assoc name others)) fs in
       let extra1 = extra f1 f2 and extra2 = extra f2 f1 in
       let missing = function
         | [] -> ()
         | (name, _) :: _ ->
-          raise (Compile_error (Printf.sprintf "no %s%s" (if variant then "tag #" else "field .")
-                                  (Symbol.to_string name)))
+          raise (Compile_error ((if variant then "no tag #" else "no field .") ^ name))
       in
       match rest1, rest2 with
       | Some (Var v1), Some (Var v2) when v1 == v2 -> missing extra1; missing extra2
@@ -506,10 +480,10 @@ end
 
 module Pat = struct
   type t =
-      Var of Symbol.t
+      Var of string
     | Wildcard
-    | Record of (Symbol.t * typed) list
-    | Variant of Symbol.t * (Symbol.t * typed) list
+    | Record of (string * typed) list
+    | Variant of string * (string * typed) list
     | Roll of typed
     | Or of typed * typed
 
@@ -535,12 +509,12 @@ module Pat = struct
     (* Field names in order of first appearance *)
     let names fieldss =
       List.fold_left (fun acc fields ->
-          acc @ List.filter (fun name -> not (List.memq name acc)) (List.map fst fields))
+          acc @ List.filter (fun name -> not (List.mem name acc)) (List.map fst fields))
         [] fieldss
     in
     let show_fields names ws =
       String.concat ", " (List.mapi (fun i (name, w) ->
-          if Symbol.equal name (label i) then w else "." ^ Symbol.to_string name ^ " = " ^ w)
+          if String.equal name (label i) then w else "." ^ name ^ " = " ^ w)
           (List.combine names ws))
     in
     (* Finds a value, as text, that no row matches, treating the open variant
@@ -570,7 +544,7 @@ module Pat = struct
             (go closed (k + n - 1) rows)
         in
         let fields_of names fields =
-          List.map (fun name -> Option.value (List.assq_opt name fields) ~default:wild) names
+          List.map (fun name -> Option.value (List.assoc_opt name fields) ~default:wild) names
         in
         match List.find_opt (fun p -> not (is_wild p)) heads with
         | None -> Option.map (fun w -> "_" :: w) (go closed (n - 1) (List.map List.tl rows))
@@ -600,23 +574,23 @@ module Pat = struct
           in
           let case (tag, payload) =
             let fieldss = List.filter_map (function
-                | {pat = Variant (tag', fields); _} when tag' == tag -> Some fields
+                | {pat = Variant (tag', fields); _} when tag' = tag -> Some fields
                 | _ -> None)
                 heads
             in
             let names = names fieldss in
             specialize (List.length names)
               (function
-                | {pat = Variant (tag', fields); _} when tag' == tag -> Some (fields_of names fields)
+                | {pat = Variant (tag', fields); _} when tag' = tag -> Some (fields_of names fields)
                 | _ -> None)
               (fun ws ->
-                 let tag = "#" ^ Symbol.to_string tag in
+                 let tag = "#" ^ tag in
                  match ws, Type.prune payload with
                  | [], Record {fields = []; rest = None} -> tag
                  | [], _ -> tag ^ "(..)"
                  | ws, _ -> tag ^ "(" ^ show_fields names ws ^ ")")
           in
-          let complete = not open_ && List.for_all (fun (tag, _) -> List.memq tag seen) tags in
+          let complete = not open_ && List.for_all (fun (tag, _) -> List.mem tag seen) tags in
           let default () = go closed (n - 1) (List.filter_map (function
               | p :: rest when is_wild p -> Some rest
               | _ -> None)
@@ -641,25 +615,25 @@ end
 module Expr = struct
   (* `the` and `abstract` only affect typing, so they don't appear here *)
   type t =
-      Record of {fields : (Symbol.t * typed) list; rest : typed option}
-    | Field of typed * Symbol.t
+      Record of {fields : (string * typed) list; rest : typed option}
+    | Field of typed * string
 
-    | Variant of Symbol.t * (Symbol.t * typed) list
+    | Variant of string * (string * typed) list
     | Match of typed * (Pat.typed * typed) list
 
     | Function of {
-        params : (Symbol.t * Pat.typed) list;
+        params : (string * Pat.typed) list;
         deps : Pat.typed option;
         body : typed
       }
     | Apply of {
         f : typed;
-        args : (Symbol.t * typed) list;
+        args : (string * typed) list;
         deps : typed option
       }
-    | Dep of Symbol.t
+    | Dep of string
 
-    | Var of Symbol.t
+    | Var of string
     | Let of {
         pat : Pat.typed;
         defn : typed;
@@ -670,10 +644,10 @@ module Expr = struct
     (* `recur (p <- e, ...) do body`: [params] start with `&p`, and body sees
        [continue] and [forget] *)
     | Recur of {
-        continue : Symbol.t;
-        forget : Symbol.t;
-        params : (Symbol.t * Pat.typed) list;
-        args : (Symbol.t * typed) list;
+        continue : string;
+        forget : string;
+        params : (string * Pat.typed) list;
+        args : (string * typed) list;
         body : typed
       }
 
@@ -710,11 +684,11 @@ module Parsing = struct
     | Dot
     | DotDot
     | Ampersand
-    | Ident of Symbol.t
-    | Field of Symbol.t
-    | Tag of Symbol.t
-    | TypeVar of Symbol.t
-    | Dep of Symbol.t
+    | Ident of string
+    | Field of string
+    | Tag of string
+    | TypeVar of string
+    | Dep of string
     | EOF
 
   let string_of_token = function
@@ -743,11 +717,11 @@ module Parsing = struct
     | Dot -> "."
     | DotDot -> ".."
     | Ampersand -> "&"
-    | Ident sym -> Symbol.to_string sym
-    | Field sym -> "." ^ Symbol.to_string sym
-    | Tag sym -> "#" ^ Symbol.to_string sym
-    | TypeVar sym -> "'" ^ Symbol.to_string sym
-    | Dep sym -> "@" ^ Symbol.to_string sym
+    | Ident sym -> sym
+    | Field sym -> "." ^ sym
+    | Tag sym -> "#" ^ sym
+    | TypeVar sym -> "'" ^ sym
+    | Dep sym -> "@" ^ sym
     | EOF -> "end of input"
 
   let line_and_col_of_pos input target =
@@ -793,7 +767,7 @@ module Parsing = struct
     let symbol start =
       let stop = ref start in
       while is_symbol_char (char !stop) do incr stop done;
-      Symbol.of_string (String.sub input start (!stop - start)), !stop
+      String.sub input start (!stop - start), !stop
     in
 
     let prefixed token =
@@ -808,7 +782,7 @@ module Parsing = struct
     | '_' ->
       let sym, next = symbol pos in
       let token =
-        match Symbol.to_string sym with
+        match sym with
         | "let" -> Let
         | "in" -> In
         | "fun" -> Fun
@@ -849,8 +823,8 @@ module Parsing = struct
     | c -> fail input pos (Printf.sprintf "unexpected character '%c'" c)
 
   type scope = {
-    vars : (Symbol.t * Type.t) list;
-    types : (Symbol.t * Type.t) list; (* names bound by `abstract` *)
+    vars : (string * Type.t) list;
+    types : (string * Type.t) list; (* names bound by `abstract` *)
     deps : Type.t                      (* dependencies of the innermost function *)
   }
 
@@ -904,7 +878,7 @@ module Parsing = struct
         let i, fields, tail, deps, pos =
           match tokenize pos, rest, using with
           | (Field name, next), _, _ ->
-            if List.mem_assq name fields then
+            if List.mem_assoc name fields then
               fail pos "duplicate field";
             let x, pos =
               match tokenize next, func with
@@ -947,11 +921,11 @@ module Parsing = struct
       let ty = type_expr scope vars binders in
       match tokenize pos with
       | TypeVar name, next ->
-        begin match List.assq_opt name binders with
+        begin match List.assoc_opt name binders with
           | Some (Some ty) -> ty, next
           | Some None -> fail pos "recursive type is not strictly positive"
           | None ->
-            match List.assq_opt name !vars with
+            match List.assoc_opt name !vars with
             | Some ty -> ty, next
             | None ->
               let ty = Type.fresh () in
@@ -960,9 +934,9 @@ module Parsing = struct
         end
 
       | Ident name, next ->
-        begin match List.assq_opt name scope.types with
+        begin match List.assoc_opt name scope.types with
           | Some ty -> ty, next
-          | None -> fail pos ("unknown type " ^ Symbol.to_string name)
+          | None -> fail pos ("unknown type " ^ name)
         end
 
       | LeftParen, next ->
@@ -1026,7 +1000,7 @@ module Parsing = struct
           if List.compare_lengths !left !right <> 0 then
             fail pos "both sides of `or` must bind the same variables";
           List.iter (fun (name, ty) ->
-              match List.assq_opt name !right with
+              match List.assoc_opt name !right with
               | Some ty' -> unify next ty ty'
               | None -> fail pos "both sides of `or` must bind the same variables")
             !left;
@@ -1034,8 +1008,8 @@ module Parsing = struct
         | _ -> p, pos
       in
       List.iter (fun (name, ty) ->
-          if List.mem_assq name !binds then
-            fail pos (Symbol.to_string name ^ " is bound twice");
+          if List.mem_assoc name !binds then
+            fail pos (name ^ " is bound twice");
           binds := (name, ty) :: !binds)
         !left;
       p, pos
@@ -1044,8 +1018,8 @@ module Parsing = struct
       let types = List.map (fun (name, p) -> name, p.Pat.ty) in
       match tokenize pos with
       | Ident name, next ->
-        if List.mem_assq name !binds then
-          fail pos (Symbol.to_string name ^ " is bound twice");
+        if List.mem_assoc name !binds then
+          fail pos (name ^ " is bound twice");
         let ty = Type.fresh () in
         binds := (name, ty) :: !binds;
         {Pat.pat = Var name; ty}, next
@@ -1135,9 +1109,9 @@ module Parsing = struct
     and atomic_expr scope pos =
       match tokenize pos with
       | Ident name, next ->
-        begin match List.assq_opt name scope.vars with
+        begin match List.assoc_opt name scope.vars with
           | Some ty -> {Expr.expr = Var name; ty = Type.instantiate ty}, next
-          | None -> fail pos ("unbound variable " ^ Symbol.to_string name)
+          | None -> fail pos ("unbound variable " ^ name)
         end
 
       | Dep name, next ->
@@ -1262,7 +1236,7 @@ module Parsing = struct
       in
       let accs, pos = accs pos in
       Type.fun_level := level;
-      let k = Type.abstract (Symbol.of_string "recur") Type.empty in
+      let k = Type.abstract "recur" Type.empty in
       let r = {Type.body = root.ty; index = Rigid {abs = k; view = Type.empty}} in
       let labelled xs = List.mapi (fun i x -> label i, x) xs in
       let params = labelled ({Pat.pat = Roll root; ty = Recurs r} :: List.map fst accs) in
@@ -1286,7 +1260,7 @@ module Parsing = struct
         }
       in
       let start = !Type.counter in
-      let continue_name = Symbol.of_string "continue" and forget_name = Symbol.of_string "forget" in
+      let continue_name = "continue" and forget_name = "forget" in
       let vars = !binds @ [continue_name, ty; forget_name, forget] @ scope.vars in
       let body, next = expr {scope with vars} (expect Do pos) in
       unify pos output body.ty;
@@ -1299,7 +1273,7 @@ module Parsing = struct
       begin match List.find_opt (fun abs -> abs.Type.id > start)
                     (List.concat_map Type.abstracts carried) with
       | Some abs ->
-        fail pos ("abstract type " ^ Symbol.to_string abs.name ^ " escapes the recursion")
+        fail pos ("abstract type " ^ abs.name ^ " escapes the recursion")
       | None -> ()
       end;
       let outer = Type.fresh () in
@@ -1325,23 +1299,23 @@ end
 module Runtime : sig
   type value
   val show : value -> string
-  val eval : (Symbol.t * value) list -> Expr.typed -> value
+  val eval : (string * value) list -> Expr.typed -> value
 end = struct
   type value =
-      Record of (Symbol.t * value) list
-    | Variant of Symbol.t * (Symbol.t * value) list
+      Record of (string * value) list
+    | Variant of string * (string * value) list
     | Closure of {
-        params : (Symbol.t * Pat.typed) list;
+        params : (string * Pat.typed) list;
         deps : Pat.typed option;
         body : Expr.typed;
-        env : (Symbol.t * value) list
+        env : (string * value) list
       }
-    | Native of ((Symbol.t * value) list -> value)
+    | Native of ((string * value) list -> value)
     | Roll of value
 
   (* The current function's dependencies are bound under a name that no
      variable can have *)
-  let deps_name = Symbol.of_string "@"
+  let deps_name = "@"
 
   let show value =
     let buf = Buffer.create 32 in
@@ -1350,9 +1324,9 @@ end = struct
         Buffer.add_char buf '{';
         show_fields buf ~sep:"=" aux fields;
         Buffer.add_char buf '}'
-      | Variant (tag, []) -> Printf.bprintf buf "#%s" (Symbol.to_string tag)
+      | Variant (tag, []) -> Printf.bprintf buf "#%s" tag
       | Variant (tag, fields) ->
-        Printf.bprintf buf "#%s(" (Symbol.to_string tag);
+        Printf.bprintf buf "#%s(" tag;
         show_fields buf ~sep:"=" aux fields;
         Buffer.add_char buf ')'
       | Closure _ | Native _ -> Buffer.add_string buf "<function>"
@@ -1372,7 +1346,7 @@ end = struct
     | Pat.Var name, _ -> Some ((name, value) :: env)
     | Pat.Wildcard, _ -> Some env
     | Pat.Record ps, Record values -> bind_fields env ps values
-    | Pat.Variant (tag, ps), Variant (tag', values) when Symbol.equal tag tag' ->
+    | Pat.Variant (tag, ps), Variant (tag', values) when String.equal tag tag' ->
       bind_fields env ps values
     | Pat.Roll p, Roll value -> bind env p value
     | Pat.Or (p, q), _ ->
@@ -1384,7 +1358,7 @@ end = struct
 
   and bind_fields env ps values =
     List.fold_left (fun env (name, p) ->
-        Option.bind env (fun env -> bind env p (List.assq name values)))
+        Option.bind env (fun env -> bind env p (List.assoc name values)))
       (Some env) ps
 
   let rec eval env (node : Expr.typed) =
@@ -1394,12 +1368,12 @@ end = struct
       let rest =
         match rest with
         | Some e ->
-          List.filter (fun (name, _) -> not (List.mem_assq name fields)) (fields_of (eval env e))
+          List.filter (fun (name, _) -> not (List.mem_assoc name fields)) (fields_of (eval env e))
         | None -> []
       in
       Record (fields @ rest)
 
-    | Expr.Field (e, name) -> List.assq name (fields_of (eval env e))
+    | Expr.Field (e, name) -> List.assoc name (fields_of (eval env e))
 
     | Expr.Variant (tag, fields) ->
       Variant (tag, List.map (fun (name, e) -> name, eval env e) fields)
@@ -1428,9 +1402,9 @@ end = struct
         | _ -> assert false
       end
 
-    | Expr.Dep name -> List.assq name (fields_of (List.assq deps_name env))
+    | Expr.Dep name -> List.assoc name (fields_of (List.assoc deps_name env))
 
-    | Expr.Var name -> List.assq name env
+    | Expr.Var name -> List.assoc name env
 
     | Expr.Let {pat; defn; body} -> eval (Option.get (bind env pat (eval env defn))) body
 
@@ -1438,7 +1412,7 @@ end = struct
 
     (* Unlike a closure, keeps the enclosing function's dependencies *)
     | Expr.Recur {continue; forget; params; args; body} ->
-      let identity = Native (fun args -> List.assq (label 0) args) in
+      let identity = Native (fun args -> List.assoc (label 0) args) in
       let rec loop args =
         let env = (continue, Native loop) :: (forget, identity) :: env in
         eval (Option.get (bind_fields env params args)) body
@@ -1450,43 +1424,3 @@ let run code =
   match Parsing.parse code with
   | exception Compile_error msg -> Error msg
   | e -> Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show (Runtime.eval [] e)))
-
-let main () =
-  let cmd =
-    match Sys.argv.(1) with
-    | "-h"
-    | "--help" -> `Usage
-    | "-v"
-    | "--version" -> `Version
-    | "-"
-    | "--" ->`Prog In_channel.(input_all stdin)
-    | "-e"
-    | "--eval" -> `Prog Sys.argv.(2)
-    | fname -> `Prog In_channel.(with_open_bin fname input_all)
-    | exception (Invalid_argument _) -> `Usage
-  in
-  match cmd with
-  | `Usage ->
-    let bin_name = Sys.argv.(0) in
-    Printf.printf {|usage: %s [command]
-Available commands are:
-  -h or --help		Print this help text.
-  -e or --eval 'code'	Parse, typecheck, and evaluate 'code'.
-  -v or --version	Show version information.
-  - or --		Parse, typecheck, and evaluate code from stdin.
-  'filename'		Parse, typecheck, and evaluate code from file 'filename'
-|} bin_name;
-    0
-
-  | `Version ->
-    print_endline "Mu 0.0.0 alpha";
-    0
-
-  | `Prog code ->
-    match run code with
-    | Ok out -> print_endline out; 0
-    | Error msg -> print_endline msg; 1
-
-let () =
-  if not !Sys.interactive then
-    exit (main ())
