@@ -28,8 +28,10 @@
     .error { text-decoration: underline wavy var(--error); text-underline-offset: 3px; }
     .form-hole, .form-wildcard { background: var(--hole); padding: 0 2px; }
     .indent { padding-left: 2ch; }
-    .cell { font: inherit; color: inherit; background: var(--bg); vertical-align: top;
-            border: 1px solid var(--dim); border-radius: 3px; padding: 0 2px; resize: none; }
+    /* The text being edited, which grows as it's typed */
+    .cell { display: inline-block; min-width: 1ch; vertical-align: top; white-space: pre;
+            outline: none; border-radius: 3px; background: var(--hover);
+            box-shadow: inset 0 -1px var(--dim); }
     #status, #output { white-space: pre-wrap; background: var(--panel); padding: 6px 8px;
                        border-radius: 4px; margin: 8px 0; }
     #status { color: var(--dim); }
@@ -45,10 +47,14 @@
   <pre id="output"></pre>
   <p class="help">
     ←↓↑→ or hjkl: previous sibling, first child, parent, next sibling &middot;
-    Enter or i: edit (Enter accepts, and gives a let without a body a hole to edit next;
-    Shift+Enter for a new line; Esc cancels) &middot;
-    d: replace with a hole, or delete a row &middot; K/J: move a row up/down &middot;
-    o/O: insert a row after/before &middot; u: undo
+    Enter or i: edit &middot; d: replace with a hole, or delete a row &middot;
+    K/J: move a row up/down &middot; o/O: insert a row after/before &middot; u: undo
+  </p>
+  <p class="help">
+    Editing: finished tokens become structure, with holes and closing brackets filled in,
+    and typing a token that's already next steps over it &middot; Backspace at the start
+    takes apart what's before &middot; Enter: next hole, or done &middot; Tab/Shift+Tab, or
+    ←/→ at the ends: next/previous hole &middot; Esc: done
   </p>
   <details><summary>Source</summary><pre id="source"></pre></details>
   <script src="workspace.js"></script>

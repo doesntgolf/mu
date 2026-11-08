@@ -781,7 +781,11 @@ module Parsing = struct
     let line, col = line_and_col_of_pos input pos in
     Printf.sprintf "line %i, column %i: %s" line col msg
 
-  let fail input pos msg = raise (Compile_error (describe input pos msg))
+  (* A syntax error at [pos], where [expected] would have fit there: a token,
+     or `_` for a missing expression or pattern *)
+  exception Syntax_error of {pos : int; msg : string; expected : string option}
+
+  let fail ?expected pos msg = raise (Syntax_error {pos; msg; expected})
 
   let rec skip input pos =
     match input.[pos] with
@@ -816,7 +820,7 @@ module Parsing = struct
 
     let prefixed token =
       match symbol (pos+1) with
-      | _, next when Int.equal next (pos+1) -> fail input pos "expected a name"
+      | _, next when Int.equal next (pos+1) -> fail pos "expected a name"
       | sym, next -> token sym, next
     in
 
@@ -864,7 +868,7 @@ module Parsing = struct
     | ']' -> RightSquare, pos+1
 
     | '\000' when pos >= String.length input -> EOF, pos
-    | c -> fail input pos (Printf.sprintf "unexpected character '%c'" c)
+    | c -> fail pos (Printf.sprintf "unexpected character '%c'" c)
 
   type scope = {
     vars : (string * Type.t) list;
@@ -892,22 +896,22 @@ module Parsing = struct
     syntax : Syntax.t
   }
 
-  (* Parses and typechecks in a single pass, with [vars] in scope. Syntax
-     errors stop parsing, but type errors are marked in the tree, which goes
-     on being checked. *)
+  (* Parses and typechecks in a single pass, with [vars] in scope. A syntax
+     error stops parsing with Syntax_error, but type errors are marked in the
+     tree, which goes on being checked. *)
   let parse ?(vars = []) input =
     let tokenize = tokenize input in
-    let fail pos = fail input (skip input pos) in
+    let fail ?expected pos = fail ?expected (skip input pos) in
 
-    let unexpected pos =
+    let unexpected ?expected pos =
       let token, _ = tokenize pos in
-      fail pos (Printf.sprintf "unexpected %s" (string_of_token token))
+      fail ?expected pos (Printf.sprintf "unexpected %s" (string_of_token token))
     in
 
     let expect token pos =
       match tokenize pos with
       | found, next when found = token -> next
-      | _ -> unexpected pos
+      | _ -> unexpected ~expected:(string_of_token token) pos
     in
 
     (* Each node adopts the nodes recorded since its start as its children *)
@@ -1002,7 +1006,7 @@ module Parsing = struct
         match tokenize pos with
         | Comma, next -> aux i fields tail deps next
         | token, next when token = closer -> List.rev fields, tail, deps, next
-        | _ -> unexpected pos
+        | _ -> unexpected ~expected:(string_of_token closer) pos
       in
       match tokenize pos with
       | token, next when token = closer -> [], None, None, next
@@ -1177,7 +1181,7 @@ module Parsing = struct
         let p, next_pos = pattern scope binds pos in
         pnode "the" start ({(pcheck pos (unify (repr ty) p.ty) p) with ty}, next_pos)
 
-      | _ -> unexpected pos
+      | _ -> unexpected ~expected:"_" pos
     in
 
     let rec expr scope pos =
@@ -1322,7 +1326,7 @@ module Parsing = struct
         let e, next = operand scope pos in
         enode "the" start ({(check pos (unify (repr ty) e.ty) e) with ty}, next)
 
-      | _ -> unexpected pos
+      | _ -> unexpected ~expected:"_" pos
 
     (* `(params) <arrow> body`: [arrow] is `->` after `fun`, and `=` in the
        sugar `let f(x) = e` and `{.f(x) = e}` *)
@@ -1382,7 +1386,7 @@ module Parsing = struct
           let rest, pos = accs pos in
           (p, init) :: rest, pos
         | RightParen, next -> [], next
-        | _ -> unexpected pos
+        | _ -> unexpected ~expected:")" pos
       in
       let accs, pos = accs pos in
       Type.fun_level := level;
@@ -1608,7 +1612,8 @@ let describe_errors code errors =
 
 let load_prelude source =
   match Parsing.parse source with
-  | exception Compile_error msg -> Error ("in the prelude, " ^ msg)
+  | exception Parsing.Syntax_error {pos; msg; _} ->
+    Error ("in the prelude, " ^ Parsing.describe source pos msg)
   | {errors = _ :: _ as errors; _} -> Error ("in the prelude, " ^ describe_errors source errors)
   | {expr; _} ->
     match Type.prune expr.ty with
@@ -1619,7 +1624,7 @@ let load_prelude source =
 
 let run prelude code =
   match Parsing.parse ~vars:prelude.vars code with
-  | exception Compile_error msg -> Error msg
+  | exception Parsing.Syntax_error {pos; msg; _} -> Error (Parsing.describe code pos msg)
   | {expr = e; errors = []; _} ->
     Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show (Runtime.eval prelude.env e)))
   | {errors; _} -> Error (describe_errors code errors)
