@@ -1,1 +1,1 @@
-line 1, column 11: patterns are not exhaustive, missing #some(#b)
+line 1, column 1: patterns are not exhaustive, missing #some(#b)

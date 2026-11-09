@@ -13,6 +13,62 @@ let show_fields buf ~sep show fields =
       show x)
     fields
 
+(* The shapes of patterns, whose subpatterns are ['p] *)
+module Pat = struct
+  type 'p t =
+      Var of string
+    | Wildcard
+    | Record of (string * 'p) list
+    | Variant of string * (string * 'p) list
+    | Roll of 'p
+    | Or of 'p * 'p
+end
+
+(* The shapes of expressions, whose subexpressions are ['e] and patterns
+   ['p]. `the` and `abstract` only affect typing, so they don't appear here. *)
+module Expr = struct
+  type ('e, 'p) t =
+      Record of {fields : (string * 'e) list; rest : 'e option}
+    | Field of 'e * string
+
+    | Variant of string * (string * 'e) list
+    | Match of 'e * ('p * 'e) list
+
+    | Function of {
+        params : (string * 'p) list;
+        deps : 'p option;
+        body : 'e
+      }
+    | Apply of {
+        f : 'e;
+        args : (string * 'e) list;
+        deps : 'e option
+      }
+    | Dep of string
+
+    | Var of string
+    | Let of {
+        pat : 'p;
+        defn : 'e;
+        body : 'e
+      }
+
+    | Roll of 'e
+    (* `recur (p <- e, ...) do body`: [params] start with `&p`, and body sees
+       [continue] and [forget] *)
+    | Recur of {
+        continue : string;
+        forget : string;
+        params : (string * 'p) list;
+        args : (string * 'e) list;
+        body : 'e
+      }
+
+    | Hole (* `_` *)
+end
+
+(* Types, and checking programs: the typed tree, and the typing rules that
+   build it *)
 module Type = struct
   type t =
     | Record of row
@@ -29,8 +85,26 @@ module Type = struct
        The abstract type is parameterized by the variables of its underlying
        type that get generalized, so [view] is an instance of [abs.repr]. *)
     | Rigid of {abs : abstract; view : t}
+    (* The type of a node with a type error, which unifies with anything, so
+       one error doesn't lead to others *)
+    | Error of error
 
   and row = {fields : (string * t) list; rest : t option}
+
+  and error =
+    (* [found] where [expected] was needed, and [why], where within them they
+       differ *)
+    | Mismatch of {expected : t; found : t; why : string}
+    | Unbound_variable of string
+    | Bound_twice of string
+    | Or_binds (* the sides of an `or` bind different variables *)
+    | Missing of string (* a value no pattern matches, written as a pattern *)
+    | Ambiguous (* patterns only exhaustive if unknown variant types are closed *)
+    | Escapes_parameter (* an existential type, through a function's parameter *)
+    | Escapes_recursion of string (* an abstract type, from one iteration to the next *)
+    | Index_escapes (* a `recur`'s index, out of it *)
+    | Unknown_type of string
+    | Not_positive of string (* a recursive type's variable, where it can't be *)
 
   (* A recursive type's binder is the Recurs node itself, so cyclic types are
      cyclic graphs. The index is shared by every layer of a cycle: [empty] when
@@ -157,6 +231,7 @@ module Type = struct
         in
         Buffer.add_string buf name
       | Var {contents = Link _} -> assert false
+      | Error _ -> Buffer.add_string buf "<error>"
 
       | Rigid {abs; view} ->
         Buffer.add_string buf abs.name;
@@ -242,6 +317,24 @@ module Type = struct
     in
     go ty;
     Buffer.contents buf
+
+  (* Whether a node's type is an error, so the node has one *)
+  let is_error = function Error _ -> true | _ -> false
+
+  let describe = function
+    | Mismatch {why; _} -> why
+    | Unbound_variable name -> "unbound variable " ^ name
+    | Bound_twice name -> name ^ " is bound twice"
+    | Or_binds -> "both sides of `or` must bind the same variables"
+    | Missing w -> "patterns are not exhaustive, missing " ^ w
+    | Ambiguous ->
+      "patterns are only exhaustive if more variant types are closed, \
+       and which ones is ambiguous: add a catch-all clause or a type annotation"
+    | Escapes_parameter -> "abstract type escapes through a parameter"
+    | Escapes_recursion name -> "abstract type " ^ name ^ " escapes the recursion"
+    | Index_escapes -> "recursion index escapes"
+    | Unknown_type name -> "unknown type " ^ name
+    | Not_positive _ -> "recursive type is not strictly positive"
 
   (* Copies a type, preserving cycles, with [leaf] choosing replacements for
      variables and abstract types. Types copied by one [copy leaf] share their
@@ -383,6 +476,7 @@ module Type = struct
     let seen = ref [] and renamed = ref [] and binders = ref [] in
     let rec go a b =
       match prune a, prune b with
+      | Error _, _ | _, Error _ -> ()
       | Var v1, Var v2 when v1 == v2 -> ()
       | Var v, ty | ty, Var v ->
         occurs v ty;
@@ -491,34 +585,33 @@ module Type = struct
 
   (* Closes a variant row by its tail, so it can't take more tags *)
   let close tail = unify (Var tail) (Variant {fields = []; rest = None})
-end
 
-module Pat = struct
-  type t =
-      Var of string
-    | Wildcard
-    | Record of (string * typed) list
-    | Variant of string * (string * typed) list
-    | Roll of typed
-    | Or of typed * typed
-    | Error of {pos : int; msg : string; p : typed} (* a type error *)
-
-  and typed = {
-    pat : t;
-    ty : Type.t
+  (* Typed programs. [ty] is an error if the node has one, which makes it
+     evaluate to a hole, and [loc] is where it is, in whatever the program
+     was read from. *)
+  type 'loc expr = {
+    expr : ('loc expr, 'loc pat) Expr.t;
+    mutable ty : t;
+    loc : 'loc
   }
 
-  type coverage = Exhaustive | Missing of string | Ambiguous
+  and 'loc pat = {
+    pat : 'loc pat Pat.t;
+    mutable ty : t;
+    loc : 'loc
+  }
 
-  (* Checks that patterns are exhaustive, following Maranget's usefulness
-     algorithm, and closes the open variant rows they must close to be: those
-     a match can't be exhaustive without, even with every other row closed.
-     Closing a row only removes values, so if closing just those isn't enough,
-     there's no single least choice of rows to close, and it's ambiguous. *)
-  let check pats =
-    let wild = {pat = Wildcard; ty = Type.empty} in
+  (* The problem, if patterns aren't exhaustive, following Maranget's
+     usefulness algorithm. Closes the open variant rows they must close to
+     be: those a match can't be exhaustive without, even with every other row
+     closed. Closing a row only removes values, so if closing just those isn't
+     enough, there's no single least choice of rows to close, and it's
+     ambiguous. *)
+  let exhaustive (pats : _ pat list) =
+    (* A wildcard in place of a pattern *)
+    let wild (p : _ pat) = {p with pat = Wildcard; ty = empty} in
     let rec row_type ty =
-      match Type.prune ty with
+      match prune ty with
       | Rigid r -> row_type r.view (* under `the t`, matching t's underlying type *)
       | ty -> ty
     in
@@ -546,13 +639,15 @@ module Pat = struct
       | _ when n = 0 -> None
       | rows ->
         (* An erroneous pattern doesn't count as missing anything *)
-        let is_wild p = match p.pat with Var _ | Wildcard | Error _ -> true | _ -> false in
+        let is_wild (p : _ pat) =
+          match p.ty, p.pat with Error _, _ | _, (Var _ | Wildcard) -> true | _ -> false
+        in
         let heads = List.map List.hd rows in
         (* Rows whose head is the constructor [sub] picks out, with its k
            subpatterns in place of the head *)
         let specialize k sub rebuild =
           let rows = List.filter_map (function
-              | p :: rest when is_wild p -> Some (List.init k (fun _ -> wild) @ rest)
+              | p :: rest when is_wild p -> Some (List.init k (fun _ -> wild p) @ rest)
               | p :: rest -> Option.map (fun ps -> ps @ rest) (sub p)
               | [] -> None)
               rows
@@ -560,8 +655,8 @@ module Pat = struct
           Option.map (fun w -> rebuild (List.take k w) :: List.drop k w)
             (go closed (k + n - 1) rows)
         in
-        let fields_of names fields =
-          List.map (fun name -> Option.value (List.assoc_opt name fields) ~default:wild) names
+        let fields_of p names fields =
+          List.map (fun name -> Option.value (List.assoc_opt name fields) ~default:(wild p)) names
         in
         match List.find_opt (fun p -> not (is_wild p)) heads with
         | None -> Option.map (fun w -> "_" :: w) (go closed (n - 1) (List.map List.tl rows))
@@ -577,11 +672,11 @@ module Pat = struct
               heads)
           in
           specialize (List.length names)
-            (function {pat = Record fields; _} -> Some (fields_of names fields) | _ -> None)
+            (function {pat = Record fields; _} as p -> Some (fields_of p names fields) | _ -> None)
             (fun ws -> "{" ^ show_fields names ws ^ "}")
 
         | Some p ->
-          let tags, tail = Type.tags (row_type p.ty) in
+          let tags, tail = tags (row_type p.ty) in
           Option.iter (fun v -> if not (List.memq v !found) then found := !found @ [v]) tail;
           let open_ = match tail with Some v -> not (closed v) | None -> false in
           let seen = List.filter_map (function
@@ -598,11 +693,11 @@ module Pat = struct
             let names = names fieldss in
             specialize (List.length names)
               (function
-                | {pat = Variant (tag', fields); _} when tag' = tag -> Some (fields_of names fields)
+                | {pat = Variant (tag', fields); _} as p when tag' = tag -> Some (fields_of p names fields)
                 | _ -> None)
               (fun ws ->
                  let tag = "#" ^ tag in
-                 match ws, Type.prune payload with
+                 match ws, prune payload with
                  | [], Record {fields = []; rest = None} -> tag
                  | [], _ -> tag ^ "(..)"
                  | ws, _ -> tag ^ "(" ^ show_fields names ws ^ ")")
@@ -621,61 +716,401 @@ module Pat = struct
     in
     let missing closed = Option.map List.hd (go closed 1 (List.map (fun p -> [p]) pats)) in
     match missing (fun _ -> true) with
-    | Some w -> Missing w
+    | Some w -> Some (Missing w)
     | None ->
       let forced = List.filter (fun v -> missing (fun v' -> v' != v) <> None) !found in
       match missing (fun v -> List.memq v forced) with
-      | None -> List.iter Type.close forced; Exhaustive
-      | Some _ -> Ambiguous
-end
+      | None -> List.iter close forced; None
+      | Some _ -> Some Ambiguous
 
-module Expr = struct
-  (* `the` and `abstract` only affect typing, so they don't appear here *)
-  type t =
-      Record of {fields : (string * typed) list; rest : typed option}
-    | Field of typed * string
+  (* The typing rules, for a front end like the parser to call as it reads a
+     program, so it's checked in a single pass. Each rule builds a typed node
+     from parts that are checked already, at a location ['loc] of the front
+     end's choosing. A node with a type error has the error as its type, and
+     the error is reported to the front end. Constructs that bind names are
+     checked in steps, which are called in order, with their parts in
+     between. *)
 
-    | Variant of string * (string * typed) list
-    | Match of typed * (Pat.typed * typed) list
-
-    | Function of {
-        params : (string * Pat.typed) list;
-        deps : Pat.typed option;
-        body : typed
-      }
-    | Apply of {
-        f : typed;
-        args : (string * typed) list;
-        deps : typed option
-      }
-    | Dep of string
-
-    | Var of string
-    | Let of {
-        pat : Pat.typed;
-        defn : typed;
-        body : typed
-      }
-
-    | Roll of typed
-    (* `recur (p <- e, ...) do body`: [params] start with `&p`, and body sees
-       [continue] and [forget] *)
-    | Recur of {
-        continue : string;
-        forget : string;
-        params : (string * Pat.typed) list;
-        args : (string * typed) list;
-        body : typed
-      }
-
-    | Hole (* `_` *)
-    (* A type error in [e], which makes it evaluate to a hole *)
-    | Error of {pos : int; msg : string; e : typed}
-
-  and typed = {
-    expr : t;
-    ty : Type.t
+  type 'loc scope = {
+    vars : (string * t) list;
+    types : (string * t) list; (* names bound by `abstract` *)
+    deps : t; (* dependencies of the innermost function *)
+    report : 'loc -> error -> unit
   }
+
+  (* The names a pattern binds, with their types *)
+  type binds = (string * t) list ref
+
+  let binds () : binds = ref []
+
+  let mark scope (e : _ expr) problem =
+    scope.report e.loc problem;
+    e.ty <- Error problem
+
+  let pmark scope (p : _ pat) problem =
+    scope.report p.loc problem;
+    p.ty <- Error problem
+
+  let mark_if scope e problem = Option.iter (mark scope e) problem
+  let pmark_if scope p problem = Option.iter (pmark scope p) problem
+  let check scope e problem = mark_if scope e problem; e
+  let pcheck scope p problem = pmark_if scope p problem; p
+
+  (* Checks return the problem they find, if any. Here, that [found] doesn't
+     unify with [expected]. *)
+  let expect expected found =
+    match unify expected found with
+    | () -> None
+    | exception Compile_error why -> Some (Mismatch {expected; found; why})
+
+  (* For `the T e`, e has type T with each abstract type written in T replaced
+     by its underlying type, so T can be a whole signature *)
+  let repr ty =
+    copy (function
+        | Rigid r -> Some r.view
+        | _ -> None)
+      ty
+
+  let tagged tag payload =
+    Variant {
+      fields = [tag, Record {fields = payload; rest = None}];
+      rest = Some (fresh ())
+    }
+
+  let types fields = List.map (fun (name, (x : _ expr)) -> name, x.ty) fields
+  let ptypes fields = List.map (fun (name, (p : _ pat)) -> name, p.ty) fields
+
+  (* A program, with [vars] in scope, is checked like a let's definition *)
+  let program ?(vars = []) report =
+    level := 0;
+    fun_level := 0;
+    {vars; types = []; deps = empty; report}
+
+  let program_end (e : _ expr) =
+    decr level;
+    generalize e.ty;
+    e
+
+  (* Type annotations. [type_vars] holds an annotation's type variables, and
+     [binders] the enclosing `rec` binders, as None where an occurrence
+     wouldn't be strictly positive. The parts with errors are errors, which
+     unify with anything, and are reported once the annotation is done. *)
+  type annotation = {
+    type_vars : (string * t) list ref;
+    binders : (string * t option) list;
+    problems : error list ref
+  }
+
+  let annotation () = {type_vars = ref []; binders = []; problems = ref []}
+
+  let problem ann problem =
+    ann.problems := problem :: !(ann.problems);
+    Error problem
+
+  let annotation_end scope ann ty loc =
+    List.iter (scope.report loc) (List.rev !(ann.problems));
+    ty
+
+  let type_var ann name =
+    match List.assoc_opt name ann.binders with
+    | Some (Some ty) -> ty
+    | Some None -> problem ann (Not_positive name)
+    | None ->
+      match List.assoc_opt name !(ann.type_vars) with
+      | Some ty -> ty
+      | None ->
+        let ty = fresh () in
+        ann.type_vars := (name, ty) :: !(ann.type_vars);
+        ty
+
+  let type_name scope ann name =
+    match List.assoc_opt name scope.types with
+    | Some ty -> ty
+    | None -> problem ann (Unknown_type name)
+
+  let record_type fields rest = Record {fields; rest}
+
+  (* Each tag's payload is a record type *)
+  let variant_type tags rest = Variant {fields = tags; rest}
+
+  (* A function type's parameters, where recursion isn't strictly positive *)
+  let function_inputs ann =
+    {ann with binders = List.map (fun (name, _) -> name, None) ann.binders}
+
+  let function_type fields rest deps output =
+    let deps = Option.value deps ~default:empty in
+    Function {inputs = Record {fields; rest}; deps; exists = []; output}
+
+  (* `rec 'a. body`, where body sees 'a *)
+  let rec_type ann name =
+    let r = {body = empty; index = fresh ()} in
+    r, {ann with binders = (name, Some (Recurs r)) :: ann.binders}
+
+  let rec_type_end (r : recurs) body =
+    r.body <- body;
+    Recurs r
+
+  (* Patterns *)
+
+  let pvar scope binds name loc =
+    let p = {pat = Var name; ty = fresh (); loc} in
+    if List.mem_assoc name !binds then pmark scope p (Bound_twice name)
+    else binds := (name, p.ty) :: !binds;
+    p
+
+  let wildcard loc = {pat = Wildcard; ty = fresh (); loc}
+
+  (* With [rest], it matches records with more fields *)
+  let precord fields ~rest loc =
+    let rest = if rest then Some (fresh ()) else None in
+    {pat = Record fields; ty = Record {fields = ptypes fields; rest}; loc}
+
+  let pvariant tag fields loc = {pat = Variant (tag, fields); ty = tagged tag (ptypes fields); loc}
+
+  let proll (p : _ pat) loc =
+    {pat = Roll p; ty = Recurs {body = p.ty; index = fresh ()}; loc}
+
+  (* An erroneous pattern keeps its error *)
+  let pthe scope ty (p : _ pat) loc =
+    if is_error p.ty then {p with loc}
+    else pcheck scope {p with ty; loc} (expect (repr ty) p.ty)
+
+  (* `p or q`, where [left] and [right] are the names each binds, which must be
+     the same. [left] ends up with all of them, so none are found unbound. *)
+  let por scope left right (p : _ pat) (q : _ pat) loc =
+    let same = List.compare_lengths !left !right = 0
+               && List.for_all (fun (name, _) -> List.mem_assoc name !right) !left in
+    let p = pcheck scope {pat = Or (p, q); ty = p.ty; loc} (expect p.ty q.ty) in
+    if not same then begin
+      left := !left @ List.filter (fun (name, _) -> not (List.mem_assoc name !left)) !right;
+      pmark scope p Or_binds
+    end
+    else begin
+      let unify_var (name, ty) = expect ty (List.assoc name !right) in
+      ignore (pcheck scope p (List.find_map unify_var !left))
+    end;
+    p
+
+  (* Adds the names a whole pattern binds, [names], to those of the construct
+     it's in *)
+  let pbind scope binds names p =
+    List.iter (fun (name, ty) ->
+        if List.mem_assoc name !binds then pmark scope p (Bound_twice name)
+        else binds := (name, ty) :: !binds)
+      !names;
+    p
+
+  (* Expressions *)
+
+  let var scope name loc =
+    match List.assoc_opt name scope.vars with
+    | Some ty -> {expr = Var name; ty = instantiate ty; loc}
+    | None ->
+      let e = {expr = Var name; ty = fresh (); loc} in
+      mark scope e (Unbound_variable name);
+      e
+
+  let hole loc = {expr = Hole; ty = fresh (); loc}
+
+  let dep scope name loc =
+    let ty = fresh () in
+    let record = Record {fields = [name, ty]; rest = Some (fresh ())} in
+    check scope {expr = Dep name; ty; loc} (expect record scope.deps)
+
+  let field scope (left : _ expr) name loc =
+    let ty = fresh () in
+    let record = Record {fields = [name, ty]; rest = Some (fresh ())} in
+    check scope {expr = Field (left, name); ty; loc} (expect record left.ty)
+
+  let apply scope (f : _ expr) args deps loc =
+    let ty = fresh () in
+    let expected = Function {
+        inputs = Record {fields = types args; rest = None};
+        deps = (match deps with Some (e : _ expr) -> e.ty | None -> empty);
+        exists = [];
+        output = ty
+      }
+    in
+    check scope {expr = Apply {f; args; deps}; ty; loc} (expect expected (open_exists f.ty))
+
+  (* A match on [left], which has the type [match_start] returns. Each
+     clause's pattern is checked before its body, so its variables' types are
+     known there. *)
+  let match_start () = fresh ()
+
+  let clause_pattern scope (left : _ expr) binds (pat : _ pat) =
+    ignore (pcheck scope pat (expect left.ty pat.ty));
+    {scope with vars = !binds @ scope.vars}
+
+  let clause_body scope ty (body : _ expr) = check scope body (expect ty body.ty)
+
+  let match_end scope left ty clauses loc =
+    check scope {expr = Match (left, clauses); ty; loc} (exhaustive (List.map fst clauses))
+
+  let record scope fields rest loc =
+    let tail = Option.map (fun _ -> fresh ()) rest in
+    Option.iter (fun (r : _ expr) ->
+        mark_if scope r (expect (Record {fields = []; rest = tail}) r.ty))
+      rest;
+    {expr = Record {fields; rest}; ty = Record {fields = types fields; rest = tail}; loc}
+
+  let variant tag fields loc = {expr = Variant (tag, fields); ty = tagged tag (types fields); loc}
+
+  let roll (e : _ expr) loc =
+    {expr = Roll e; ty = Recurs {body = e.ty; index = empty}; loc}
+
+  (* `let p = e in body`: p and e are checked a level deeper, so that p's
+     variables are generalized for body *)
+  let let_start () =
+    incr level;
+    binds ()
+
+  let let_bind scope binds (pat : _ pat) (defn : _ expr) =
+    mark_if scope defn (expect pat.ty defn.ty);
+    pmark_if scope pat (exhaustive [pat]);
+    decr level;
+    List.iter (fun (_, ty) -> generalize ty) !binds;
+    {scope with vars = !binds @ scope.vars}
+
+  let let_end pat defn (body : _ expr) loc =
+    (* An error in the body is the body's, not the let's *)
+    let ty = if is_error body.ty then fresh () else body.ty in
+    {expr = Let {pat; defn; body}; ty; loc}
+
+  (* `abstract t in body`: body sees t as a new abstract type *)
+  let abstract_start scope name =
+    {scope with types = (name, rigid name (fresh ())) :: scope.types}
+
+  let abstract_end (body : _ expr) loc = {body with loc}
+
+  (* An erroneous expression keeps its error, since it can't be evaluated *)
+  let the scope ty (e : _ expr) loc =
+    if is_error e.ty then {e with loc}
+    else check scope {e with ty; loc} (expect (repr ty) e.ty)
+
+  (* A function: its parameters, which bind [binds], at [loc], then its body *)
+  type 'loc lambda = {
+    params : (string * 'loc pat) list;
+    deps : 'loc pat option;
+    inputs : t;
+    deps_ty : t;
+    problem : error option
+  }
+
+  let lambda () =
+    incr fun_level;
+    binds ()
+
+  let lambda_params scope binds params deps loc =
+    let inputs = Record {fields = ptypes params; rest = None} in
+    let problem = exhaustive [{pat = Record params; ty = inputs; loc}] in
+    let deps_ty = fresh () in
+    Option.iter (fun (p : _ pat) ->
+        pmark_if scope p (expect deps_ty p.ty);
+        pmark_if scope p (exhaustive [p]))
+      deps;
+    {params; deps; inputs; deps_ty; problem},
+    {scope with vars = !binds @ scope.vars; deps = deps_ty}
+
+  let lambda_end scope l (body : _ expr) loc =
+    decr fun_level;
+    let exists = existentials body.ty in
+    let escapes =
+      if mentions exists l.inputs || mentions exists l.deps_ty then
+        Some Escapes_parameter
+      else None
+    in
+    let ty = Function {inputs = l.inputs; deps = l.deps_ty; exists; output = body.ty} in
+    let e = {expr = Function {params = l.params; deps = l.deps; body}; ty; loc} in
+    check scope e (if l.problem = None then escapes else l.problem)
+
+  (* `recur (p <- e, acc = init, ...) do body`. Within body, `continue`
+     continues with a subterm of e and new accumulators. p matches e's top
+     layer, whose subterms get a fresh index, so only they can be continued
+     with. The index can't escape into the accumulators or anything outside,
+     which is checked like an existential's level. On the way out it becomes
+     e's own index, since the subterms are still e's subterms, and `forget`
+     does the same for a layer within body.
+
+     The steps: p, which is checked a function level deeper, binding [binds]
+     with the accumulators; e; each accumulator; then body. *)
+  let recur () =
+    let level = !fun_level + 1 in
+    fun_level := level;
+    level, binds ()
+
+  let recur_root scope root =
+    pmark_if scope root (exhaustive [root]);
+    decr fun_level
+
+  let recur_acc scope (p : _ pat) (init : _ expr) =
+    mark_if scope init (expect p.ty init.ty);
+    pmark_if scope p (exhaustive [p])
+
+  type 'loc recursion = {
+    level : int;
+    index : abstract;
+    layer : recurs; (* p's, whose subterms have the index *)
+    params : (string * 'loc pat) list;
+    output : t;
+    accs : ('loc pat * 'loc expr) list;
+    input : 'loc expr;
+    counter : int (* abstract types made after this are made within *)
+  }
+
+  let continue_name = "continue" and forget_name = "forget"
+
+  let recur_body scope (level, binds) (root : _ pat) (input : _ expr) accs =
+    fun_level := level;
+    let index = abstract "recur" empty in
+    let layer = {body = root.ty; index = Rigid {abs = index; view = empty}} in
+    let labelled xs = List.mapi (fun i x -> label i, x) xs in
+    let params = labelled ({pat = Roll root; ty = Recurs layer; loc = root.loc} :: List.map fst accs) in
+    let output = fresh () in
+    let ty = Function {
+        inputs = Record {fields = ptypes params; rest = None};
+        deps = empty;
+        exists = [];
+        output
+      }
+    in
+    (* Any index, so both subterms and the re-rolled layer can be forgotten *)
+    let forget = Function {
+        inputs = Record {
+            fields = [label 0, Recurs {body = root.ty; index = fresh ~level:generic ()}];
+            rest = None
+          };
+        deps = empty;
+        exists = [];
+        output = input.ty
+      }
+    in
+    let vars = !binds @ [continue_name, ty; forget_name, forget] @ scope.vars in
+    {level; index; layer; params; output; accs; input; counter = !counter},
+    {scope with vars}
+
+  let recur_end scope r (body : _ expr) loc =
+    mark_if scope body (expect r.output body.ty);
+    decr fun_level;
+    (* Each iteration introduces its own abstract types, so they can't be
+       passed between iterations, through the result or the accumulators *)
+    let carried = r.output :: List.map (fun ((p : _ pat), _) -> p.ty) r.accs in
+    let problem =
+      if r.index.fun_level < r.level then Some Index_escapes
+      else
+        List.find_opt (fun abs -> abs.id > r.counter) (List.concat_map abstracts carried)
+        |> Option.map (fun abs -> Escapes_recursion abs.name)
+    in
+    let outer = fresh () in
+    let copy = copy (function Rigid x when x.abs == r.index -> Some outer | _ -> None) in
+    let input_ty = copy (Recurs r.layer) and ty = copy r.output in
+    let problem = if problem = None then expect input_ty r.input.ty else problem in
+    let labelled xs = List.mapi (fun i x -> label i, x) xs in
+    let args = labelled (r.input :: List.map snd r.accs) in
+    let recur =
+      Expr.Recur {continue = continue_name; forget = forget_name; params = r.params; args; body}
+    in
+    check scope {expr = recur; ty; loc} problem
 end
 
 (* The concrete syntax tree, for the editor: each construct's [form], like
@@ -688,6 +1123,9 @@ end
    Some nodes are rows, which the editor can rearrange: a record's entries,
    a match's clauses, and a let's binding, `p = e` without the body. *)
 module Syntax = struct
+  (* Where a typed node was in the source, from its start to its stop *)
+  type span = int * int
+
   type t = {
     form : string;
     info : info;
@@ -696,7 +1134,7 @@ module Syntax = struct
     children : t list
   }
 
-  and info = Expr of Expr.typed | Pat of Pat.typed | Other
+  and info = Expr of span Type.expr | Pat of span Type.pat | Other
 end
 
 module Parsing = struct
@@ -870,33 +1308,13 @@ module Parsing = struct
     | '\000' when pos >= String.length input -> EOF, pos
     | c -> fail pos (Printf.sprintf "unexpected character '%c'" c)
 
-  type scope = {
-    vars : (string * Type.t) list;
-    types : (string * Type.t) list; (* names bound by `abstract` *)
-    deps : Type.t                      (* dependencies of the innermost function *)
-  }
-
-  (* For `the T e`, e has type T with each abstract type written in T replaced
-     by its underlying type, so T can be a whole signature *)
-  let repr ty =
-    Type.copy (function
-        | Rigid r -> Some r.view
-        | _ -> None)
-      ty
-
-  let variant_type tag payload =
-    Type.Variant {
-      fields = [tag, Record {fields = payload; rest = None}];
-      rest = Some (Type.fresh ())
-    }
-
   type result = {
-    expr : Expr.typed;
-    errors : (int * string) list; (* positions and messages, in order *)
+    expr : Syntax.span Type.expr;
+    errors : (Syntax.span * Type.error) list; (* in order *)
     syntax : Syntax.t
   }
 
-  (* Parses and typechecks in a single pass, with [vars] in scope. A syntax
+  (* Parses a program, with [vars] in scope, checking it as it goes. A syntax
      error stops parsing with Syntax_error, but type errors are marked in the
      tree, which goes on being checked. *)
   let parse ?(vars = []) input =
@@ -924,53 +1342,16 @@ module Parsing = struct
       let children, rest = adopt [] !nodes in
       nodes := {Syntax.form; info; start; stop; children} :: rest
     in
-    let enode form start (e, next) = node form (Expr e) start next; e, next in
-    let pnode form start (p, next) = node form (Pat p) start next; p, next in
-
-    let errors = ref [] in
-    let error pos msg =
-      let pos = skip input pos in
-      errors := (pos, msg) :: !errors;
-      pos
+    (* Records a typed node, and goes on after it *)
+    let enode form (e : Syntax.span Type.expr) =
+      let start, stop = e.loc in
+      node form (Expr e) start stop;
+      e, stop
     in
-    (* A node is checked before its parent adopts it, so it's found among the
-       unadopted nodes, to update *)
-    let retag old info =
-      let same (n : Syntax.t) =
-        match n.info, old with
-        | Expr a, Syntax.Expr b -> a == b
-        | Pat a, Pat b -> a == b
-        | _ -> false
-      in
-      nodes := List.map (fun (n : Syntax.t) -> if same n then {n with info} else n) !nodes
-    in
-    let mark pos msg (e : Expr.typed) =
-      let marked = {e with expr = Error {pos = error pos msg; msg; e}} in
-      retag (Expr e) (Expr marked);
-      marked
-    in
-    let pmark pos msg (p : Pat.typed) =
-      let marked = {p with pat = Error {pos = error pos msg; msg; p}} in
-      retag (Pat p) (Pat marked);
-      marked
-    in
-    let check pos problem e = Option.fold ~none:e ~some:(fun msg -> mark pos msg e) problem in
-    let pcheck pos problem p = Option.fold ~none:p ~some:(fun msg -> pmark pos msg p) problem in
-
-    (* Checks return the problem they find, if any *)
-    let unify a b =
-      match Type.unify a b with
-      | () -> None
-      | exception Compile_error msg -> Some msg
-    in
-
-    let exhaustive pats =
-      match Pat.check pats with
-      | Exhaustive -> None
-      | Missing w -> Some ("patterns are not exhaustive, missing " ^ w)
-      | Ambiguous ->
-        Some "patterns are only exhaustive if more variant types are closed, \
-              and which ones is ambiguous: add a catch-all clause or a type annotation"
+    let pnode form (p : Syntax.span Type.pat) =
+      let start, stop = p.loc in
+      node form (Pat p) start stop;
+      p, stop
     in
 
     (* Comma separated, up to [closer]: positional items, `.name <sep> item`,
@@ -1021,34 +1402,11 @@ module Parsing = struct
       | _ -> [], pos
     in
 
-    (* [vars] holds the annotation's type variables. [binders] holds the
-       enclosing `rec` binders, as None where an occurrence would not be
-       strictly positive. *)
-    let rec type_expr scope vars binders pos =
-      let ty = type_expr scope vars binders in
+    let rec type_expr scope ann pos =
+      let ty = type_expr scope ann in
       match tokenize pos with
-      | TypeVar name, next ->
-        begin match List.assoc_opt name binders with
-          | Some (Some ty) -> ty, next
-          | Some None ->
-            ignore (error pos "recursive type is not strictly positive");
-            Type.fresh (), next
-          | None ->
-            match List.assoc_opt name !vars with
-            | Some ty -> ty, next
-            | None ->
-              let ty = Type.fresh () in
-              vars := (name, ty) :: !vars;
-              ty, next
-        end
-
-      | Ident name, next ->
-        begin match List.assoc_opt name scope.types with
-          | Some ty -> ty, next
-          | None ->
-            ignore (error pos ("unknown type " ^ name));
-            Type.fresh (), next
-        end
+      | TypeVar name, next -> Type.type_var ann name, next
+      | Ident name, next -> Type.type_name scope ann name, next
 
       | LeftParen, next ->
         let inner, pos = ty next in
@@ -1056,7 +1414,7 @@ module Parsing = struct
 
       | LeftCurly, next ->
         let fields, rest, _, pos = sequence ~rest:ty ~sep:Colon ty RightCurly next in
-        Type.Record {fields; rest}, pos
+        Type.record_type fields rest, pos
 
       | LeftSquare, next ->
         let tag pos =
@@ -1067,119 +1425,84 @@ module Parsing = struct
               | LeftParen, next -> sequence ~rest:ty ~sep:Colon ty RightParen next
               | _ -> [], None, None, next
             in
-            (name, Type.Record {fields; rest}), pos
+            (name, Type.record_type fields rest), pos
           | _ -> unexpected pos
         in
         let tags, rest, _, pos = sequence ~rest:ty ~sep:Colon tag RightSquare next in
-        Type.Variant {fields = List.map snd tags; rest}, pos
+        Type.variant_type (List.map snd tags) rest, pos
 
       | Fun, next ->
-        let input = type_expr scope vars (List.map (fun (name, _) -> name, None) binders) in
+        let input = type_expr scope (Type.function_inputs ann) in
         let fields, rest, deps, pos =
           sequence ~rest:input ~using:input ~sep:Colon input RightParen (expect LeftParen next)
         in
         let output, pos = ty (expect Arrow pos) in
-        let deps = Option.value deps ~default:Type.empty in
-        Type.Function {inputs = Record {fields; rest}; deps; exists = []; output}, pos
+        Type.function_type fields rest deps output, pos
 
       | Rec, next ->
         begin match tokenize next with
           | TypeVar name, next ->
-            let r = {Type.body = Type.empty; index = Type.fresh ()} in
-            let body, pos =
-              type_expr scope vars ((name, Some (Type.Recurs r)) :: binders) (expect Dot next)
-            in
-            r.body <- body;
-            Type.Recurs r, pos
+            let r, inner = Type.rec_type ann name in
+            let body, pos = type_expr scope inner (expect Dot next) in
+            Type.rec_type_end r body, pos
           | _ -> unexpected next
         end
 
       | _ -> unexpected pos
     in
 
-    (* An annotation with an error is ignored *)
     let annotation scope pos =
-      let before = !errors and start = skip input pos in
-      let ty, pos = type_expr scope (ref []) [] pos in
+      let start = skip input pos and ann = Type.annotation () in
+      let ty, pos = type_expr scope ann pos in
       node "type" Other start pos;
-      (if !errors == before then ty else Type.fresh ()), pos
+      Type.annotation_end scope ann ty (start, pos), pos
     in
 
+    (* [binds] gets the names the pattern binds *)
     let rec pattern scope binds pos =
-      let left = ref [] and start = skip input pos in
-      let p, pos = atomic_pattern scope left pos in
+      let names = Type.binds () and start = skip input pos in
+      let p, pos = atomic_pattern scope names pos in
       let p, pos =
         match tokenize pos with
         | Or, next ->
-          let right = ref [] in
-          let q, next_pos = pattern scope right next in
-          let same = List.compare_lengths !left !right = 0
-                     && List.for_all (fun (name, _) -> List.mem_assoc name !right) !left in
-          let p = pcheck next (unify p.Pat.ty q.Pat.ty) {Pat.pat = Or (p, q); ty = p.ty} in
-          pnode "or" start @@
-          if not same then begin
-            (* All of them, so the body doesn't find them unbound *)
-            left := !left @ List.filter (fun (name, _) -> not (List.mem_assoc name !left)) !right;
-            pmark pos "both sides of `or` must bind the same variables" p, next_pos
-          end
-          else
-            let unify_var (name, ty) = unify ty (List.assoc name !right) in
-            pcheck next (List.find_map unify_var !left) p, next_pos
+          let right = Type.binds () in
+          let q, next = pattern scope right next in
+          pnode "or" (Type.por scope names right p q (start, next))
         | _ -> p, pos
       in
-      List.fold_left (fun p (name, ty) ->
-          if List.mem_assoc name !binds then
-            pmark pos (name ^ " is bound twice") p
-          else begin
-            binds := (name, ty) :: !binds;
-            p
-          end)
-        p !left,
-      pos
+      Type.pbind scope binds names p, pos
 
     and atomic_pattern scope binds pos =
-      let types = List.map (fun (name, p) -> name, p.Pat.ty) in
       let start = skip input pos in
       match tokenize pos with
-      | Ident name, next ->
-        let p = {Pat.pat = Var name; ty = Type.fresh ()} in
-        pnode "var" start @@
-        if List.mem_assoc name !binds then
-          pmark pos (name ^ " is bound twice") p, next
-        else begin
-          binds := (name, p.ty) :: !binds;
-          p, next
-        end
-
-      | Underscore, next ->
-        pnode "wildcard" start ({Pat.pat = Wildcard; ty = Type.fresh ()}, next)
+      | Ident name, next -> pnode "var" (Type.pvar scope binds name (start, next))
+      | Underscore, next -> pnode "wildcard" (Type.wildcard (start, next))
 
       | LeftParen, next ->
         let p, pos = pattern scope binds next in
-        pnode "parens" start (p, expect RightParen pos)
+        let next = expect RightParen pos in
+        node "parens" (Pat p) start next;
+        p, next
 
       | LeftCurly, next ->
         let fields, rest, _, pos =
           sequence ~rest:(fun pos -> (), pos) ~row:"entry" ~sep:Equal (pattern scope binds)
             RightCurly next
         in
-        let ty = Type.Record {fields = types fields; rest = Option.map Type.fresh rest} in
-        pnode "record" start ({Pat.pat = Record fields; ty}, pos)
+        pnode "record" (Type.precord fields ~rest:(rest <> None) (start, pos))
 
       | Tag tag, next ->
         let fields, pos = payload (pattern scope binds) next in
-        let ty = variant_type tag (types fields) in
-        pnode "variant" start ({Pat.pat = Variant (tag, fields); ty}, pos)
+        pnode "variant" (Type.pvariant tag fields (start, pos))
 
       | Ampersand, next ->
         let p, pos = atomic_pattern scope binds next in
-        let ty = Type.Recurs {body = p.ty; index = Type.fresh ()} in
-        pnode "roll" start ({Pat.pat = Roll p; ty}, pos)
+        pnode "roll" (Type.proll p (start, pos))
 
       | The, next ->
         let ty, pos = annotation scope next in
-        let p, next_pos = pattern scope binds pos in
-        pnode "the" start ({(pcheck pos (unify (repr ty) p.ty) p) with ty}, next_pos)
+        let p, next = pattern scope binds pos in
+        pnode "the" (Type.pthe scope ty p (start, next))
 
       | _ -> unexpected ~expected:"_" pos
     in
@@ -1199,253 +1522,140 @@ module Parsing = struct
     (* Field accesses, applications and matches on [left], which begins at
        [start] *)
     and compound_expr ?(matches = true) scope start left pos =
-      let continue ?(matches = matches) form e next =
-        node form (Expr e) start next;
+      let continue ?(matches = matches) form e =
+        let e, next = enode form e in
         compound_expr ~matches scope start e next
       in
       match tokenize pos with
-      | Field name, next ->
-        let ty = Type.fresh () in
-        let record = Type.Record {fields = [name, ty]; rest = Some (Type.fresh ())} in
-        let problem = unify left.Expr.ty record in
-        continue "field" (check pos problem {expr = Field (left, name); ty}) next
+      | Field name, next -> continue "field" (Type.field scope left name (start, next))
 
       | LeftParen, next ->
         let args, _, deps, next =
           sequence ~using:(expr scope) ~sep:Equal (expr scope) RightParen next
         in
-        let ty = Type.fresh () in
-        let found = Type.Function {
-            inputs = Record {fields = List.map (fun (name, e) -> name, e.Expr.ty) args; rest = None};
-            deps = (match deps with Some e -> e.Expr.ty | None -> Type.empty);
-            exists = [];
-            output = ty
-          }
-        in
-        let problem = unify (Type.open_exists left.ty) found in
-        continue "apply" (check pos problem {expr = Apply {f = left; args; deps}; ty}) next
+        continue "apply" (Type.apply scope left args deps (start, next))
 
       | LeftSquare, next when matches ->
-        let ty = Type.fresh () in
+        let ty = Type.match_start () in
         let clause pos =
-          let binds = ref [] and start = skip input pos in
+          let binds = Type.binds () and clause_start = skip input pos in
           let pat, pos = pattern scope binds pos in
-          (* Before the body, so its variables' types are known there *)
-          let pat = pcheck pos (unify left.ty pat.ty) pat in
-          let pos = expect Arrow pos in
-          let body, next = expr {scope with vars = !binds @ scope.vars} pos in
-          let body = check pos (unify ty body.ty) body in
-          node "clause" Other start next;
+          let inner = Type.clause_pattern scope left binds pat in
+          let body, next = expr inner (expect Arrow pos) in
+          let body = Type.clause_body scope ty body in
+          node "clause" Other clause_start next;
           (pat, body), next
         in
         let clauses, _, _, next = sequence ~sep:Equal clause RightSquare next in
-        let clauses = List.map snd clauses in
-        let problem = exhaustive (List.map fst clauses) in
-        continue ~matches:true "match" (check pos problem {expr = Match (left, clauses); ty}) next
+        continue ~matches:true "match"
+          (Type.match_end scope left ty (List.map snd clauses) (start, next))
 
       | _ -> left, pos
 
     and atomic_expr scope pos =
       let start = skip input pos in
       match tokenize pos with
-      | Ident name, next ->
-        enode "var" start @@
-        begin match List.assoc_opt name scope.vars with
-          | Some ty -> {Expr.expr = Var name; ty = Type.instantiate ty}, next
-          | None ->
-            mark pos ("unbound variable " ^ name) {expr = Var name; ty = Type.fresh ()}, next
-        end
-
-      | Underscore, next -> enode "hole" start ({expr = Hole; ty = Type.fresh ()}, next)
-
-      | Dep name, next ->
-        let ty = Type.fresh () in
-        let record = Type.Record {fields = [name, ty]; rest = Some (Type.fresh ())} in
-        let problem = unify scope.deps record in
-        enode "dep" start (check pos problem {expr = Dep name; ty}, next)
+      | Ident name, next -> enode "var" (Type.var scope name (start, next))
+      | Underscore, next -> enode "hole" (Type.hole (start, next))
+      | Dep name, next -> enode "dep" (Type.dep scope name (start, next))
 
       | LeftParen, next ->
         let e, pos = expr scope next in
-        enode "parens" start (e, expect RightParen pos)
+        let next = expect RightParen pos in
+        node "parens" (Expr e) start next;
+        e, next
 
       | Let, next ->
-        incr Type.level;
-        let binds = ref [] and binding = skip input next in
+        let binds = Type.let_start () and binding = skip input next in
         let pat, pos = pattern scope binds next in
         let defn, next =
           match pat.pat, tokenize pos with
           | Var _, (LeftParen, _) -> lambda scope Equal pos (* `let f(x) = e` *)
           | _ -> expr scope (expect Equal pos)
         in
-        let defn = check pos (unify pat.ty defn.ty) defn in
-        let pat = pcheck pos (exhaustive [pat]) pat in
+        let inner = Type.let_bind scope binds pat defn in
         node "binding" Other binding next;
-        decr Type.level;
-        List.iter (fun (_, ty) -> Type.generalize ty) !binds;
-        let body, next = expr {scope with vars = !binds @ scope.vars} (expect In next) in
-        enode "let" start ({expr = Let {pat; defn; body}; ty = body.ty}, next)
+        let body, next = expr inner (expect In next) in
+        enode "let" (Type.let_end pat defn body (start, next))
 
-      | Fun, next -> enode "fun" start (lambda scope Arrow next)
+      | Fun, next -> enode "fun" (fst (lambda ~start scope Arrow next))
 
       | LeftCurly, next ->
         let fields, rest, _, next =
           sequence ~func:(lambda scope Equal) ~rest:(expr scope) ~row:"entry" ~sep:Equal
             (expr scope) RightCurly next
         in
-        let tail = Option.map (fun _ -> Type.fresh ()) rest in
-        let rest = Option.map (fun r ->
-            check pos (unify r.Expr.ty (Record {fields = []; rest = tail})) r)
-            rest
-        in
-        let fields_ty = List.map (fun (name, e) -> name, e.Expr.ty) fields in
-        let ty = Type.Record {fields = fields_ty; rest = tail} in
-        enode "record" start ({expr = Record {fields; rest}; ty}, next)
+        enode "record" (Type.record scope fields rest (start, next))
 
       | Tag tag, next ->
         let fields, next = payload (expr scope) next in
-        let ty = variant_type tag (List.map (fun (name, e) -> name, e.Expr.ty) fields) in
-        enode "variant" start ({expr = Variant (tag, fields); ty}, next)
+        enode "variant" (Type.variant tag fields (start, next))
 
       | Ampersand, next ->
         let e, next = operand scope next in
-        enode "roll" start ({expr = Roll e; ty = Recurs {body = e.ty; index = Type.empty}}, next)
+        enode "roll" (Type.roll e (start, next))
 
-      | Recur, next -> enode "recur" start (recur scope (expect LeftParen next))
+      | Recur, next -> enode "recur" (recur scope start (expect LeftParen next))
 
       | Abstract, next ->
         begin match tokenize next with
           | Ident name, next ->
-            let ty = Type.rigid name (Type.fresh ()) in
-            enode "abstract" start
-              (expr {scope with types = (name, ty) :: scope.types} (expect In next))
+            let body, next = expr (Type.abstract_start scope name) (expect In next) in
+            enode "abstract" (Type.abstract_end body (start, next))
           | _ -> unexpected next
         end
 
       | The, next ->
         let ty, pos = annotation scope next in
         let e, next = operand scope pos in
-        enode "the" start ({(check pos (unify (repr ty) e.ty) e) with ty}, next)
+        enode "the" (Type.the scope ty e (start, next))
 
       | _ -> unexpected ~expected:"_" pos
 
     (* `(params) <arrow> body`: [arrow] is `->` after `fun`, and `=` in the
-       sugar `let f(x) = e` and `{.f(x) = e}` *)
-    and lambda scope arrow pos =
-      incr Type.fun_level;
-      let binds = ref [] in
+       sugar `let f(x) = e` and `{.f(x) = e}`, where the function has no node
+       of its own, but is located from its parameters *)
+    and lambda ?start scope arrow pos =
+      let params_start = skip input pos in
+      let binds = Type.lambda () in
       let params, _, deps, pos =
         sequence ~using:(pattern scope binds) ~sep:Equal (pattern scope binds) RightParen
           (expect LeftParen pos)
       in
-      let inputs =
-        Type.Record {fields = List.map (fun (name, p) -> name, p.Pat.ty) params; rest = None}
-      in
-      let problem = exhaustive [{pat = Record params; ty = inputs}] in
-      let deps_ty = Type.fresh () in
-      let deps = Option.map (fun p ->
-          let p = pcheck pos (unify deps_ty p.Pat.ty) p in
-          pcheck pos (exhaustive [p]) p)
-          deps
-      in
-      let body, next =
-        expr {scope with vars = !binds @ scope.vars; deps = deps_ty} (expect arrow pos)
-      in
-      decr Type.fun_level;
-      let exists = Type.existentials body.ty in
-      let escapes =
-        if Type.mentions exists inputs || Type.mentions exists deps_ty then
-          Some "abstract type escapes through a parameter"
-        else None
-      in
-      let ty = Type.Function {inputs; deps = deps_ty; exists; output = body.ty} in
-      let e = {Expr.expr = Function {params; deps; body}; ty} in
-      check pos (if problem = None then escapes else problem) e, next
+      let l, inner = Type.lambda_params scope binds params deps (params_start, pos) in
+      let body, next = expr inner (expect arrow pos) in
+      let start = Option.value start ~default:params_start in
+      Type.lambda_end scope l body (start, next), next
 
-    (* `recur (p <- e, acc = init, ...) do body`. Within body, `continue`
-       continues with a subterm of e and new accumulators. p matches e's top
-       layer, whose subterms get a fresh index, so only they can be continued
-       with. The index can't escape into the accumulators or anything outside,
-       which is checked like an existential's level. On the way out it becomes
-       e's own index, since the subterms are still e's subterms, and `forget`
-       does the same for a layer within body. *)
-    and recur scope pos =
-      let level = !Type.fun_level + 1 in
-      let binds = ref [] in
-      Type.fun_level := level;
-      let root, pos = pattern scope binds pos in
-      let root = pcheck pos (exhaustive [root]) root in
-      decr Type.fun_level;
+    and recur scope start pos =
+      let r = Type.recur () in
+      let root, pos = pattern scope (snd r) pos in
+      Type.recur_root scope root;
       let input, pos = expr scope (expect LeftArrow pos) in
       let rec accs pos =
         match tokenize pos with
         | Comma, next ->
-          let p, pos = pattern scope binds next in
+          let p, pos = pattern scope (snd r) next in
           let init, pos = expr scope (expect Equal pos) in
-          let init = check pos (unify p.Pat.ty init.Expr.ty) init in
-          let p = pcheck pos (exhaustive [p]) p in
+          Type.recur_acc scope p init;
           let rest, pos = accs pos in
           (p, init) :: rest, pos
         | RightParen, next -> [], next
         | _ -> unexpected ~expected:")" pos
       in
       let accs, pos = accs pos in
-      Type.fun_level := level;
-      let k = Type.abstract "recur" Type.empty in
-      let r = {Type.body = root.ty; index = Rigid {abs = k; view = Type.empty}} in
-      let labelled xs = List.mapi (fun i x -> label i, x) xs in
-      let params = labelled ({Pat.pat = Roll root; ty = Recurs r} :: List.map fst accs) in
-      let output = Type.fresh () in
-      let ty = Type.Function {
-          inputs = Record {fields = List.map (fun (l, p) -> l, p.Pat.ty) params; rest = None};
-          deps = Type.empty;
-          exists = [];
-          output
-        }
-      in
-      (* Any index, so both subterms and the re-rolled layer can be forgotten *)
-      let forget = Type.Function {
-          inputs = Record {
-              fields = [label 0, Recurs {body = root.ty; index = Type.fresh ~level:Type.generic ()}];
-              rest = None
-            };
-          deps = Type.empty;
-          exists = [];
-          output = input.ty
-        }
-      in
-      let start = !Type.counter in
-      let continue_name = "continue" and forget_name = "forget" in
-      let vars = !binds @ [continue_name, ty; forget_name, forget] @ scope.vars in
-      let body, next = expr {scope with vars} (expect Do pos) in
-      let body = check pos (unify output body.ty) body in
-      decr Type.fun_level;
-      (* Each iteration introduces its own abstract types, so they can't be
-         passed between iterations, through the result or the accumulators *)
-      let carried = output :: List.map (fun (p, _) -> p.Pat.ty) accs in
-      let problem =
-        if k.fun_level < level then Some "recursion index escapes"
-        else
-          List.find_opt (fun abs -> abs.Type.id > start) (List.concat_map Type.abstracts carried)
-          |> Option.map (fun abs -> "abstract type " ^ abs.Type.name ^ " escapes the recursion")
-      in
-      let outer = Type.fresh () in
-      let copy = Type.copy (function Rigid r when r.abs == k -> Some outer | _ -> None) in
-      let input_ty = copy (Recurs r) and ty = copy output in
-      let problem = if problem = None then unify input.ty input_ty else problem in
-      let args = labelled (input :: List.map snd accs) in
-      let recur = Expr.Recur {continue = continue_name; forget = forget_name; params; args; body} in
-      check pos problem {expr = recur; ty}, next
+      let r, inner = Type.recur_body scope r root input accs in
+      let body, next = expr inner (expect Do pos) in
+      Type.recur_end scope r body (start, next)
     in
 
-    Type.level := 0;
-    Type.fun_level := 0;
-    let expr, pos = expr {vars; types = []; deps = Type.empty} 0 in
+    let errors = ref [] in
+    let report loc problem = errors := (loc, problem) :: !errors in
+    let expr, pos = expr (Type.program ~vars report) 0 in
     match tokenize pos with
     | EOF, _ ->
-      (* The implicit top-level `let` *)
-      decr Type.level;
-      Type.generalize expr.ty;
-      let errors = List.sort (fun (a, _) (b, _) -> Int.compare a b) (List.rev !errors) in
+      let expr = Type.program_end expr in
+      let errors = List.stable_sort (fun ((a, _), _) ((b, _), _) -> Int.compare a b) (List.rev !errors) in
       let stop = String.length input in
       {expr; errors; syntax = {form = "program"; info = Other; start = 0; stop; children = !nodes}}
     | _ -> unexpected pos
@@ -1454,22 +1664,18 @@ end
 module Runtime : sig
   type value
   val show : value -> string
-  val eval : (string * value) list -> Expr.typed -> value
+  val eval : (string * value) list -> 'loc Type.expr -> value
   (* The environment within `let p = e in ...`, unless binding it depends on
      a hole *)
-  val define : (string * value) list -> Pat.typed -> Expr.typed -> (string * value) list option
+  val define : (string * value) list -> 'loc Type.pat -> 'loc Type.expr -> (string * value) list option
   (* A record's field, which is a hole if the record is *)
   val field : value -> string -> value
 end = struct
   type value =
       Record of (string * value) list
     | Variant of string * (string * value) list
-    | Closure of {
-        params : (string * Pat.typed) list;
-        deps : Pat.typed option;
-        body : Expr.typed;
-        env : (string * value) list
-      }
+    (* A function, given its caller's dependencies and its arguments *)
+    | Closure of (value -> (string * value) list -> value)
     | Native of ((string * value) list -> value)
     | Roll of value
     | Hole
@@ -1509,8 +1715,9 @@ end = struct
     | Hole -> raise Indeterminate
     | _ -> assert false
 
-  let rec bind env (p : Pat.typed) value =
+  let rec bind env (p : _ Type.pat) value =
     match p.pat, value with
+    | _ when Type.is_error p.ty -> raise Indeterminate
     | Pat.Var name, _ -> Some ((name, value) :: env)
     | Pat.Wildcard, _ -> Some env
     | Pat.Record ps, Record values -> bind_fields env ps values
@@ -1524,7 +1731,7 @@ end = struct
       end
     | Pat.Record ps, Hole -> bind_fields env ps (List.map (fun (name, _) -> name, Hole) ps)
     | Pat.Roll p, Hole -> bind env p Hole
-    | Pat.Variant _, Hole | Pat.Error _, _ -> raise Indeterminate
+    | Pat.Variant _, Hole -> raise Indeterminate
     | _ -> None
 
   and bind_fields env ps values =
@@ -1535,8 +1742,9 @@ end = struct
   let rec eval env node =
     try step env node with Indeterminate -> Hole
 
-  and step env (node : Expr.typed) =
+  and step env (node : _ Type.expr) =
     match node.expr with
+    | _ when Type.is_error node.ty -> Hole
     | Expr.Record {fields; rest} ->
       let fields = List.map (fun (name, e) -> name, eval env e) fields in
       let rest =
@@ -1561,7 +1769,11 @@ end = struct
       in
       eval env body
 
-    | Expr.Function {params; deps; body} -> Closure {params; deps; body; env}
+    | Expr.Function {params; deps = pattern; body} ->
+      Closure (fun deps args ->
+          let inner = Option.get (bind_fields ((deps_name, deps) :: env) params args) in
+          let inner = match pattern with Some p -> Option.get (bind inner p deps) | None -> inner in
+          eval inner body)
 
     | Expr.Apply {f; args; deps} ->
       let f = eval env f in
@@ -1569,11 +1781,7 @@ end = struct
       begin match f with
         | Native f -> f args
         | Hole -> raise Indeterminate
-        | Closure c ->
-          let deps = match deps with Some e -> eval env e | None -> Record [] in
-          let inner = Option.get (bind_fields ((deps_name, deps) :: c.env) c.params args) in
-          let inner = match c.deps with Some p -> Option.get (bind inner p deps) | None -> inner in
-          eval inner c.body
+        | Closure f -> f (match deps with Some e -> eval env e | None -> Record []) args
         | _ -> assert false
       end
 
@@ -1594,7 +1802,7 @@ end = struct
       in
       loop (List.map (fun (name, e) -> name, eval env e) args)
 
-    | Expr.Hole | Expr.Error _ -> Hole
+    | Expr.Hole -> Hole
 
   let define env pat defn =
     try bind env pat (eval env defn) with Indeterminate -> None
@@ -1608,7 +1816,9 @@ end
 type prelude = {vars : (string * Type.t) list; env : (string * Runtime.value) list}
 
 let describe_errors code errors =
-  String.concat "\n" (List.map (fun (pos, msg) -> Parsing.describe code pos msg) errors)
+  String.concat "\n" (List.map (fun ((pos, _), problem) ->
+      Parsing.describe code pos (Type.describe problem))
+      errors)
 
 let load_prelude source =
   match Parsing.parse source with

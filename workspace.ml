@@ -5,7 +5,8 @@
    cell of raw text sits in a hole, or after a node, and as each token typed
    in it is finished, it's turned into structure: it's put in the source,
    which is parsed with whatever it's missing filled in, like the holes and
-   closing tokens of a construct, and the cell moves on into the next hole. *)
+   closing tokens of a construct, and the cell moves on into the next hole.
+   A cell before a node wraps it in what's typed. *)
 open Js_of_ocaml
 open Bootstrap
 
@@ -19,9 +20,15 @@ let prelude, prelude_error =
 
 let parse source = Parsing.parse ~vars:prelude.vars source
 
+(* A node that what's typed before it wraps, with the closing tokens that
+   were filled in after it, which are taken back out before each change, since
+   what's typed next might need others. It's kept by its length and the length
+   of the source after the closing tokens, which edits before it don't change. *)
+type wrapped = {form : string; length : int; mutable closing : int; rest : int}
+
 (* The cell being edited is raw text at a span of the source. The span holds
    the text if it parses there as a node, or else [fallback], which does: a
-   hole, or nothing for a cell after a node. *)
+   hole, or nothing for a cell between nodes. *)
 type cell = {
   mutable start : int;
   mutable stop : int;
@@ -29,6 +36,7 @@ type cell = {
   mutable text : string;
   mutable anchor : int; (* the selection in the text, from anchor to caret *)
   mutable caret : int;
+  mutable wrapped : wrapped option;
   before : string; (* the source when editing began, for undo *)
 }
 
@@ -76,6 +84,15 @@ let rec path_to start stop (node : Syntax.t) =
   | true, _ -> Some []
   | false, _ -> within ()
 
+(* The outermost node that starts at [start] and reaches [stop] *)
+let rec outermost_from start stop (node : Syntax.t) =
+  List.find_mapi (fun i (child : Syntax.t) ->
+      if child.start = start && stop <= child.stop then Some [i]
+      else if child.start <= start && stop <= child.stop then
+        Option.map (List.cons i) (outermost_from start stop child)
+      else None)
+    node.children
+
 (* The innermost node that ends at a position *)
 let rec ending_at pos path (node : Syntax.t) =
   let within =
@@ -103,16 +120,16 @@ let node_at st path = Option.get (find st.parsed.syntax path)
 
 let text_of st (node : Syntax.t) = String.sub st.source node.start (node.stop - node.start)
 
-let problem (node : Syntax.t) =
-  match node.info with
-  | Expr {expr = Error {msg; _}; _} | Pat {pat = Error {msg; _}; _} -> Some msg
-  | _ -> None
-
 let type_of (node : Syntax.t) =
   match node.info with
   | Expr e -> Some e.ty
   | Pat p -> Some p.ty
   | Other -> None
+
+let problem node =
+  match type_of node with
+  | Some (Type.Error problem) -> Some (Type.describe problem)
+  | _ -> None
 
 (* Holes, and wildcards, which are what's missing from a pattern *)
 let is_hole (node : Syntax.t) = node.form = "hole" || node.form = "wildcard"
@@ -207,10 +224,12 @@ let place st cell text =
   | exception Parsing.Syntax_error _ -> false
 
 (* Puts the cell's text at its span if it fits, or else its fallback.
-   Returns whether nothing is left that doesn't fit. *)
+   Returns whether nothing is left that doesn't fit. Text before a wrapped
+   node isn't put there, since it could run into it. *)
 let settle st cell =
   let text = String.trim cell.text in
-  (text <> "" && place st cell text) || (ignore (place st cell cell.fallback); text = "")
+  (text <> "" && cell.wrapped = None && place st cell text)
+  || (ignore (place st cell cell.fallback); text = "")
 
 (* The tokens of some text, as spans, up to any that doesn't tokenize *)
 let tokens text =
@@ -259,19 +278,43 @@ let space_before source pos token =
   else if String.contains ")}],(." token.[0] then ""
   else " "
 
-(* Parses the source, inserting whatever it's missing at [caret], like a hole
-   or the token that finishes a construct, until it does *)
-let repair source caret =
-  let rec go source caret n =
+(* Parses the source, inserting whatever it's missing, like a hole or the
+   token that finishes a construct, until it does, as long as it's missing at
+   one of [points], which are in order. Returns how much went in at each. *)
+let repair source points =
+  let rec go source points inserted n =
     match parse source with
-    | parsed -> Some (source, parsed)
-    | exception Parsing.Syntax_error {pos; expected = Some token; _}
-      when n < 100 && pos = Parsing.skip source caret ->
-      let space = space_before source caret token in
-      go (splice source caret caret (space ^ token)) (caret + String.length space + String.length token) (n + 1)
+    | parsed -> Some (source, parsed, inserted)
+    | exception Parsing.Syntax_error {pos; expected = Some token; _} when n < 100 ->
+      begin match List.find_index (fun point -> Parsing.skip source point = pos) points with
+        | Some i ->
+          let point = List.nth points i in
+          let text = space_before source point token ^ token in
+          let length = String.length text in
+          go (splice source point point text)
+            (List.mapi (fun j point -> if j >= i then point + length else point) points)
+            (List.mapi (fun j n -> if j = i then n + length else n) inserted)
+            (n + 1)
+        | None -> None
+      end
     | exception Parsing.Syntax_error _ -> None
   in
-  go source caret 0
+  go source points (List.map (fun _ -> 0) points) 0
+
+let wrapped_span source w =
+  let stop = String.length source - w.rest - w.closing in
+  stop - w.length, stop
+
+(* Whether the wrapped node is still a node, and the same kind *)
+let still_wrapped source (parsed : Parsing.result) w =
+  let start, stop = wrapped_span source w in
+  let rec within (node : Syntax.t) =
+    (node.start = start && node.stop = stop && node.form = w.form)
+    || List.exists (fun (child : Syntax.t) ->
+        child.start <= start && stop <= child.stop && within child)
+      node.children
+  in
+  within parsed.syntax
 
 (* Moves the cell to the hole right after a position, if there's one, or else
    to the position itself *)
@@ -288,41 +331,78 @@ let arrive st cell pos =
 
 (* Puts finished text at the cell, which moves past it. A token that's
    already next is stepped over instead, taking an empty hole before it with
-   it, and the comma before that. *)
+   it, and the comma before that. Text before a wrapped node is put there with
+   whatever it's missing filled in on either side of the node, which it can't
+   step into. *)
 let step st cell ?token text =
   let source = st.source in
-  match token, token_at source cell.stop with
-  | Some token, Some (next, after) when next = token ->
-    let removals =
-      if cell.fallback <> "_" then []
-      else
-        match token_before source cell.start with
-        | Some (Comma, comma, _) -> [comma, cell.stop; cell.start, cell.stop]
-        | _ -> [cell.start, cell.stop]
-    in
-    let removed =
-      List.find_map (fun (start, stop) ->
-          let source = splice source start stop "" in
-          match parse source with
-          | parsed -> Some (source, parsed, stop - start)
-          | exception Parsing.Syntax_error _ -> None)
-        removals
-    in
-    let source, parsed, removed = Option.value removed ~default:(source, st.parsed, 0) in
-    st.source <- source;
-    st.parsed <- parsed;
-    arrive st cell (after - removed);
-    true
-  | _ ->
+  let wrapped = Option.map (fun w -> w, wrapped_span source w) cell.wrapped in
+  let step_over () =
+    match token, token_at source cell.stop with
+    | Some token, Some (next, after)
+      when next = token
+        && Option.fold wrapped ~none:true ~some:(fun (_, (start, _)) -> Parsing.skip source cell.stop < start) ->
+      let removals =
+        if cell.fallback <> "_" then []
+        else
+          match token_before source cell.start with
+          | Some (Comma, comma, _) -> [comma, cell.stop; cell.start, cell.stop]
+          | _ -> [cell.start, cell.stop]
+      in
+      let removed =
+        List.find_map (fun (start, stop) ->
+            let source = splice source start stop "" in
+            match parse source with
+            | parsed -> Some (source, parsed, stop - start)
+            | exception Parsing.Syntax_error _ -> None)
+          removals
+      in
+      let source, parsed, removed = Option.value removed ~default:(source, st.parsed, 0) in
+      Some (source, parsed, after - removed, None)
+    | _ -> None
+  in
+  (* The text at the cell, and when it's just before the wrapped node, the
+     space between them *)
+  let put source =
     let space = space_before source cell.start text in
     let caret = cell.start + String.length space + String.length text in
-    match repair (splice source cell.start cell.stop (space ^ text)) caret with
-    | Some (source, parsed) ->
-      st.source <- source;
-      st.parsed <- parsed;
-      arrive st cell caret;
-      true
-    | None -> false
+    match wrapped with
+    | Some (_, (start, _)) when Parsing.skip source cell.stop >= start ->
+      let sep = if String.contains "([{&." text.[String.length text - 1] then "" else " " in
+      splice source cell.start start (space ^ text ^ sep), caret
+    | _ -> splice source cell.start cell.stop (space ^ text), caret
+  in
+  let insert () =
+    let source, caret = put source in
+    Option.map (fun (source, parsed, _) -> source, parsed, caret, None) (repair source [caret])
+  in
+  let wrap () =
+    Option.bind wrapped (fun (w, (_, stop)) ->
+        let unclosed = splice source stop (stop + w.closing) "" in
+        let source, caret = put unclosed in
+        let stop = stop + String.length source - String.length unclosed in
+        Option.map (fun (source, parsed, inserted) -> source, parsed, caret, Some (List.nth inserted 1))
+          (repair source [caret; stop]))
+  in
+  let fits (source, parsed, _, closing) =
+    match cell.wrapped, closing with
+    | Some w, Some closing -> still_wrapped source parsed {w with closing}
+    | Some w, None -> still_wrapped source parsed w
+    | None, _ -> true
+  in
+  match List.find_map (fun f -> Option.bind (f ()) (fun c -> if fits c then Some c else None))
+          [step_over; insert; wrap] with
+  | Some (source, parsed, pos, closing) ->
+    st.source <- source;
+    st.parsed <- parsed;
+    Option.iter (fun w -> Option.iter (fun closing -> w.closing <- closing) closing) cell.wrapped;
+    arrive st cell pos;
+    (* Past the start of the wrapped node, it's no longer before it *)
+    Option.iter (fun w ->
+        if cell.stop > fst (wrapped_span source w) then cell.wrapped <- None)
+      cell.wrapped;
+    true
+  | None -> false
 
 (* Turns the finished tokens before the cell's caret into structure, one at a
    time, leaving the rest as its text. With [all], the whole text is
@@ -368,6 +448,7 @@ let commit st cell ~all =
    Otherwise the token before and the smallest node around it and the cell
    become the cell's text, without the token's last character. *)
 let melt st cell =
+  cell.wrapped <- None;
   ignore (place st cell cell.fallback);
   match token_before st.source cell.start with
   | None -> ()
@@ -431,9 +512,28 @@ let edit st =
       text;
       anchor = 0;
       caret = String.length text;
+      wrapped = None;
       before = st.source;
     };
   st.message <- ""
+
+(* Edits at the start or end of the selected node. What's typed at the start
+   wraps it, and at the end, extends it, like with a field or arguments. *)
+let insert st ~before =
+  let node = selected st in
+  if before && is_hole node then edit st
+  else begin
+    let pos = if before then node.start else node.stop in
+    let wrapped =
+      if not before then None
+      else
+        Some {form = node.form; length = node.stop - node.start; closing = 0;
+              rest = String.length st.source - node.stop}
+    in
+    st.editing <- Some {start = pos; stop = pos; fallback = ""; text = ""; anchor = 0; caret = 0;
+                        wrapped; before = st.source};
+    st.message <- ""
+  end
 
 (* Moves the cell to the next or previous hole, if there is one *)
 let to_hole st cell forward =
@@ -443,6 +543,7 @@ let to_hole st cell forward =
     else List.fold_left (fun found h -> if h < cell.start then Some h else found) None holes
   in
   Option.iter (fun h ->
+      cell.wrapped <- None;
       cell.start <- h;
       cell.stop <- h + 1;
       cell.fallback <- "_";
@@ -452,7 +553,8 @@ let to_hole st cell forward =
     target
 
 (* Stops editing, selecting the node that was edited, or that the cell was
-   after. Text that doesn't fit is dropped. *)
+   after, or what the wrapped node was wrapped in. Text that doesn't fit is
+   dropped. *)
 let leave st cell =
   if not (commit st cell ~all:true) then begin
     cell.text <- "";
@@ -464,8 +566,15 @@ let leave st cell =
     save st.source
   end;
   let path =
-    if cell.start < cell.stop then path_to cell.start cell.stop st.parsed.syntax
-    else ending_at cell.start [] st.parsed.syntax
+    match cell.wrapped with
+    | Some w ->
+      let start, stop = wrapped_span st.source w in
+      (* What's typed went where the node started *)
+      let typed = String.length cell.before - w.rest - w.length in
+      if st.source = cell.before then path_to start stop st.parsed.syntax
+      else outermost_from typed stop st.parsed.syntax
+    | None when cell.start < cell.stop -> path_to cell.start cell.stop st.parsed.syntax
+    | None -> ending_at cell.start [] st.parsed.syntax
   in
   st.cursor <- valid st.parsed.syntax (Option.value path ~default:st.cursor)
 
@@ -795,7 +904,11 @@ let status st =
     | None -> Some st.cursor
   in
   let node = node_at st (Option.value path ~default:[]) in
-  let ty = Option.fold ~none:"" ~some:(fun ty -> " : " ^ Type.show ty) (type_of node) in
+  let ty =
+    match type_of node with
+    | Some ty when not (Type.is_error ty) -> " : " ^ Type.show ty
+    | _ -> ""
+  in
   let problem = Option.fold ~none:"" ~some:(fun msg -> " - " ^ msg) (problem node) in
   let message = if st.message = "" then "" else "\n" ^ st.message in
   node.form ^ ty ^ problem ^ message
@@ -873,6 +986,8 @@ let normal_key st key =
     true
   | "ArrowDown" | "j" -> move st (st.cursor @ [0]); true
   | "Enter" | "i" -> edit st; true
+  | "I" -> insert st ~before:true; true
+  | "A" -> insert st ~before:false; true
   | "d" | "Delete" | "Backspace" ->
     let node = selected st in
     if is_row node then delete_row st st.cursor

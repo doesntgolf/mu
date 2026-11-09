@@ -1,6 +1,6 @@
 line 2, column 9: unbound variable y
 line 3, column 13: unbound variable q
-line 4, column 11: no tag #b
-line 4, column 17: cannot unify [#c, ..'a] with {.d : 'a, ..'b}
+line 4, column 2: no tag #b
+line 4, column 15: cannot unify {.d : 'a, ..'b} with [#c, ..'a]
 line 4, column 25: unknown type T
 line 4, column 30: unbound variable w

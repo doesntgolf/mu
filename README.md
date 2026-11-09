@@ -16,7 +16,9 @@ environment.
 
 **Status:** The language design is still somewhat in flux. The bootstrapping type checker
 and interpreter in OCaml is still in the beginning stages. It type checks while parsing,
-which keeps the language honest about being checkable in a single pass. `make` builds
+which keeps the language honest about being checkable in a single pass: the typing rules
+are functions the parser calls as it reads each construct, which another front end, like
+an editor holding a tree, could call just as well. `make` builds
 `mu`, the command-line interpreter, and `workspace.js` for the editing environment
 prototype in `index.html`, using `ocamlfind` and `js_of_ocaml`. `make test` runs the tests.
 Both load the prelude in `prelude.ml`: a Mu record, as an OCaml string, whose fields are
@@ -305,9 +307,10 @@ is unaffected by code formatting concerns.
 Programs being edited are usually incomplete or wrong somewhere, so the environment keeps
 checking and running them anyway. A hole, written `_` where an expression goes, stands for
 code that hasn't been written yet. It can have any type, and is inferred the type its
-context needs. A type error doesn't stop checking either: the expression it's found in is
-marked with it, keeping whatever type it has, and the rest of the program goes on being
-checked. Failed unifications are undone, so an error doesn't spread into other types.
+context needs. A type error doesn't stop checking either: the expression or pattern it's
+found in gets the error as its type, and the rest of the program goes on being checked. An
+error's type unifies with anything, and failed unifications are undone, so an error doesn't
+spread into other types or lead to more errors.
 
 Holes and erroneous expressions both evaluate to holes. Evaluation carries on around them,
 and an expression that needs more of a hole than to pass it along, like `_.x`, `_(a)`, or
