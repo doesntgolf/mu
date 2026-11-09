@@ -41,8 +41,6 @@ type ('e, 'p) node =
   | Clause of 'p * 'e
   | Binding of 'p * 'e (* a let's `p = e`, without the body *)
   | Acc of 'p * 'e (* a recur's accumulator, `p = init` *)
-  (* A function in `let f(x) = e` and `{.f(x) = e}`, written `(x) = e` *)
-  | Lambda of 'e
 
 (* How to see the shapes of a tree's nodes, checked or not *)
 type ('e, 'p) shapes = {of_expr : 'e -> ('e, 'p) Expr.t; of_pat : 'p -> 'p Pat.t}
@@ -77,7 +75,6 @@ let rec strip_node : fragment -> tree = function
   | Clause (p, e) -> Clause (strip_pat p, strip e)
   | Binding (p, e) -> Binding (strip_pat p, strip e)
   | Acc (p, e) -> Acc (strip_pat p, strip e)
-  | Lambda e -> Lambda (strip e)
 
 (* Fields, with None for the name of each positional one *)
 let named fields =
@@ -101,7 +98,8 @@ let unnamed items =
     invalid_arg "repeated field";
   fields
 
-(* `let f(x) = e` and `{.f(x) = e}`, whose function is a Lambda *)
+(* A let or a named entry whose value is a function, which is written
+   `let f(x) = e` or `{.f(x) = e}` *)
 let sugar s = function
   | Binding (p, e) ->
     begin match s.of_pat p, s.of_expr e with
@@ -109,6 +107,13 @@ let sugar s = function
       | _ -> false
     end
   | Entry (Some _, E e) -> (match s.of_expr e with Function _ -> true | _ -> false)
+  | _ -> false
+
+(* Whether a node's [i]th child is a function written `(x) = e` *)
+let shows_sugar s node i =
+  match node with
+  | Binding _ -> i = 1 && sugar s node
+  | Entry _ -> i = 0 && sugar s node
   | _ -> false
 
 let rec annotation : Annot.t -> string = function
@@ -138,10 +143,11 @@ and annotation_items ({fields; rest} : Annot.row) =
 
 and annotation_row row = String.concat ", " (annotation_items row)
 
-(* A node's concrete syntax: its text, and the nodes within it *)
+(* A node's concrete syntax: its text, and the nodes within it. A function
+   can be [sugared], written `(x) = e`. *)
 type ('e, 'p) part = Text of string | Part of ('e, 'p) node
 
-let parts s node =
+let parts ?(sugared = false) s node =
   let sep_by sep groups =
     List.concat (List.mapi (fun i group -> if i = 0 then group else Text sep :: group) groups)
   in
@@ -194,6 +200,7 @@ let parts s node =
       | Match (l, clauses) ->
         parens (open_ended l) (E l)
         @ Text " [" :: sep_by ", " (List.map (fun (q, b) -> [Part (Clause (q, b))]) clauses) @ [Text "]"]
+      | Function _ when sugared -> function_parts "=" x
       | Function _ -> Text "fun" :: function_parts "->" x
       | Apply {f; args; deps} ->
         let bare = match s.of_expr f with Variant (_, []) -> true | _ -> false in
@@ -226,15 +233,14 @@ let parts s node =
     end
   | T ann -> [Text (annotation ann)]
   | Entry (None, x) -> [Part x]
-  | Entry (Some name, E f) when sugar s node -> [Text ("." ^ name); Part (Lambda f)]
+  | Entry (Some name, x) when sugar s node -> [Text ("." ^ name); Part x]
   | Entry (Some name, x) | Item (name, x) -> [Text ("." ^ name ^ " = "); Part x]
   | Using x -> [Text "using "; Part x]
   | Rest (Some x) -> [Text ".."; Part x]
   | Rest None -> [Text ".."]
   | Clause (q, b) -> [Part (P q); Text " -> "; Part (E b)]
-  | Binding (q, d) when sugar s node -> [Part (P q); Part (Lambda d)]
+  | Binding (q, d) when sugar s node -> [Part (P q); Part (E d)]
   | Binding (q, d) | Acc (q, d) -> [Part (P q); Text " = "; Part (E d)]
-  | Lambda f -> function_parts "=" f
 
 let children s node = List.filter_map (function Part n -> Some n | Text _ -> None) (parts s node)
 
@@ -259,7 +265,6 @@ let form s = function
   | Clause _ -> "clause"
   | Binding _ -> "binding"
   | Acc _ -> "accumulator"
-  | Lambda _ -> "fun"
 
 (* Holes, and wildcards, which are what's missing from a pattern. An entry of
    a hole is one too, so what's typed in it can name it. *)
@@ -293,20 +298,31 @@ let valid root path =
   go root [] path
 
 (* Text, and where each node within it is, by path *)
-let print_spans s node =
+let print_spans ?sugared s node =
   let buf = Buffer.create 64 and spans = ref [] in
-  let rec go path node =
+  let rec go ?sugared path node =
     let start = Buffer.length buf in
     ignore (List.fold_left (fun i -> function
         | Text t -> Buffer.add_string buf t; i
-        | Part child -> go (path @ [i]) child; i + 1)
-        0 (parts s node));
+        | Part child -> go ~sugared:(shows_sugar s node i) (path @ [i]) child; i + 1)
+        0 (parts ?sugared s node));
     spans := (path, (start, Buffer.length buf)) :: !spans
   in
-  go [] node;
+  go ?sugared [] node;
   Buffer.contents buf, !spans
 
-let print s node = fst (print_spans s node)
+let print ?sugared s node = fst (print_spans ?sugared s node)
+
+(* Whether the node at a path in the program is a function written
+   `(x) = e`, and that node's syntax and text *)
+let sugared root path =
+  match split path with
+  | Some (parent, i) -> shows_sugar untyped (get untyped root parent) i
+  | None -> false
+
+let parts_at root path = parts ~sugared:(sugared root path) untyped (get untyped root path)
+let print_spans_at root path = print_spans ~sugared:(sugared root path) untyped (get untyped root path)
+let print_at root path = fst (print_spans_at root path)
 
 (* A node with new children, which must be the kinds of node it can hold *)
 let rebuild (node : tree) (children : tree list) : tree =
@@ -382,15 +398,13 @@ let rebuild (node : tree) (children : tree list) : tree =
     in
     P {x with pat = shape}
   | T _, [] -> node
-  | Lambda f, cs -> Lambda {f with expr = fn cs}
-  | Entry (name, _), [Lambda f] -> Entry (name, E f)
   | Entry (name, _), [x] -> Entry (name, x)
   | Item (name, _), [x] -> Item (name, x)
   | Using _, [x] -> Using x
   | Rest (Some _), [x] -> Rest (Some x)
   | Rest None, [] -> node
   | Clause _, [P q; E b] -> Clause (q, b)
-  | Binding _, [P q; (E d | Lambda d)] -> Binding (q, d)
+  | Binding _, [P q; E d] -> Binding (q, d)
   | Acc _, [P q; E init] -> Acc (q, init)
   | _ -> bad ()
 
@@ -505,8 +519,8 @@ let binding_frame = list_frame "let " " in _" parse_expr "_ = _" (fun read ->
 (* A function written `(x) = e`, as a let's *)
 let lambda_frame = list_frame "let f" " in _" parse_expr "(_) = _" (fun read ->
     match shape_of read, children untyped read with
-    | Some (Let {body; _}), [Binding (_, f) as binding; _] when hole (E body) && sugar untyped binding ->
-      Some (Some ([0], 1), [Lambda f])
+    | Some (Let {body; _}), [binding; _] when hole (E body) && sugar untyped binding ->
+      Some (Some ([0], 1), [List.nth (children untyped binding) 1])
     | _ -> None)
 
 (* The list a node holds, if it holds one: its frame, and which of its
@@ -529,7 +543,6 @@ let list_of (node : tree) =
       | Variant _ -> Some (pat_variant_frame, 0, 0)
       | _ -> None
     end
-  | Lambda _ -> Some (params_frame, 0, 1)
   | _ -> None
 
 (* How text is read in place of the node at a path, and if it's an item of a
@@ -540,7 +553,7 @@ let slot root path =
     | P _ -> pat_frame
     | T _ -> type_frame
     | Binding _ -> binding_frame
-    | Lambda _ -> lambda_frame
+    | E _ when sugared root path -> lambda_frame
     | _ -> expr_frame
   in
   match split path with
@@ -714,7 +727,7 @@ let rec around root at text =
   | None ->
     let* parent, i = split (path_of at) in
     let parent_node = get untyped root parent in
-    let parts = parts untyped parent_node in
+    let parts = parts_at root parent in
     let count = List.length (children untyped parent_node) in
     let starts = match parts with Part _ :: _ -> true | _ -> false in
     let ends = match List.rev parts with Part _ :: _ -> true | _ -> false in
@@ -741,7 +754,7 @@ let step_over root at token =
       | Text _ :: rest -> after k rest
       | [] -> None
     in
-    let* rest = after 0 (parts untyped (get untyped root parent)) in
+    let* rest = after 0 (parts_at root parent) in
     let rec texts acc = function
       | Text t :: rest -> texts (acc ^ t) rest
       | rest -> acc, rest <> []
@@ -749,7 +762,7 @@ let step_over root at token =
     (* A function written `(x) = e` was typed `(x) -> e` if it's in a record *)
     let is token (t : Parsing.token) =
       t = token
-      || t = Equal && token = Arrow && (match get untyped root parent with Lambda _ -> true | _ -> false)
+      || t = Equal && token = Arrow && sugared root parent
     in
     let rec rest_after = function
       | t :: rest -> if is token t then Some (List.map (fun t typed -> is typed t) rest) else rest_after rest
@@ -961,14 +974,14 @@ let melt st cell =
       begin match slot root path with
         | _, Some (parent, i) ->
           let first = match list_of (get untyped root parent) with Some (_, first, _) -> first | None -> 0 in
-          i > first && refillable (print untyped (get untyped root path))
+          i > first && refillable (print_at root path)
           && begin match remove root parent i with
             | root ->
               let earlier = parent @ [i - 1] in
               set st root;
               cell.at <- Into earlier;
               cell.filled <- [];
-              cell.text <- print untyped (get untyped root earlier);
+              cell.text <- print_at root earlier;
               cell.caret <- String.length cell.text;
               true
             | exception Invalid_argument _ -> false
@@ -980,7 +993,7 @@ let melt st cell =
   if not joined then begin
     let path = path_of cell.at in
     let rec around node_path =
-      let text, spans = print_spans untyped (get untyped root node_path) in
+      let text, spans = print_spans_at root node_path in
       let start, stop = List.assoc (List.drop (List.length node_path) path) spans in
       let before, after =
         match cell.at with
@@ -1012,7 +1025,7 @@ let melt st cell =
 let edit st =
   let path = into (root st) st.cursor in
   let node = get untyped (root st) path in
-  let text = if hole node then "" else print untyped node in
+  let text = if hole node then "" else print_at (root st) path in
   st.editing <- Some {at = Into path; text; anchor = 0; caret = String.length text; filled = [];
                       origin = path; before = st.doc};
   st.message <- ""
@@ -1242,7 +1255,6 @@ let delete st =
 let type_of : checked -> Type.t option = function
   | E e -> Some e.ty
   | P p -> Some p.ty
-  | Lambda e -> Some e.ty
   | _ -> None
 
 let problem node =
@@ -1304,7 +1316,7 @@ let value (s, title) =
 (* The values to show by path, and whether the cell has been put in yet *)
 type context = {values : (path * (string * string)) list; mutable placed : bool}
 
-let rec render st ctx path (node : checked) : Dom.node Js.t =
+let rec render st ctx ?sugared path (node : checked) : Dom.node Js.t =
   match st.editing with
   | Some {at = Into p; _} when p = path ->
     ctx.placed <- true;
@@ -1370,11 +1382,11 @@ let rec render st ctx path (node : checked) : Dom.node Js.t =
           let p = path @ [i] in
           cell (Before p);
           Option.iter (fun v -> Dom.appendChild !line (value v)) (List.assoc_opt p ctx.values);
-          Dom.appendChild !line (render st ctx p child);
+          Dom.appendChild !line (render st ctx ~sugared:(shows_sugar typed node i) p child);
           cell (After p);
           after_block := is_block child;
           i + 1)
-        0 (parts typed node));
+        0 (parts ?sugared typed node));
     let g = take () in
     if bracketed then put (String.trim g) (closing_break node) else put g None;
     (el :> Dom.node Js.t)
