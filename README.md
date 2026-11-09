@@ -267,6 +267,14 @@ abstract t in
 The underlying type of an abstract type may not refer back to the abstract type itself;
 recursion goes through `rec` types instead.
 
+An annotation can be given a name with `type <T> = <annotation> in <body>`. Within the
+type annotations in `<body>`, `<T>` stands for the annotation, which is a transparent name
+rather than a new type: `type AB = [#a, #b] in the AB #a` is just `the [#a, #b] #a`. The
+annotation's type variables are generalized like a `let`'s, so each use of `<T>` has its
+own: with `type Id = fun('a) -> 'a`, `the Id f` and `the Id g` needn't be functions on the
+same type. The name isn't in scope in its own annotation, so a recursive type is written
+with `rec`, as in `type List = rec 'l. [#nil, #cons({}, 'l)]`.
+
 ### Dependencies
 
 #### Function dependencies

@@ -94,6 +94,7 @@ module Expr = struct
 
     | The of Annot.t * 'e
     | Abstract of string * 'e (* `abstract t in e` *)
+    | Alias of string * Annot.t * 'e (* `type T = annotation in e` *)
 
     | Hole (* `_` *)
 
@@ -121,6 +122,7 @@ module Expr = struct
              accs = List.map (fun (q, x) -> p q, e x) accs; body = e body}
     | The (ann, x) -> The (ann, e x)
     | Abstract (name, x) -> Abstract (name, e x)
+    | Alias (name, ann, x) -> Alias (name, ann, e x)
     | Hole -> Hole
 end
 
@@ -804,7 +806,7 @@ module Type = struct
 
   type 'loc scope = {
     vars : (string * t) list;
-    types : (string * t) list; (* names bound by `abstract` *)
+    types : (string * t) list; (* names bound by `abstract` and `type` *)
     deps : t; (* dependencies of the innermost function *)
     report : 'loc -> error -> unit
   }
@@ -871,7 +873,7 @@ module Type = struct
         end
       | Name name ->
         begin match List.assoc_opt name scope.types with
-          | Some ty -> ty
+          | Some ty -> instantiate ty
           | None -> problem (Unknown_type name)
         end
       | Record r -> Record (row binders r)
@@ -1074,6 +1076,16 @@ module Type = struct
       let scope = {scope with types = (name, rigid name (fresh ())) :: scope.types} in
       node (Abstract (name, check scope expected body)) expected None
 
+    (* body's annotations see T as the annotation, whose variables are
+       generalized like a let's, so each use of T has its own *)
+    | Alias (name, ann, body) ->
+      incr level;
+      let ty = annotation scope e.loc ann in
+      decr level;
+      generalize ty;
+      let scope = {scope with types = (name, ty) :: scope.types} in
+      node (Alias (name, ann, check scope expected body)) expected None
+
     | The (ann, x) ->
       let ty = annotation scope e.loc ann in
       let x = check scope (repr ty) x in
@@ -1202,6 +1214,7 @@ module Parsing = struct
     | Fun
     | Using
     | Abstract
+    | Type
     | The
     | Rec
     | Recur
@@ -1235,6 +1248,7 @@ module Parsing = struct
     | Fun -> "fun"
     | Using -> "using"
     | Abstract -> "abstract"
+    | Type -> "type"
     | The -> "the"
     | Rec -> "rec"
     | Recur -> "recur"
@@ -1332,6 +1346,7 @@ module Parsing = struct
         | "fun" -> Fun
         | "using" -> Using
         | "abstract" -> Abstract
+        | "type" -> Type
         | "the" -> The
         | "rec" -> Rec
         | "recur" -> Recur
@@ -1598,6 +1613,15 @@ module Parsing = struct
           | _ -> unexpected next
         end
 
+      | Type, next ->
+        begin match tokenize next with
+          | Ident name, next ->
+            let ann, pos = type_expr (expect Equal next) in
+            let body, next = expr (expect In pos) in
+            enode (Expr.Alias (name, ann, body)) start next
+          | _ -> unexpected next
+        end
+
       | The, next ->
         let ty, pos = type_expr next in
         let e, next = operand pos in
@@ -1782,7 +1806,7 @@ end = struct
 
     | Expr.Roll e -> Roll (eval env e)
 
-    | Expr.The (_, e) | Expr.Abstract (_, e) -> eval env e
+    | Expr.The (_, e) | Expr.Abstract (_, e) | Expr.Alias (_, _, e) -> eval env e
 
     (* Unlike a closure, keeps the enclosing function's dependencies *)
     | Expr.Recur {continue; forget; root; input; accs; body} ->

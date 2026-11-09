@@ -169,7 +169,11 @@ let parts ?(sugared = false) s node =
   (* Operands that need parentheses, to be read back the same: what would
      take in a postfix after it, and a match on the left of a postfix
      operand of `&` or `the`, which would take the match *)
-  let open_ended x = match s.of_expr x with Let _ | Function _ | Abstract _ | Recur _ -> true | _ -> false in
+  let open_ended x =
+    match s.of_expr x with
+    | Let _ | Function _ | Abstract _ | Alias _ | Recur _ -> true
+    | _ -> false
+  in
   let prefixed x = match s.of_expr x with The _ | Roll _ -> true | _ -> false in
   let rec has_match x =
     match s.of_expr x with
@@ -214,6 +218,7 @@ let parts ?(sugared = false) s node =
         @ [Text ") do "; Part (E body)]
       | The (ann, r) -> [Text "the "; Part (T ann); Text " "] @ parens (has_match r) (E r)
       | Abstract (name, body) -> [Text ("abstract " ^ name ^ " in "); Part (E body)]
+      | Alias (name, ann, body) -> [Text ("type " ^ name ^ " = "); Part (T ann); Text " in "; Part (E body)]
     end
   | P q ->
     begin match s.of_pat q with
@@ -250,6 +255,7 @@ let form s = function
       | Record _ -> "record" | Field _ -> "field" | Variant _ -> "variant" | Match _ -> "match"
       | Function _ -> "fun" | Apply _ -> "apply" | Dep _ -> "dep" | Var _ -> "var" | Let _ -> "let"
       | Roll _ -> "roll" | Recur _ -> "recur" | The _ -> "the" | Abstract _ -> "abstract"
+      | Alias _ -> "alias"
       | Hole -> "hole"
     end
   | P q ->
@@ -375,6 +381,7 @@ let rebuild (node : tree) (children : tree list) : tree =
         end
       | The _, [T ann; r] -> The (ann, e r)
       | Abstract (name, _), [body] -> Abstract (name, e body)
+      | Alias (name, _, _), [T ann; body] -> Alias (name, ann, e body)
       | (Var _ | Dep _ | Hole) as leaf, [] -> leaf
       | _ -> bad ()
     in
@@ -435,7 +442,7 @@ let tokens text =
 (* Whether typing more could make it a different token *)
 let extendable : Parsing.token -> bool = function
   | Ident _ | Field _ | Tag _ | TypeVar _ | Dep _ | Dot | Underscore
-  | Let | In | Fun | Using | Abstract | The | Rec | Recur | Do | Or -> true
+  | Let | In | Fun | Using | Abstract | Type | The | Rec | Recur | Do | Or -> true
   | _ -> false
 
 (* Whether some text is only holes and the tokens around them, which reading
@@ -1265,7 +1272,7 @@ let problem node =
 (* Layout. Blocks span several lines; everything else is inline. *)
 let rec is_block node =
   match form typed node with
-  | "let" | "abstract" | "recur" -> true
+  | "let" | "abstract" | "alias" | "recur" -> true
   | "match" -> List.length (children typed node) > 2 || List.exists is_block (children typed node)
   | _ -> List.exists is_block (children typed node)
 
@@ -1281,13 +1288,13 @@ let line_break node i child =
   let last = i = List.length (children typed node) - 1 in
   let when_ cond break = if cond then Some break else None in
   match form typed node with
-  | "let" | "abstract" -> when_ last (Ends_line false)
+  | "let" | "abstract" | "alias" -> when_ last (Ends_line false)
   | "recur" -> when_ last (Ends_line true)
   | "match" -> when_ (i > 0) (Starts_line true)
   | "record" | "variant" -> when_ (i > 0) (Starts_line false)
   | "apply" -> when_ (i > 1) (Starts_line false)
   (* Other blocks can start on the same line, and break within *)
-  | _ -> when_ (last && List.mem (form typed child) ["let"; "abstract"]) (Ends_line true)
+  | _ -> when_ (last && List.mem (form typed child) ["let"; "abstract"; "alias"]) (Ends_line true)
 
 let closing_break node =
   match form typed node with
@@ -1407,12 +1414,14 @@ let values (program : unit Type.expr) =
         | None -> []
       end
     | Abstract (_, body) -> bindings env (path @ [0]) body
+    | Alias (_, _, body) -> bindings env (path @ [1]) body
     | _ -> []
   in
   let rec body path (e : unit Type.expr) =
     match e.expr with
     | Let {body = b; _} -> body (path @ [1]) b
     | Abstract (_, b) -> body (path @ [0]) b
+    | Alias (_, _, b) -> body (path @ [1]) b
     | _ -> path
   in
   let result =
