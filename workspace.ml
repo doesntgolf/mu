@@ -1,10 +1,10 @@
 (* The workspace: a structure editor for Mu programs, in the browser.
 
-   The program is kept as source text, and shown as the syntax tree parsed
-   from it. In normal mode, a cursor moves between nodes. In editing mode, a
-   cell of raw text sits in a hole, or after a node, and as each token typed
-   in it is finished, it's turned into structure: it's put in the source,
-   which is parsed with whatever it's missing filled in, like the holes and
+   The program is a tree, which is checked and drawn from its shape. In
+   normal mode, a cursor moves between nodes. In editing mode, a cell of raw
+   text sits in place of a node, or before or after it, and as each token
+   typed in it is finished, the cell's text is read there, framed by what
+   the place needs, with whatever it's missing filled in, like the holes and
    closing tokens of a construct, and the cell moves on into the next hole.
    A cell before a node wraps it in what's typed. *)
 open Js_of_ocaml
@@ -18,95 +18,273 @@ let prelude, prelude_error =
   | Ok prelude -> prelude, ""
   | Error msg -> {vars = []; env = []}, msg
 
-let parse source = Parsing.parse ~vars:prelude.vars source
+let ( let* ) = Option.bind
 
-(* A node that what's typed before it wraps, with the closing tokens that
-   were filled in after it, which are taken back out before each change, since
-   what's typed next might need others. It's kept by its length and the length
-   of the source after the closing tokens, which edits before it don't change. *)
-type wrapped = {form : string; length : int; mutable closing : int; rest : int}
+type path = int list
 
-(* The cell being edited is raw text at a span of the source. The span holds
-   the text if it parses there as a node, or else [fallback], which does: a
-   hole, or nothing for a cell between nodes. *)
-type cell = {
-  mutable start : int;
-  mutable stop : int;
-  mutable fallback : string;
-  mutable text : string;
-  mutable anchor : int; (* the selection in the text, from anchor to caret *)
-  mutable caret : int;
-  mutable wrapped : wrapped option;
-  before : string; (* the source when editing began, for undo *)
-}
+let split path =
+  match List.rev path with
+  | i :: rest -> Some (List.rev rest, i)
+  | [] -> None
 
-type state = {
-  mutable source : string;
-  mutable parsed : Parsing.result;
-  mutable cursor : int list; (* the selected node's path of child indices *)
-  mutable editing : cell option;
-  mutable message : string;
-  mutable undo : string list;
-  area : Dom_html.element Js.t; (* the cell's element, kept across redraws *)
-}
+(* The nodes of a program as the editor sees them: its expressions, patterns
+   and types, and the parts of constructs that hold them, which are items of
+   a list or rows the editor can rearrange *)
+type ('e, 'p) node =
+  | E of 'e
+  | P of 'p
+  | T of Annot.t
+  | Entry of string option * ('e, 'p) node (* of a record, named or positional *)
+  | Item of string * ('e, 'p) node (* a named argument, payload field or parameter *)
+  | Using of ('e, 'p) node
+  | Rest of ('e, 'p) node option (* `..r` in a record, and `..` in a record pattern *)
+  | Clause of 'p * 'e
+  | Binding of 'p * 'e (* a let's `p = e`, without the body *)
+  | Acc of 'p * 'e (* a recur's accumulator, `p = init` *)
+  (* A function in `let f(x) = e` and `{.f(x) = e}`, written `(x) = e` *)
+  | Lambda of 'e
 
-(* Saved in the browser, so a reload doesn't lose the program *)
-let storage_key = Js.string "mu-workspace"
+(* How to see the shapes of a tree's nodes, checked or not *)
+type ('e, 'p) shapes = {of_expr : 'e -> ('e, 'p) Expr.t; of_pat : 'p -> 'p Pat.t}
 
-let load () =
-  try
-    Js.Optdef.to_option Dom_html.window##.localStorage
-    |> Fun.flip Option.bind (fun s -> Js.Opt.to_option (s##getItem storage_key))
-    |> Option.map Js.to_string
-  with _ -> None
+let untyped = {of_expr = (fun (e : _ Expr.untyped) -> e.expr); of_pat = (fun (p : _ Pat.untyped) -> p.pat)}
+let typed = {of_expr = (fun (e : _ Type.expr) -> e.expr); of_pat = (fun (p : _ Type.pat) -> p.pat)}
 
-let save source =
-  try
-    Js.Optdef.iter Dom_html.window##.localStorage (fun s ->
-        s##setItem storage_key (Js.string source))
-  with _ -> ()
+(* The program, which has no locations *)
+type expr = unit Expr.untyped
+type pat = unit Pat.untyped
+type tree = (expr, pat) node
 
-let rec find (node : Syntax.t) = function
+type checked = (unit Type.expr, unit Type.pat) node
+
+(* What's read from text, located in it *)
+type fragment = (Parsing.span Expr.untyped, Parsing.span Pat.untyped) node
+
+let hole_expr : expr = {expr = Hole; loc = ()}
+let wildcard : pat = {pat = Wildcard; loc = ()}
+
+let rec strip (e : _ Expr.untyped) : expr = {expr = Expr.map strip strip_pat e.expr; loc = ()}
+and strip_pat (p : _ Pat.untyped) : pat = {pat = Pat.map strip_pat p.pat; loc = ()}
+
+let rec strip_node : fragment -> tree = function
+  | E e -> E (strip e)
+  | P p -> P (strip_pat p)
+  | T ann -> T ann
+  | Entry (name, x) -> Entry (name, strip_node x)
+  | Item (name, x) -> Item (name, strip_node x)
+  | Using x -> Using (strip_node x)
+  | Rest x -> Rest (Option.map strip_node x)
+  | Clause (p, e) -> Clause (strip_pat p, strip e)
+  | Binding (p, e) -> Binding (strip_pat p, strip e)
+  | Acc (p, e) -> Acc (strip_pat p, strip e)
+  | Lambda e -> Lambda (strip e)
+
+(* Fields, with None for the name of each positional one *)
+let named fields =
+  let rec go i = function
+    | [] -> []
+    | (name, x) :: rest when name = label i -> (None, x) :: go (i + 1) rest
+    | (name, x) :: rest -> (Some name, x) :: go i rest
+  in
+  go 0 fields
+
+(* Fields from positional and named ones, whose names can't repeat *)
+let unnamed items =
+  let rec go i = function
+    | [] -> []
+    | (None, x) :: rest -> (label i, x) :: go (i + 1) rest
+    | (Some name, x) :: rest -> (name, x) :: go i rest
+  in
+  let fields = go 0 items in
+  let names = List.map fst fields in
+  if List.length (List.sort_uniq compare names) < List.length names then
+    invalid_arg "repeated field";
+  fields
+
+(* `let f(x) = e` and `{.f(x) = e}`, whose function is a Lambda *)
+let sugar s = function
+  | Binding (p, e) ->
+    begin match s.of_pat p, s.of_expr e with
+      | Var _, Function _ -> true
+      | _ -> false
+    end
+  | Entry (Some _, E e) -> (match s.of_expr e with Function _ -> true | _ -> false)
+  | _ -> false
+
+let rec annotation : Annot.t -> string = function
+  | Var name -> "'" ^ name
+  | Name name -> name
+  | Record row -> "{" ^ annotation_row row ^ "}"
+  | Variant {fields; rest} ->
+    let tag (name, payload) =
+      match payload with
+      | Annot.Record {fields = []; rest = None} -> "#" ^ name
+      | Annot.Record row -> "#" ^ name ^ "(" ^ annotation_row row ^ ")"
+      | ty -> "#" ^ name ^ "(" ^ annotation ty ^ ")"
+    in
+    let rest = match rest with Some r -> [".." ^ annotation r] | None -> [] in
+    "[" ^ String.concat ", " (List.map tag fields @ rest) ^ "]"
+  | Function {inputs; deps; output} ->
+    let deps = match deps with Some d -> ["using " ^ annotation d] | None -> [] in
+    "fun(" ^ String.concat ", " (annotation_items inputs @ deps) ^ ") -> " ^ annotation output
+  | Rec (name, body) -> "rec '" ^ name ^ ". " ^ annotation body
+
+and annotation_items ({fields; rest} : Annot.row) =
+  List.map (function
+      | None, ty -> annotation ty
+      | Some name, ty -> "." ^ name ^ " : " ^ annotation ty)
+    (named fields)
+  @ (match rest with Some r -> [".." ^ annotation r] | None -> [])
+
+and annotation_row row = String.concat ", " (annotation_items row)
+
+(* A node's concrete syntax: its text, and the nodes within it *)
+type ('e, 'p) part = Text of string | Part of ('e, 'p) node
+
+let parts s node =
+  let sep_by sep groups =
+    List.concat (List.mapi (fun i group -> if i = 0 then group else Text sep :: group) groups)
+  in
+  let parens cond node = if cond then [Text "("; Part node; Text ")"] else [Part node] in
+  let items wrap fields =
+    List.map (function
+        | None, x -> [Part (wrap x)]
+        | Some name, x -> [Part (Item (name, wrap x))])
+      (named fields)
+  in
+  let using wrap = function Some x -> [[Part (Using (wrap x))]] | None -> [] in
+  let e x = E x and p x = P x in
+  let function_parts arrow f =
+    match s.of_expr f with
+    | Function {params; deps; body} ->
+      Text "(" :: sep_by ", " (items p params @ using p deps) @ [Text (") " ^ arrow ^ " "); Part (E body)]
+    | _ -> invalid_arg "function_parts"
+  in
+  (* Operands that need parentheses, to be read back the same: what would
+     take in a postfix after it, and a match on the left of a postfix
+     operand of `&` or `the`, which would take the match *)
+  let open_ended x = match s.of_expr x with Let _ | Function _ | Abstract _ | Recur _ -> true | _ -> false in
+  let prefixed x = match s.of_expr x with The _ | Roll _ -> true | _ -> false in
+  let rec has_match x =
+    match s.of_expr x with
+    | Match _ -> true
+    | Field (l, _) -> has_match l
+    | Apply {f; _} -> has_match f
+    | _ -> false
+  in
+  let rec open_pattern q =
+    match s.of_pat q with
+    | The _ -> true
+    | Roll r -> (match s.of_pat r with Or _ -> false | _ -> open_pattern r)
+    | _ -> false
+  in
+  match node with
+  | E x ->
+    begin match s.of_expr x with
+      | Var name -> [Text name]
+      | Hole -> [Text "_"]
+      | Dep name -> [Text ("@" ^ name)]
+      | Record {fields; rest} ->
+        let entries = List.map (fun (name, x) -> [Part (Entry (name, E x))]) (named fields) in
+        let rest = match rest with Some r -> [[Part (Rest (Some (E r)))]] | None -> [] in
+        Text "{" :: sep_by ", " (entries @ rest) @ [Text "}"]
+      | Field (l, name) -> parens (open_ended l || prefixed l) (E l) @ [Text ("." ^ name)]
+      | Variant (tag, []) -> [Text ("#" ^ tag)]
+      | Variant (tag, fields) -> Text ("#" ^ tag ^ "(") :: sep_by ", " (items e fields) @ [Text ")"]
+      | Match (l, clauses) ->
+        parens (open_ended l) (E l)
+        @ Text " [" :: sep_by ", " (List.map (fun (q, b) -> [Part (Clause (q, b))]) clauses) @ [Text "]"]
+      | Function _ -> Text "fun" :: function_parts "->" x
+      | Apply {f; args; deps} ->
+        let bare = match s.of_expr f with Variant (_, []) -> true | _ -> false in
+        parens (open_ended f || prefixed f || bare) (E f)
+        @ Text "(" :: sep_by ", " (items e args @ using e deps) @ [Text ")"]
+      | Let {pat; defn; body} -> [Text "let "; Part (Binding (pat, defn)); Text " in "; Part (E body)]
+      | Roll r -> Text "&" :: parens (has_match r) (E r)
+      | Recur {root; input; accs; body; _} ->
+        [Text "recur ("; Part (P root); Text " <- "; Part (E input)]
+        @ List.concat_map (fun (q, init) -> [Text ", "; Part (Acc (q, init))]) accs
+        @ [Text ") do "; Part (E body)]
+      | The (ann, r) -> [Text "the "; Part (T ann); Text " "] @ parens (has_match r) (E r)
+      | Abstract (name, body) -> [Text ("abstract " ^ name ^ " in "); Part (E body)]
+    end
+  | P q ->
+    begin match s.of_pat q with
+      | Var name -> [Text name]
+      | Wildcard -> [Text "_"]
+      | Record {fields; rest} ->
+        let entries = List.map (fun (name, x) -> [Part (Entry (name, P x))]) (named fields) in
+        let rest = if rest then [[Part (Rest None)]] else [] in
+        Text "{" :: sep_by ", " (entries @ rest) @ [Text "}"]
+      | Variant (tag, []) -> [Text ("#" ^ tag)]
+      | Variant (tag, fields) -> Text ("#" ^ tag ^ "(") :: sep_by ", " (items p fields) @ [Text ")"]
+      | Roll r -> Text "&" :: parens (match s.of_pat r with Or _ -> true | _ -> false) (P r)
+      | The (ann, r) -> [Text "the "; Part (T ann); Text " "; Part (P r)]
+      | Or (l, r) ->
+        parens (match s.of_pat l with Or _ -> true | _ -> open_pattern l) (P l)
+        @ [Text " or "; Part (P r)]
+    end
+  | T ann -> [Text (annotation ann)]
+  | Entry (None, x) -> [Part x]
+  | Entry (Some name, E f) when sugar s node -> [Text ("." ^ name); Part (Lambda f)]
+  | Entry (Some name, x) | Item (name, x) -> [Text ("." ^ name ^ " = "); Part x]
+  | Using x -> [Text "using "; Part x]
+  | Rest (Some x) -> [Text ".."; Part x]
+  | Rest None -> [Text ".."]
+  | Clause (q, b) -> [Part (P q); Text " -> "; Part (E b)]
+  | Binding (q, d) when sugar s node -> [Part (P q); Part (Lambda d)]
+  | Binding (q, d) | Acc (q, d) -> [Part (P q); Text " = "; Part (E d)]
+  | Lambda f -> function_parts "=" f
+
+let children s node = List.filter_map (function Part n -> Some n | Text _ -> None) (parts s node)
+
+let form s = function
+  | E x ->
+    begin match s.of_expr x with
+      | Record _ -> "record" | Field _ -> "field" | Variant _ -> "variant" | Match _ -> "match"
+      | Function _ -> "fun" | Apply _ -> "apply" | Dep _ -> "dep" | Var _ -> "var" | Let _ -> "let"
+      | Roll _ -> "roll" | Recur _ -> "recur" | The _ -> "the" | Abstract _ -> "abstract"
+      | Hole -> "hole"
+    end
+  | P q ->
+    begin match s.of_pat q with
+      | Var _ -> "var" | Wildcard -> "wildcard" | Record _ -> "record" | Variant _ -> "variant"
+      | Roll _ -> "roll" | The _ -> "the" | Or _ -> "or"
+    end
+  | T _ -> "type"
+  | Entry _ -> "entry"
+  | Item _ -> "item"
+  | Using _ -> "using"
+  | Rest _ -> "rest"
+  | Clause _ -> "clause"
+  | Binding _ -> "binding"
+  | Acc _ -> "accumulator"
+  | Lambda _ -> "fun"
+
+(* Holes, and wildcards, which are what's missing from a pattern. An entry of
+   a hole is one too, so what's typed in it can name it. *)
+let rec is_hole s = function
+  | E x -> (match s.of_expr x with Hole -> true | _ -> false)
+  | P q -> (match s.of_pat q with Wildcard -> true | _ -> false)
+  | Entry (None, x) -> is_hole s x
+  | _ -> false
+
+let hole node = is_hole untyped node
+
+let rec find s node = function
   | [] -> Some node
-  | i :: path -> Option.bind (List.nth_opt node.children i) (fun child -> find child path)
+  | i :: path -> Option.bind (List.nth_opt (children s node) i) (fun child -> find s child path)
 
-(* The outermost node with the span, other than the whole program *)
-let rec path_to start stop (node : Syntax.t) =
-  let within () =
-    List.find_mapi (fun i (child : Syntax.t) ->
-        if child.start <= start && stop <= child.stop then
-          Option.map (List.cons i) (path_to start stop child)
-        else None)
-      node.children
-  in
-  match node.start = start && node.stop = stop, node.form with
-  | true, "program" -> Some (Option.value (within ()) ~default:[])
-  | true, _ -> Some []
-  | false, _ -> within ()
+let get s node path =
+  match find s node path with
+  | Some node -> node
+  | None -> invalid_arg "get"
 
-(* The outermost node that starts at [start] and reaches [stop] *)
-let rec outermost_from start stop (node : Syntax.t) =
-  List.find_mapi (fun i (child : Syntax.t) ->
-      if child.start = start && stop <= child.stop then Some [i]
-      else if child.start <= start && stop <= child.stop then
-        Option.map (List.cons i) (outermost_from start stop child)
-      else None)
-    node.children
-
-(* The innermost node that ends at a position *)
-let rec ending_at pos path (node : Syntax.t) =
-  let within =
-    List.find_mapi (fun i (child : Syntax.t) ->
-        if child.start < pos && pos <= child.stop then ending_at pos (path @ [i]) child else None)
-      node.children
-  in
-  if within = None && node.stop = pos && path <> [] then Some path else within
-
-(* The longest prefix of a path that's still in the tree *)
+(* The longest prefix of a path that's in the tree *)
 let valid root path =
   let rec go node acc = function
     | i :: path ->
-      begin match List.nth_opt node.Syntax.children i with
+      begin match List.nth_opt (children untyped node) i with
         | Some child -> go child (i :: acc) path
         | None -> List.rev acc
       end
@@ -114,124 +292,123 @@ let valid root path =
   in
   go root [] path
 
-let selected st = Option.get (find st.parsed.syntax st.cursor)
-
-let node_at st path = Option.get (find st.parsed.syntax path)
-
-let text_of st (node : Syntax.t) = String.sub st.source node.start (node.stop - node.start)
-
-let type_of (node : Syntax.t) =
-  match node.info with
-  | Expr e -> Some e.ty
-  | Pat p -> Some p.ty
-  | Other -> None
-
-let problem node =
-  match type_of node with
-  | Some (Type.Error problem) -> Some (Type.describe problem)
-  | _ -> None
-
-(* Holes, and wildcards, which are what's missing from a pattern *)
-let is_hole (node : Syntax.t) = node.form = "hole" || node.form = "wildcard"
-
-(* The start of each hole, in order *)
-let holes st =
-  let rec go (node : Syntax.t) = if is_hole node then [node.start] else List.concat_map go node.children in
-  go st.parsed.syntax
-
-(* Layout. Blocks span several lines; everything else is inline. *)
-let rec is_block (node : Syntax.t) =
-  match node.form with
-  | "let" | "abstract" | "recur" -> true
-  | "match" -> List.length node.children > 2 || List.exists is_block node.children
-  | _ -> List.exists is_block node.children
-
-(* Where a block's lines break. Keywords like `in` and `->` end a line, and
-   separators start one, so a list in brackets is laid out as
-     { a
-     , b
-     }
-   Each break is before a child, or before the closing bracket. *)
-type break = Ends_line of bool | Starts_line of bool (* whether it's indented *)
-
-let line_break (node : Syntax.t) i (child : Syntax.t) =
-  let last = i = List.length node.children - 1 in
-  let when_ cond break = if cond then Some break else None in
-  match node.form with
-  | "let" | "abstract" -> when_ last (Ends_line false)
-  | "recur" -> when_ last (Ends_line true)
-  | "match" -> when_ (i > 0) (Starts_line true)
-  | "record" | "variant" | "parens" -> when_ (i > 0) (Starts_line false)
-  | "apply" -> when_ (i > 1) (Starts_line false)
-  (* Other blocks can start on the same line, and break within *)
-  | _ -> when_ (last && List.mem child.form ["let"; "abstract"]) (Ends_line true)
-
-let closing_break (node : Syntax.t) =
-  match node.form with
-  | "match" -> Some (Starts_line true)
-  | "record" | "variant" | "parens" | "apply" -> Some (Starts_line false)
-  | _ -> None
-
-(* The source between nodes, with whitespace and comments collapsed *)
-let between source start stop =
-  let buf = Buffer.create 16 in
-  let rec go pos =
-    if pos < stop then begin
-      let next = min stop (Parsing.skip source pos) in
-      if next > pos then begin
-        Buffer.add_char buf ' ';
-        go next
-      end else begin
-        Buffer.add_char buf source.[pos];
-        go (pos + 1)
-      end
-    end
+(* Text, and where each node within it is, by path *)
+let print_spans s node =
+  let buf = Buffer.create 64 and spans = ref [] in
+  let rec go path node =
+    let start = Buffer.length buf in
+    ignore (List.fold_left (fun i -> function
+        | Text t -> Buffer.add_string buf t; i
+        | Part child -> go (path @ [i]) child; i + 1)
+        0 (parts s node));
+    spans := (path, (start, Buffer.length buf)) :: !spans
   in
-  go start;
-  Buffer.contents buf
+  go [] node;
+  Buffer.contents buf, !spans
 
-let text s = (doc##createTextNode (Js.string s) :> Dom.node Js.t)
+let print s node = fst (print_spans s node)
 
-let trim_end s =
-  let n = ref (String.length s) in
-  while !n > 0 && s.[!n - 1] = ' ' do decr n done;
-  String.sub s 0 !n
+(* A node with new children, which must be the kinds of node it can hold *)
+let rebuild (node : tree) (children : tree list) : tree =
+  let bad () = invalid_arg "rebuild" in
+  let e = function E x -> x | _ -> bad () in
+  let p = function P x -> x | _ -> bad () in
+  (* Items, named or positional, then an optional `using` *)
+  let items get cs =
+    let fields cs = unnamed (List.map (function Item (name, x) -> Some name, get x | x -> None, get x) cs) in
+    match List.rev cs with
+    | Using x :: rest -> fields (List.rev rest), Some (get x)
+    | _ -> fields cs, None
+  in
+  let plain get cs = match items get cs with fields, None -> fields | _ -> bad () in
+  let entries get cs = unnamed (List.map (function Entry (name, x) -> name, get x | _ -> bad ()) cs) in
+  let fn cs : (expr, pat) Expr.t =
+    match List.rev cs with
+    | E body :: rest ->
+      let params, deps = items p (List.rev rest) in
+      Function {params; deps; body}
+    | _ -> bad ()
+  in
+  match node, children with
+  | E x, cs ->
+    let shape : (expr, pat) Expr.t =
+      match x.expr, cs with
+      | Record _, cs ->
+        let cs, rest =
+          match List.rev cs with
+          | Rest (Some r) :: rest -> List.rev rest, Some (e r)
+          | _ -> cs, None
+        in
+        Record {fields = entries e cs; rest}
+      | Field (_, name), [l] -> Field (e l, name)
+      | Variant (tag, _), cs -> Variant (tag, plain e cs)
+      | Match _, l :: cs ->
+        Match (e l, List.map (function Clause (q, b) -> q, b | _ -> bad ()) cs)
+      | Function _, cs -> fn cs
+      | Apply _, f :: cs ->
+        let args, deps = items e cs in
+        Apply {f = e f; args; deps}
+      | Let _, [Binding (pat, defn); body] -> Let {pat; defn; body = e body}
+      | Roll _, [r] -> Roll (e r)
+      | Recur r, P root :: E input :: cs ->
+        begin match List.rev cs with
+          | E body :: accs ->
+            let accs = List.rev_map (function Acc (q, init) -> q, init | _ -> bad ()) accs in
+            Recur {r with root; input; accs; body}
+          | _ -> bad ()
+        end
+      | The _, [T ann; r] -> The (ann, e r)
+      | Abstract (name, _), [body] -> Abstract (name, e body)
+      | (Var _ | Dep _ | Hole) as leaf, [] -> leaf
+      | _ -> bad ()
+    in
+    E {x with expr = shape}
+  | P x, cs ->
+    let shape : pat Pat.t =
+      match x.pat, cs with
+      | Record _, cs ->
+        let cs, rest =
+          match List.rev cs with
+          | Rest None :: rest -> List.rev rest, true
+          | _ -> cs, false
+        in
+        Record {fields = entries p cs; rest}
+      | Variant (tag, _), cs -> Variant (tag, plain p cs)
+      | Roll _, [r] -> Roll (p r)
+      | The _, [T ann; r] -> The (ann, p r)
+      | Or _, [l; r] -> Or (p l, p r)
+      | (Var _ | Wildcard) as leaf, [] -> leaf
+      | _ -> bad ()
+    in
+    P {x with pat = shape}
+  | T _, [] -> node
+  | Lambda f, cs -> Lambda {f with expr = fn cs}
+  | Entry (name, _), [Lambda f] -> Entry (name, E f)
+  | Entry (name, _), [x] -> Entry (name, x)
+  | Item (name, _), [x] -> Item (name, x)
+  | Using _, [x] -> Using x
+  | Rest (Some _), [x] -> Rest (Some x)
+  | Rest None, [] -> node
+  | Clause _, [P q; E b] -> Clause (q, b)
+  | Binding _, [P q; (E d | Lambda d)] -> Binding (q, d)
+  | Acc _, [P q; E init] -> Acc (q, init)
+  | _ -> bad ()
 
-(* Editing. Each change to the source must leave it parsing. *)
+let rec update node path f =
+  match path with
+  | [] -> f node
+  | i :: path ->
+    let cs = children untyped node in
+    if i >= List.length cs then invalid_arg "update";
+    rebuild node (List.mapi (fun j child -> if j = i then update child path f else child) cs)
 
-let splice source start stop text =
-  String.sub source 0 start ^ text ^ String.sub source stop (String.length source - stop)
+(* Removes the [i]th child of the node at a path *)
+let remove root path i =
+  update root path (fun node ->
+      rebuild node (List.filteri (fun j _ -> j <> i) (children untyped node)))
 
-(* What stands in for a node whose text doesn't parse *)
-let fallback_for (node : Syntax.t) =
-  match node.form with
-  | "binding" -> "_ = _"
-  | "clause" -> "_ -> _"
-  | _ -> "_"
+(* Reading text *)
 
-(* Puts [text] at the cell's span, if the source then parses, with a node
-   there unless the text is empty *)
-let place st cell text =
-  let source = splice st.source cell.start cell.stop text in
-  let stop = cell.start + String.length text in
-  match parse source with
-  | parsed when text = "" || path_to cell.start stop parsed.syntax <> None ->
-    st.source <- source;
-    st.parsed <- parsed;
-    cell.stop <- stop;
-    true
-  | _ -> false
-  | exception Parsing.Syntax_error _ -> false
-
-(* Puts the cell's text at its span if it fits, or else its fallback.
-   Returns whether nothing is left that doesn't fit. Text before a wrapped
-   node isn't put there, since it could run into it. *)
-let settle st cell =
-  let text = String.trim cell.text in
-  (text <> "" && cell.wrapped = None && place st cell text)
-  || (ignore (place st cell cell.fallback); text = "")
-
-(* The tokens of some text, as spans, up to any that doesn't tokenize *)
 let tokens text =
   let rec go pos acc =
     match Parsing.tokenize text pos with
@@ -241,166 +418,494 @@ let tokens text =
   in
   go 0 []
 
-let token_at source pos =
-  match Parsing.tokenize source pos with
-  | found -> Some found
-  | exception Parsing.Syntax_error _ -> None
-
-(* The last token that ends by a position *)
-let token_before source pos =
-  List.fold_left (fun found ((_, _, stop) as token) -> if stop <= pos then Some token else found)
-    None (tokens source)
-
 (* Whether typing more could make it a different token *)
 let extendable : Parsing.token -> bool = function
   | Ident _ | Field _ | Tag _ | TypeVar _ | Dep _ | Dot | Underscore
   | Let | In | Fun | Using | Abstract | The | Rec | Recur | Do | Or -> true
   | _ -> false
 
-(* Whether some text is only holes and the tokens around them, which
-   repairing would put back *)
+(* Whether some text is only holes and the tokens around them, which reading
+   would put back *)
 let refillable text =
-  let found = tokens text in
-  let stop = List.fold_left (fun _ (_, _, stop) -> stop) 0 found in
-  Parsing.skip text stop = String.length text
-  && List.for_all (fun (token, _, _) ->
+  List.for_all (fun (token, _, _) ->
       match (token : Parsing.token) with
       | Underscore | RightParen | RightCurly | RightSquare | Comma | Equal | Arrow | LeftArrow
       | In | Do -> true
       | _ -> false)
-    found
+    (tokens text)
 
-(* The space before a token at a position, as programs are usually written *)
-let space_before source pos token =
-  let prev = if pos > 0 then source.[pos - 1] else ' ' in
-  if String.contains " \t\n({[&" prev then ""
-  else if prev = ',' then " "
-  else if String.contains ")}],(." token.[0] then ""
-  else " "
+(* How text is read in a place in the program: [prefix] and [suffix] frame
+   it, so that [parse] reads it as what it stands for there, which is
+   [items] of what's read: the children of the node at a path, from child
+   [first], or else the whole of it. [standin] reads as one item, or the
+   whole. *)
+type frame = {
+  prefix : string;
+  suffix : string;
+  parse : string -> fragment;
+  standin : string;
+  items : fragment -> ((path * int) option * fragment list) option;
+}
 
-(* Parses the source, inserting whatever it's missing, like a hole or the
-   token that finishes a construct, until it does, as long as it's missing at
-   one of [points], which are in order. Returns how much went in at each. *)
-let repair source points =
-  let rec go source points inserted n =
-    match parse source with
-    | parsed -> Some (source, parsed, inserted)
+let parse_expr text = E (Parsing.parse text)
+let parse_pat text = P (Parsing.parse_pattern text)
+
+let whole parse = {prefix = ""; suffix = ""; parse; standin = "_"; items = fun read -> Some (None, [read])}
+let expr_frame = whole parse_expr
+let pat_frame = whole parse_pat
+let type_frame = {(whole (fun text -> T (Parsing.parse_type text))) with standin = ""}
+
+let shape_of = function E e -> Some (untyped.of_expr e) | _ -> None
+let pat_shape_of = function P p -> Some (untyped.of_pat p) | _ -> None
+let all_but_last xs = List.take (List.length xs - 1) xs
+
+(* The frames of lists' items. Around the items are holes. *)
+let list_frame prefix suffix parse standin items = {prefix; suffix; parse; standin; items}
+
+let record_frame = list_frame "{" "}" parse_expr "_" (fun read ->
+    match shape_of read with Some (Record _) -> Some (Some ([], 0), children untyped read) | _ -> None)
+
+let variant_frame = list_frame "#x(" ")" parse_expr "_" (fun read ->
+    match shape_of read with Some (Variant ("x", _)) -> Some (Some ([], 0), children untyped read) | _ -> None)
+
+let params_frame = list_frame "fun(" ") -> _" parse_expr "_" (fun read ->
+    match shape_of read with
+    | Some (Function {body; _}) when hole (E body) -> Some (Some ([], 0), all_but_last (children untyped read))
+    | _ -> None)
+
+let args_frame = list_frame "_(" ")" parse_expr "_" (fun read ->
+    match shape_of read with
+    | Some (Apply {f; _}) when hole (E f) -> Some (Some ([], 1), List.tl (children untyped read))
+    | _ -> None)
+
+let clauses_frame = list_frame "_ [" "]" parse_expr "_ -> _" (fun read ->
+    match shape_of read with
+    | Some (Match (l, _)) when hole (E l) -> Some (Some ([], 1), List.tl (children untyped read))
+    | _ -> None)
+
+let accs_frame = list_frame "recur (_ <- _, " ") do _" parse_expr "_ = _" (fun read ->
+    match shape_of read with
+    | Some (Recur {root; input; body; _}) when hole (P root) && hole (E input) && hole (E body) ->
+      Some (Some ([], 2), all_but_last (List.drop 2 (children untyped read)))
+    | _ -> None)
+
+let pat_record_frame = list_frame "{" "}" parse_pat "_" (fun read ->
+    match pat_shape_of read with Some (Record _) -> Some (Some ([], 0), children untyped read) | _ -> None)
+
+let pat_variant_frame = list_frame "#x(" ")" parse_pat "_" (fun read ->
+    match pat_shape_of read with
+    | Some (Variant ("x", _)) -> Some (Some ([], 0), children untyped read)
+    | _ -> None)
+
+let binding_frame = list_frame "let " " in _" parse_expr "_ = _" (fun read ->
+    match shape_of read, children untyped read with
+    | Some (Let {body; _}), [binding; _] when hole (E body) -> Some (Some ([], 0), [binding])
+    | _ -> None)
+
+(* A function written `(x) = e`, as a let's *)
+let lambda_frame = list_frame "let f" " in _" parse_expr "(_) = _" (fun read ->
+    match shape_of read, children untyped read with
+    | Some (Let {body; _}), [Binding (_, f) as binding; _] when hole (E body) && sugar untyped binding ->
+      Some (Some ([0], 1), [Lambda f])
+    | _ -> None)
+
+(* The list a node holds, if it holds one: its frame, and which of its
+   children are items, from [first] up to [trailing] from the end *)
+let list_of (node : tree) =
+  match node with
+  | E e ->
+    begin match e.expr with
+      | Record _ -> Some (record_frame, 0, 0)
+      | Variant _ -> Some (variant_frame, 0, 0)
+      | Function _ -> Some (params_frame, 0, 1)
+      | Apply _ -> Some (args_frame, 1, 0)
+      | Match _ -> Some (clauses_frame, 1, 0)
+      | Recur _ -> Some (accs_frame, 2, 1)
+      | _ -> None
+    end
+  | P p ->
+    begin match p.pat with
+      | Record _ -> Some (pat_record_frame, 0, 0)
+      | Variant _ -> Some (pat_variant_frame, 0, 0)
+      | _ -> None
+    end
+  | Lambda _ -> Some (params_frame, 0, 1)
+  | _ -> None
+
+(* How text is read in place of the node at a path, and if it's an item of a
+   list, the list's node and the item's index *)
+let slot root path =
+  let alone () =
+    match get untyped root path with
+    | P _ -> pat_frame
+    | T _ -> type_frame
+    | Binding _ -> binding_frame
+    | Lambda _ -> lambda_frame
+    | _ -> expr_frame
+  in
+  match split path with
+  | Some (parent_path, i) ->
+    let parent = get untyped root parent_path in
+    begin match list_of parent with
+      | Some (frame, first, trailing)
+        when first <= i && i < List.length (children untyped parent) - trailing ->
+        frame, Some (parent_path, i)
+      | _ -> alone (), None
+    end
+  | None -> alone (), None
+
+(* Reads [src] in a frame, with whatever it's missing filled in at its end,
+   and given [inner], at that offset too. What's filled in at the end must
+   finish with the frame's suffix, rather than the suffix being taken into
+   what's read. Returns the text with what was filled in, and what's read. *)
+let read frame ?inner src =
+  let token_list text = List.map (fun (token, _, _) -> token) (tokens text) in
+  let suffix = token_list frame.suffix in
+  let rec go src inner added n =
+    match frame.parse src with
+    | read ->
+      let added = token_list added in
+      let extra = List.length added - List.length suffix in
+      if extra >= 0 && List.drop extra added = suffix then Some (src, read) else None
     | exception Parsing.Syntax_error {pos; expected = Some token; _} when n < 100 ->
-      begin match List.find_index (fun point -> Parsing.skip source point = pos) points with
-        | Some i ->
-          let point = List.nth points i in
-          let text = space_before source point token ^ token in
-          let length = String.length text in
-          go (splice source point point text)
-            (List.mapi (fun j point -> if j >= i then point + length else point) points)
-            (List.mapi (fun j n -> if j = i then n + length else n) inserted)
-            (n + 1)
-        | None -> None
+      let token = " " ^ token in
+      if pos >= String.length src then go (src ^ token) inner (added ^ token) (n + 1)
+      else begin match inner with
+        | Some i when Parsing.skip src i = pos ->
+          let src = String.sub src 0 i ^ token ^ String.sub src i (String.length src - i) in
+          go src (Some (i + String.length token)) added (n + 1)
+        | _ -> None
       end
     | exception Parsing.Syntax_error _ -> None
   in
-  go source points (List.map (fun _ -> 0) points) 0
+  go src inner "" 0
 
-let wrapped_span source w =
-  let stop = String.length source - w.rest - w.closing in
-  stop - w.length, stop
+(* The program with [items] in place of the node at a path *)
+let replace root path list items =
+  match list, items with
+  | Some (parent_path, i), items ->
+    update root parent_path (fun parent ->
+        let cs = children untyped parent in
+        rebuild parent (List.take i cs @ items @ List.drop (i + 1) cs))
+  | None, [item] -> update root path (fun _ -> item)
+  | None, _ -> invalid_arg "replace"
 
-(* Whether the wrapped node is still a node, and the same kind *)
-let still_wrapped source (parsed : Parsing.result) w =
-  let start, stop = wrapped_span source w in
-  let rec within (node : Syntax.t) =
-    (node.start = start && node.stop = stop && node.form = w.form)
-    || List.exists (fun (child : Syntax.t) ->
-        child.start <= start && stop <= child.stop && within child)
-      node.children
+(* The expressions and patterns of what's read, by path, with their spans *)
+let rec located path (node : fragment) =
+  let here = match node with E e -> [path, e.loc] | P p -> [path, p.loc] | _ -> [] in
+  here @ List.concat (List.mapi (fun i child -> located (path @ [i]) child) (children untyped node))
+
+(* Where the cell is: in place of the node at a path, or after or before it *)
+type position = Into of path | After of path | Before of path
+
+let path_of = function Into path | After path | Before path -> path
+
+(* Where the cell goes into a hole. An entry of a hole is the hole, so what's
+   typed there can name it. *)
+let into root path =
+  match split path with
+  | Some (parent, _) when (match get untyped root parent with Entry (None, _) -> true | _ -> false) -> parent
+  | _ -> path
+
+(* Reads [text] at a position, in place of the node at a path, or after or
+   before it, where the node stands for itself. Returns the new program,
+   where the cell goes next, and the tokens filled in before it, which typing
+   steps over. The cell goes into the next hole if only what was filled in
+   comes before it, or for text before a node, stays before it, or else goes
+   after the node the text ends. *)
+let place root at text =
+  let path = path_of at in
+  let frame, list = slot root path in
+  let original = get untyped root path in
+  let standin = match original with E _ | P _ -> "_" | _ -> frame.standin in
+  let start = String.length frame.prefix in
+  let src, inner, standin_at, caret =
+    match at with
+    | Into _ -> frame.prefix ^ text, None, None, start + String.length text
+    | After _ ->
+      frame.prefix ^ standin ^ " " ^ text, None, Some start,
+      start + String.length standin + 1 + String.length text
+    | Before _ ->
+      let caret = start + String.length text in
+      frame.prefix ^ text ^ " " ^ standin, Some caret, Some (caret + 1), caret
   in
-  within parsed.syntax
+  let* () = if standin_at = None || standin <> "" then Some () else None in
+  let* src, read = read frame ?inner src in
+  let* first, items = frame.items read in
+  let count = List.length items in
+  let* () = if list <> None || count = 1 then Some () else None in
+  let nodes = located [] read in
+  (* Which item a path in what's read is in, and the path within it *)
+  let locate fpath =
+    match first with
+    | None -> Some (0, fpath)
+    | Some (at, first) ->
+      let n = List.length at in
+      match List.drop n fpath with
+      | c :: rest when List.take n fpath = at && c >= first && c - first < count -> Some (c - first, rest)
+      | _ -> None
+  in
+  let hole_at pos =
+    List.find_map (fun (fpath, (start, _)) ->
+        if start = pos && hole (get untyped read fpath) then locate fpath else None)
+      nodes
+  in
+  let items = Array.of_list (List.map strip_node items) in
+  (* The original, in place of the stand-in *)
+  let* standin_loc =
+    match standin_at with
+    | None -> Some None
+    | Some pos ->
+      let* k, rest = hole_at pos in
+      begin match original, get untyped items.(k) rest with
+        | (E _, E _ | P _, P _) ->
+          items.(k) <- update items.(k) rest (fun _ -> original);
+          Some (Some (k, rest))
+        | (E _ | P _), _ -> None
+        | _ when print untyped items.(k) = standin ->
+          items.(k) <- original;
+          Some (Some (k, []))
+        | _ -> None
+      end
+  in
+  let root = replace root path list (Array.to_list items) in
+  let in_program (k, rest) =
+    match list with
+    | Some (parent, i) -> parent @ [i + k] @ rest
+    | None -> path @ rest
+  in
+  let next_hole =
+    let rec next pos filled =
+      match Parsing.tokenize src pos with
+      | Parsing.Underscore, stop ->
+        let* loc = hole_at (stop - 1) in
+        if Some (stop - 1) = standin_at then
+          Option.map (fun loc -> Before (in_program loc), List.rev filled) standin_loc
+        else Some (Into (into root (in_program loc)), List.rev filled)
+      | Parsing.EOF, _ -> None
+      | token, stop -> next stop (( = ) token :: filled)
+      | exception Parsing.Syntax_error _ -> None
+    in
+    next caret []
+  in
+  let ending =
+    List.filter_map (fun (fpath, (_, stop)) -> if stop = caret then locate fpath else None) nodes
+    |> List.fold_left (fun found (k, rest) ->
+        match found with
+        | Some (_, longest) when List.length longest >= List.length rest -> found
+        | _ -> Some (k, rest))
+      None
+    |> Option.map (fun loc -> After (in_program loc), [])
+  in
+  let last =
+    match list with
+    | Some (parent, i) when count > 0 -> parent @ [i + count - 1]
+    | Some (parent, _) -> parent
+    | None -> path
+  in
+  let at, filled = Option.value (if next_hole <> None then next_hole else ending) ~default:(After last, []) in
+  Some (root, at, filled)
 
-(* Moves the cell to the hole right after a position, if there's one, or else
-   to the position itself *)
-let arrive st cell pos =
-  match token_at st.source pos with
-  | Some (Underscore, next) ->
-    cell.start <- next - 1;
-    cell.stop <- next;
-    cell.fallback <- "_"
-  | _ ->
-    cell.start <- pos;
-    cell.stop <- pos;
-    cell.fallback <- ""
-
-(* Puts finished text at the cell, which moves past it. A token that's
-   already next is stepped over instead, taking an empty hole before it with
-   it, and the comma before that. Text before a wrapped node is put there with
-   whatever it's missing filled in on either side of the node, which it can't
-   step into. *)
-let step st cell ?token text =
-  let source = st.source in
-  let wrapped = Option.map (fun w -> w, wrapped_span source w) cell.wrapped in
-  let step_over () =
-    match token, token_at source cell.stop with
-    | Some token, Some (next, after)
-      when next = token
-        && Option.fold wrapped ~none:true ~some:(fun (_, (start, _)) -> Parsing.skip source cell.stop < start) ->
-      let removals =
-        if cell.fallback <> "_" then []
-        else
-          match token_before source cell.start with
-          | Some (Comma, comma, _) -> [comma, cell.stop; cell.start, cell.stop]
-          | _ -> [cell.start, cell.stop]
-      in
-      let removed =
-        List.find_map (fun (start, stop) ->
-            let source = splice source start stop "" in
-            match parse source with
-            | parsed -> Some (source, parsed, stop - start)
-            | exception Parsing.Syntax_error _ -> None)
-          removals
-      in
-      let source, parsed, removed = Option.value removed ~default:(source, st.parsed, 0) in
-      Some (source, parsed, after - removed, None)
+(* Text after or before a node that doesn't fit with it might with what the
+   node is the last or first part of *)
+let rec around root at text =
+  match place root at text with
+  | Some placed -> Some placed
+  | None ->
+    let* parent, i = split (path_of at) in
+    let parent_node = get untyped root parent in
+    let parts = parts untyped parent_node in
+    let count = List.length (children untyped parent_node) in
+    let starts = match parts with Part _ :: _ -> true | _ -> false in
+    let ends = match List.rev parts with Part _ :: _ -> true | _ -> false in
+    match at with
+    | After _ when ends && i = count - 1 -> around root (After parent) text
+    | Before _ when starts && i = 0 -> around root (Before parent) text
     | _ -> None
+
+(* Typing a token that's next steps over it, to the node after it, or past
+   the construct it ends, taking an empty item the cell was in with it. The
+   rest of the tokens between them are returned, for typing to step over. *)
+let step_over root at token =
+  let* path, empty =
+    match at with
+    | Into path when hole (get untyped root path) -> Some (path, true)
+    | After path -> Some (path, false)
+    | Into _ | Before _ -> None
   in
-  (* The text at the cell, and when it's just before the wrapped node, the
-     space between them *)
-  let put source =
-    let space = space_before source cell.start text in
-    let caret = cell.start + String.length space + String.length text in
-    match wrapped with
-    | Some (_, (start, _)) when Parsing.skip source cell.stop >= start ->
-      let sep = if String.contains "([{&." text.[String.length text - 1] then "" else " " in
-      splice source cell.start start (space ^ text ^ sep), caret
-    | _ -> splice source cell.start cell.stop (space ^ text), caret
+  let rec next path =
+    let* parent, i = split path in
+    let rec after k = function
+      | Part _ :: rest when k = i -> Some rest
+      | Part _ :: rest -> after (k + 1) rest
+      | Text _ :: rest -> after k rest
+      | [] -> None
+    in
+    let* rest = after 0 (parts untyped (get untyped root parent)) in
+    let rec texts acc = function
+      | Text t :: rest -> texts (acc ^ t) rest
+      | rest -> acc, rest <> []
+    in
+    (* A function written `(x) = e` was typed `(x) -> e` if it's in a record *)
+    let is token (t : Parsing.token) =
+      t = token
+      || t = Equal && token = Arrow && (match get untyped root parent with Lambda _ -> true | _ -> false)
+    in
+    let rec rest_after = function
+      | t :: rest -> if is token t then Some (List.map (fun t typed -> is typed t) rest) else rest_after rest
+      | [] -> None
+    in
+    match texts "" rest with
+    | "", false -> next parent
+    | text, more ->
+      let* filled = rest_after (List.map (fun (t, _, _) -> t) (tokens text)) in
+      Some (parent, i, (if more then Some (i + 1) else None), filled)
   in
-  let insert () =
-    let source, caret = put source in
-    Option.map (fun (source, parsed, _) -> source, parsed, caret, None) (repair source [caret])
+  let* parent, i, after, filled = next path in
+  match after with
+  | Some j ->
+    let target = parent @ [j] in
+    Some (root, (if hole (get untyped root target) then Into (into root target) else Before target), filled)
+  | None ->
+    let item = path = parent @ [i] && snd (slot root path) <> None in
+    let root = if empty && item then (try remove root parent i with Invalid_argument _ -> root) else root in
+    Some (root, After parent, filled)
+
+(* Tokens that change what's before them: `(` after a let's name makes it a
+   function's, `let f(_) = e`, with e its body, and after a tag, gives it a
+   payload, and `,` after the input of a recur starts its accumulators *)
+let special root at (token : Parsing.token) =
+  match at, token with
+  | After path, Comma ->
+    let* parent, i = split path in
+    begin match get untyped root parent with
+      | E {expr = Recur ({accs = []; _} as r); _} as recur when i = 1 ->
+        let acc = wildcard, hole_expr in
+        Some (update root parent (fun _ -> match recur with
+            | E e -> E {e with expr = Recur {r with accs = [acc]}}
+            | _ -> recur),
+              Into (parent @ [2; 0]), [])
+      | _ -> None
+    end
+  | After path, LeftParen ->
+    begin match get untyped root path, split path with
+      | E ({expr = Variant (tag, []); _} as e), _ ->
+        Some (update root path (fun _ -> E {e with expr = Variant (tag, [label 0, hole_expr])}), Into (path @ [0]), [])
+      | P ({pat = Variant (tag, []); _} as p), _ ->
+        Some (update root path (fun _ -> P {p with pat = Variant (tag, [label 0, wildcard])}), Into (path @ [0]), [])
+      | _, Some (parent, 0) ->
+        begin match get untyped root parent with
+          | Binding (({pat = Var _; _} as name), defn) as binding when not (sugar untyped binding) ->
+            let defn = {defn with expr = Function {params = [label 0, wildcard]; deps = None; body = defn}} in
+            Some (update root parent (fun _ -> Binding (name, defn)), Into (parent @ [1; 0]), [])
+          | _ -> None
+        end
+      | _ -> None
+    end
+  | _ -> None
+
+(* Editing *)
+
+(* The cell being edited, raw text at a position in the program *)
+type cell = {
+  mutable at : position;
+  mutable text : string;
+  mutable anchor : int; (* the selection in the text, from anchor to caret *)
+  mutable caret : int;
+  mutable filled : (Parsing.token -> bool) list; (* filled in after the cell, which typing steps over *)
+  origin : path; (* the node editing began at, which what's typed before wraps *)
+  before : expr; (* the program when editing began, for undo *)
+}
+
+type state = {
+  mutable doc : expr;
+  mutable cursor : path; (* the selected node *)
+  mutable editing : cell option;
+  mutable message : string;
+  mutable undo : expr list;
+  area : Dom_html.element Js.t; (* the cell's element, kept across redraws *)
+}
+
+let root st = E st.doc
+
+let set st = function
+  | E e -> st.doc <- e
+  | _ -> invalid_arg "set"
+
+(* Saved in the browser as text, so a reload doesn't lose the program *)
+let storage_key = Js.string "mu-workspace"
+
+let load () =
+  try
+    Js.Optdef.to_option Dom_html.window##.localStorage
+    |> Fun.flip Option.bind (fun s -> Js.Opt.to_option (s##getItem storage_key))
+    |> Option.map Js.to_string
+  with _ -> None
+
+let save st =
+  try
+    Js.Optdef.iter Dom_html.window##.localStorage (fun s ->
+        s##setItem storage_key (Js.string (print untyped (root st))))
+  with _ -> ()
+
+let attempt f = try f () with Invalid_argument _ | Failure _ | Not_found -> None
+
+(* Puts [text] in place of the node at a path, if it reads as one node there *)
+let fill st path text =
+  let placed =
+    attempt (fun () ->
+        let frame, list = slot (root st) path in
+        let* read =
+          try Some (frame.parse (frame.prefix ^ text ^ frame.suffix))
+          with Parsing.Syntax_error _ -> None
+        in
+        let* _, items = frame.items read in
+        match items with
+        | [item] -> Some (replace (root st) path list [strip_node item])
+        | _ -> None)
   in
-  let wrap () =
-    Option.bind wrapped (fun (w, (_, stop)) ->
-        let unclosed = splice source stop (stop + w.closing) "" in
-        let source, caret = put unclosed in
-        let stop = stop + String.length source - String.length unclosed in
-        Option.map (fun (source, parsed, inserted) -> source, parsed, caret, Some (List.nth inserted 1))
-          (repair source [caret; stop]))
+  Option.iter (set st) placed;
+  placed <> None
+
+(* Puts what stands for nothing in place of the node at a path: a hole, or
+   an item of holes *)
+let clear st path =
+  Option.iter (fun (root, _, _) -> set st root) (attempt (fun () -> place (root st) (Into path) ""))
+
+(* Puts the cell's text in place of its node if it reads as one, or else
+   clears it. Returns whether nothing is left that doesn't fit. Text before
+   or after a node isn't put there until it's finished. *)
+let settle st cell =
+  let text = String.trim cell.text in
+  match cell.at with
+  | Into path -> (text <> "" && fill st path text) || (clear st path; text = "")
+  | After _ | Before _ -> text = ""
+
+(* Puts finished text at the cell, which moves on. A token that's already
+   next is stepped over instead. *)
+let step st cell ?token text =
+  let root = root st in
+  let stepped =
+    match token, cell.filled with
+    | Some token, next :: filled when next token -> Some (root, cell.at, filled)
+    | Some token, _ ->
+      attempt (fun () ->
+          match step_over root cell.at token with
+          | None -> special root cell.at token
+          | stepped -> stepped)
+    | None, _ -> None
   in
-  let fits (source, parsed, _, closing) =
-    match cell.wrapped, closing with
-    | Some w, Some closing -> still_wrapped source parsed {w with closing}
-    | Some w, None -> still_wrapped source parsed w
-    | None, _ -> true
+  let placed () =
+    attempt (fun () ->
+        match cell.at with
+        | Into _ -> place root cell.at text
+        | After _ | Before _ -> around root cell.at text)
   in
-  match List.find_map (fun f -> Option.bind (f ()) (fun c -> if fits c then Some c else None))
-          [step_over; insert; wrap] with
-  | Some (source, parsed, pos, closing) ->
-    st.source <- source;
-    st.parsed <- parsed;
-    Option.iter (fun w -> Option.iter (fun closing -> w.closing <- closing) closing) cell.wrapped;
-    arrive st cell pos;
-    (* Past the start of the wrapped node, it's no longer before it *)
-    Option.iter (fun w ->
-        if cell.stop > fst (wrapped_span source w) then cell.wrapped <- None)
-      cell.wrapped;
+  match if stepped <> None then stepped else placed () with
+  | Some (root, at, filled) ->
+    set st root;
+    cell.at <- at;
+    cell.filled <- filled;
     true
   | None -> false
 
@@ -425,7 +930,7 @@ let commit st cell ~all =
     cell.anchor <- cell.caret
   end;
   if finished <> [] then begin
-    ignore (place st cell cell.fallback);
+    (match cell.at with Into path -> clear st path | After _ | Before _ -> ());
     let last = List.fold_left (fun _ (_, _, stop) -> stop) 0 finished in
     let rec go = function
       | [] -> last
@@ -445,138 +950,134 @@ let commit st cell ~all =
 
 (* Backspace at the start of the cell takes apart what's before it. An empty
    item goes with the comma before it, into the end of the item before that.
-   Otherwise the token before and the smallest node around it and the cell
-   become the cell's text, without the token's last character. *)
+   Otherwise the smallest node with text before the cell, from the end of
+   which the last character goes, becomes the cell's text, around what's in
+   the cell. *)
 let melt st cell =
-  cell.wrapped <- None;
-  ignore (place st cell cell.fallback);
-  match token_before st.source cell.start with
-  | None -> ()
-  | Some (token, start, stop) ->
-    let rec around (node : Syntax.t) =
-      match List.find_opt (fun (child : Syntax.t) ->
-          child.start <= start && cell.stop <= child.stop) node.children with
-      | Some child -> around child
-      | None -> node
+  let root = root st in
+  let joined =
+    match cell.at with
+    | Into path when cell.text = "" ->
+      begin match slot root path with
+        | _, Some (parent, i) ->
+          let first = match list_of (get untyped root parent) with Some (_, first, _) -> first | None -> 0 in
+          i > first && refillable (print untyped (get untyped root path))
+          && begin match remove root parent i with
+            | root ->
+              let earlier = parent @ [i - 1] in
+              set st root;
+              cell.at <- Into earlier;
+              cell.filled <- [];
+              cell.text <- print untyped (get untyped root earlier);
+              cell.caret <- String.length cell.text;
+              true
+            | exception Invalid_argument _ -> false
+          end
+        | _, None -> false
+      end
+    | _ -> false
+  in
+  if not joined then begin
+    let path = path_of cell.at in
+    let rec around node_path =
+      let text, spans = print_spans untyped (get untyped root node_path) in
+      let start, stop = List.assoc (List.drop (List.length node_path) path) spans in
+      let before, after =
+        match cell.at with
+        | Into _ -> start, stop
+        | Before _ -> start, start
+        | After _ -> stop, stop
+      in
+      let prefix = String.trim (String.sub text 0 before) in
+      if prefix <> "" then Some (node_path, text, before, after)
+      else Option.bind (split node_path) (fun (parent, _) -> around parent)
     in
-    let node = around st.parsed.syntax in
-    let item =
-      List.find_opt (fun (child : Syntax.t) ->
-          child.start <= cell.start && cell.stop <= child.stop)
-        node.children
-    in
-    let earlier =
-      List.fold_left (fun found (child : Syntax.t) -> if child.stop <= start then Some child else found)
-        None node.children
-    in
-    let joined =
-      match token, item, earlier with
-      | Comma, Some item, Some earlier
-        when cell.text = "" && refillable (text_of st item) ->
-        let source = splice st.source start item.stop "" in
-        begin match parse source with
-          | parsed ->
-            st.source <- source;
-            st.parsed <- parsed;
-            cell.start <- earlier.start;
-            cell.stop <- earlier.stop;
-            cell.fallback <- fallback_for earlier;
-            cell.text <- text_of st earlier;
-            cell.caret <- String.length cell.text;
-            true
-          | exception Parsing.Syntax_error _ -> false
-        end
-      | _ -> false
-    in
-    if not joined then begin
-      let prefix = String.sub st.source node.start (stop - 1 - node.start) in
-      let suffix = String.sub st.source cell.stop (node.stop - cell.stop) in
+    let outer = match cell.at with After _ -> Some path | Into _ | Before _ -> Option.map fst (split path) in
+    match Option.bind outer around with
+    | None -> ()
+    | Some (node_path, text, before, after) ->
+      let rec trim_end n = if n > 0 && text.[n - 1] = ' ' then trim_end (n - 1) else n in
+      let prefix = String.sub text 0 (trim_end before - 1) in
+      let suffix = String.sub text after (String.length text - after) in
       cell.text <- prefix ^ cell.text ^ (if refillable suffix then "" else suffix);
       cell.caret <- String.length prefix;
-      cell.start <- node.start;
-      cell.stop <- node.stop;
-      cell.fallback <- fallback_for node
-    end;
-    cell.anchor <- cell.caret;
-    ignore (settle st cell)
+      cell.at <- Into node_path;
+      cell.filled <- []
+  end;
+  cell.anchor <- cell.caret;
+  ignore (settle st cell)
 
 (* Edits the selected node as text, all selected, so typing replaces it. A
    hole is edited empty. *)
 let edit st =
-  let node = selected st in
-  let text = if text_of st node = "_" then "" else text_of st node in
-  st.editing <- Some {
-      start = node.start;
-      stop = node.stop;
-      fallback = fallback_for node;
-      text;
-      anchor = 0;
-      caret = String.length text;
-      wrapped = None;
-      before = st.source;
-    };
+  let path = into (root st) st.cursor in
+  let node = get untyped (root st) path in
+  let text = if hole node then "" else print untyped node in
+  st.editing <- Some {at = Into path; text; anchor = 0; caret = String.length text; filled = [];
+                      origin = path; before = st.doc};
   st.message <- ""
 
 (* Edits at the start or end of the selected node. What's typed at the start
    wraps it, and at the end, extends it, like with a field or arguments. *)
 let insert st ~before =
-  let node = selected st in
-  if before && is_hole node then edit st
+  let node = get untyped (root st) st.cursor in
+  if before && hole node then edit st
   else begin
-    let pos = if before then node.start else node.stop in
-    let wrapped =
-      if not before then None
-      else
-        Some {form = node.form; length = node.stop - node.start; closing = 0;
-              rest = String.length st.source - node.stop}
-    in
-    st.editing <- Some {start = pos; stop = pos; fallback = ""; text = ""; anchor = 0; caret = 0;
-                        wrapped; before = st.source};
+    (* Around an entry's value *)
+    let path = match node with Entry (None, _) -> st.cursor @ [0] | _ -> st.cursor in
+    let at = if before then Before path else After path in
+    st.editing <- Some {at; text = ""; anchor = 0; caret = 0; filled = []; origin = st.cursor; before = st.doc};
     st.message <- ""
   end
 
+(* The holes, in order *)
+let holes root =
+  let rec go path node =
+    if hole node then [path]
+    else List.concat (List.mapi (fun i child -> go (path @ [i]) child) (children untyped node))
+  in
+  go [] root
+
+let rec is_prefix p q =
+  match p, q with
+  | [], _ -> true
+  | a :: p, b :: q -> a = b && is_prefix p q
+  | _ -> false
+
 (* Moves the cell to the next or previous hole, if there is one *)
 let to_hole st cell forward =
-  let holes = holes st in
+  let holes = holes (root st) in
+  let last p = List.fold_left (fun found h -> if p h then Some h else found) None holes in
   let target =
-    if forward then List.find_opt (fun h -> h >= cell.stop) holes
-    else List.fold_left (fun found h -> if h < cell.start then Some h else found) None holes
+    match cell.at, forward with
+    | Before p, true -> List.find_opt (fun h -> compare h p >= 0) holes
+    | (Into p | After p), true -> List.find_opt (fun h -> compare h p > 0 && not (is_prefix p h)) holes
+    | (Into p | Before p), false -> last (fun h -> compare h p < 0)
+    | After p, false -> last (fun h -> compare h p < 0 || is_prefix p h)
   in
   Option.iter (fun h ->
-      cell.wrapped <- None;
-      cell.start <- h;
-      cell.stop <- h + 1;
-      cell.fallback <- "_";
+      cell.at <- Into h;
+      cell.filled <- [];
       cell.text <- "";
       cell.anchor <- 0;
       cell.caret <- 0)
     target
 
 (* Stops editing, selecting the node that was edited, or that the cell was
-   after, or what the wrapped node was wrapped in. Text that doesn't fit is
-   dropped. *)
+   after, or what the node it was before was wrapped in. Text that doesn't fit
+   is dropped. *)
 let leave st cell =
   if not (commit st cell ~all:true) then begin
     cell.text <- "";
     ignore (settle st cell)
   end;
   st.editing <- None;
-  if st.source <> cell.before then begin
+  if st.doc <> cell.before then begin
     st.undo <- cell.before :: st.undo;
-    save st.source
+    save st
   end;
-  let path =
-    match cell.wrapped with
-    | Some w ->
-      let start, stop = wrapped_span st.source w in
-      (* What's typed went where the node started *)
-      let typed = String.length cell.before - w.rest - w.length in
-      if st.source = cell.before then path_to start stop st.parsed.syntax
-      else outermost_from typed stop st.parsed.syntax
-    | None when cell.start < cell.stop -> path_to cell.start cell.stop st.parsed.syntax
-    | None -> ending_at cell.start [] st.parsed.syntax
-  in
-  st.cursor <- valid st.parsed.syntax (Option.value path ~default:st.cursor)
+  let path = match cell.at with Into p | After p -> p | Before _ -> cell.origin in
+  st.cursor <- valid (root st) path
 
 (* Keys while editing, other than typing. Returns whether the key was used. *)
 let editing_key st cell key shift =
@@ -588,9 +1089,9 @@ let editing_key st cell key shift =
   match key with
   | "Enter" ->
     if finished () then begin
-      let before = cell.start in
+      let before = cell.at in
       to_hole st cell true;
-      if cell.start = before then leave st cell
+      if cell.at = before then leave st cell
     end;
     true
   | "Tab" -> if finished () then to_hole st cell (not shift); true
@@ -599,6 +1100,195 @@ let editing_key st cell key shift =
   | "Backspace" when at_start -> melt st cell; true
   | "Escape" -> leave st cell; true
   | _ -> false
+
+(* Changes to the program in normal mode *)
+
+let change st root cursor =
+  st.undo <- st.doc :: st.undo;
+  set st root;
+  st.cursor <- valid root cursor;
+  st.message <- "";
+  save st
+
+(* Rows are a record's entries, a match's clauses, a recur's accumulators,
+   and the bindings of a chain of lets, which can be rearranged *)
+let is_row = function Entry _ | Clause _ | Binding _ | Acc _ -> true | _ -> false
+
+(* The innermost row at or around the cursor *)
+let enclosing_row st =
+  let rec go path =
+    if is_row (get untyped (root st) path) then Some path
+    else Option.bind (split path) (fun (parent, _) -> go parent)
+  in
+  go st.cursor
+
+(* The paths of the rows before and after one. A binding's are the bindings
+   of the lets around and within its own. *)
+let neighbours root path =
+  let node = get untyped root path in
+  let parent_path, i = Option.get (split path) in
+  match node with
+  | Binding _ ->
+    let is_let path = form untyped (get untyped root path) = "let" in
+    let before =
+      match split parent_path with
+      | Some (outer, 1) when is_let outer -> Some (outer @ [0])
+      | _ -> None
+    in
+    let after = if is_let (parent_path @ [1]) then Some (parent_path @ [1; 0]) else None in
+    before, after
+  | _ ->
+    let rows =
+      List.concat (List.mapi (fun j child -> if form untyped child = form untyped node then [j] else [])
+                     (children untyped (get untyped root parent_path)))
+    in
+    let before = List.fold_left (fun acc j -> if j < i then Some j else acc) None rows in
+    let after = List.find_opt (fun j -> j > i) rows in
+    Option.map (fun j -> parent_path @ [j]) before, Option.map (fun j -> parent_path @ [j]) after
+
+(* Swaps the row around the cursor with the one before or after it *)
+let move_row st up =
+  match enclosing_row st with
+  | None -> st.message <- "not in a row"
+  | Some path ->
+    let root = root st in
+    let before, after = neighbours root path in
+    match if up then before else after with
+    | None -> ()
+    | Some other ->
+      let a = get untyped root path and b = get untyped root other in
+      match update (update root path (fun _ -> b)) other (fun _ -> a) with
+      | root -> change st root other
+      | exception Invalid_argument _ -> st.message <- "can't move this here"
+
+let expr_of = function E e -> e | _ -> invalid_arg "expr_of"
+
+(* Deletes a row. A binding goes with the rest of its let, leaving the let's
+   body. *)
+let delete_row st path =
+  let root = root st in
+  let parent, i = Option.get (split path) in
+  let node = get untyped root path in
+  match node with
+  | Binding _ -> change st (update root parent (fun _ -> get untyped root (parent @ [1]))) parent
+  | _ ->
+    match remove root parent i with
+    | exception Invalid_argument _ -> st.message <- "can't delete this"
+    | after ->
+      (* The next row, which takes its place, or else the one before *)
+      let is_row path = Option.map (form untyped) (find untyped after path) = Some (form untyped node) in
+      let cursor = List.find_opt is_row [path; parent @ [i - 1]] in
+      change st after (Option.value cursor ~default:parent)
+
+(* An item of holes, for a list read in a frame *)
+let template frame =
+  let* _, read = read frame (frame.prefix ^ frame.standin) in
+  let* _, items = frame.items read in
+  match items with [item] -> Some (strip_node item) | _ -> None
+
+(* Inserts a row of holes before or after the one around the cursor, and
+   edits its first hole *)
+let insert_row st after =
+  match enclosing_row st with
+  | None -> st.message <- "not in a row"
+  | Some path ->
+    let root = root st in
+    let parent, i = Option.get (split path) in
+    let fresh body = E {Expr.expr = Let {pat = wildcard; defn = hole_expr; body = expr_of body}; loc = ()} in
+    let inserted =
+      attempt (fun () ->
+          match get untyped root path with
+          | Binding _ ->
+            if after then Some (update root (parent @ [1]) fresh, parent @ [1; 0])
+            else Some (update root parent fresh, parent @ [0])
+          | _ ->
+            let* frame, _, _ = list_of (get untyped root parent) in
+            let* row = template frame in
+            let j = if after then i + 1 else i in
+            let root =
+              update root parent (fun node ->
+                  let cs = children untyped node in
+                  rebuild node (List.take j cs @ [row] @ List.drop j cs))
+            in
+            Some (root, parent @ [j]))
+    in
+    match inserted with
+    | None -> st.message <- "can't insert a row here"
+    | Some (root, row) ->
+      change st root row;
+      Option.iter (fun h -> st.cursor <- h)
+        (List.find_opt (is_prefix row) (holes (E st.doc)));
+      edit st
+
+(* Replaces the selected node with a hole, or removes it from its list *)
+let delete st =
+  let root = root st in
+  let path = st.cursor in
+  match get untyped root path with
+  | node when is_row node -> delete_row st path
+  | E _ -> change st (update root path (fun _ -> E hole_expr)) path
+  | P _ -> change st (update root path (fun _ -> P wildcard)) path
+  | Item _ | Using _ | Rest _ ->
+    let parent, i = Option.get (split path) in
+    begin match remove root parent i with
+      | root -> change st root parent
+      | exception Invalid_argument _ -> st.message <- "can't delete this"
+    end
+  | _ -> st.message <- "can't delete this"
+
+(* Drawing *)
+
+(* The type of a checked node, and what's wrong with it *)
+let type_of : checked -> Type.t option = function
+  | E e -> Some e.ty
+  | P p -> Some p.ty
+  | Lambda e -> Some e.ty
+  | _ -> None
+
+let problem node =
+  match type_of node with
+  | Some (Type.Error problem) -> Some (Type.describe problem)
+  | _ -> None
+
+(* Layout. Blocks span several lines; everything else is inline. *)
+let rec is_block node =
+  match form typed node with
+  | "let" | "abstract" | "recur" -> true
+  | "match" -> List.length (children typed node) > 2 || List.exists is_block (children typed node)
+  | _ -> List.exists is_block (children typed node)
+
+(* Where a block's lines break. Keywords like `in` and `->` end a line, and
+   separators start one, so a list in brackets is laid out as
+     { a
+     , b
+     }
+   Each break is before a child, or before the closing bracket. *)
+type break = Ends_line of bool | Starts_line of bool (* whether it's indented *)
+
+let line_break node i child =
+  let last = i = List.length (children typed node) - 1 in
+  let when_ cond break = if cond then Some break else None in
+  match form typed node with
+  | "let" | "abstract" -> when_ last (Ends_line false)
+  | "recur" -> when_ last (Ends_line true)
+  | "match" -> when_ (i > 0) (Starts_line true)
+  | "record" | "variant" -> when_ (i > 0) (Starts_line false)
+  | "apply" -> when_ (i > 1) (Starts_line false)
+  (* Other blocks can start on the same line, and break within *)
+  | _ -> when_ (last && List.mem (form typed child) ["let"; "abstract"]) (Ends_line true)
+
+let closing_break node =
+  match form typed node with
+  | "match" -> Some (Starts_line true)
+  | "record" | "variant" | "apply" -> Some (Starts_line false)
+  | _ -> None
+
+let text s = (doc##createTextNode (Js.string s) :> Dom.node Js.t)
+
+let trim_end s =
+  let n = ref (String.length s) in
+  while !n > 0 && s.[!n - 1] = ' ' do decr n done;
+  String.sub s 0 !n
 
 (* Set below, once drawing the whole workspace is defined *)
 let redraw = ref (fun () -> ())
@@ -612,37 +1302,30 @@ let value (s, title) =
   (el :> Dom.node Js.t)
 
 (* The values to show by path, and whether the cell has been put in yet *)
-type context = {values : (int list * (string * string)) list; mutable placed : bool}
+type context = {values : (path * (string * string)) list; mutable placed : bool}
 
-let rec render st ctx path (node : Syntax.t) : Dom.node Js.t =
+let rec render st ctx path (node : checked) : Dom.node Js.t =
   match st.editing with
-  | Some cell
-    when not ctx.placed && cell.start < cell.stop && node.start = cell.start && node.stop = cell.stop ->
+  | Some {at = Into p; _} when p = path ->
     ctx.placed <- true;
     (st.area :> Dom.node Js.t)
   | _ ->
     let block = is_block node in
     (* Inline, even for blocks, whose lines are divs within *)
     let el = Dom_html.createSpan doc in
-    let classes = ["node"; "form-" ^ node.form] in
+    let classes = ["node"; "form-" ^ form typed node] in
     let classes = if path = st.cursor && st.editing = None then "selected" :: classes else classes in
     let classes = if problem node <> None then "error" :: classes else classes in
     el##.className := Js.string (String.concat " " classes);
     Option.iter (fun msg -> el##.title := Js.string msg) (problem node);
-    el##.onclick := Dom_html.handler (fun ev ->
-        Dom_html.stopPropagation ev;
-        Option.iter (leave st) st.editing;
-        st.cursor <- valid st.parsed.syntax path;
-        st.message <- "";
-        !redraw ();
-        Js._false);
-    el##.ondblclick := Dom_html.handler (fun ev ->
-        Dom_html.stopPropagation ev;
-        Option.iter (leave st) st.editing;
-        st.cursor <- valid st.parsed.syntax path;
-        edit st;
-        !redraw ();
-        Js._false);
+    let select ev =
+      Dom_html.stopPropagation ev;
+      Option.iter (leave st) st.editing;
+      st.cursor <- path;
+      st.message <- ""
+    in
+    el##.onclick := Dom_html.handler (fun ev -> select ev; !redraw (); Js._false);
+    el##.ondblclick := Dom_html.handler (fun ev -> select ev; edit st; !redraw (); Js._false);
     let line = ref (el :> Dom.node Js.t) in
     let new_line indent =
       let div = Dom_html.createDiv doc in
@@ -661,249 +1344,81 @@ let rec render st ctx path (node : Syntax.t) : Dom.node Js.t =
       | Some (Starts_line indent) ->
         new_line indent;
         Dom.appendChild !line (text (String.trim gap ^ " "))
-      | None -> Dom.appendChild !line (text gap)
+      | None -> if gap <> "" then Dom.appendChild !line (text gap)
     in
-    (* A cell between nodes goes in the gap it's in, where the gap starts if
-       it's right after a node, or else where it ends *)
-    let put_around start stop gap break =
-      let at =
-        match st.editing with
-        | Some cell when not ctx.placed && cell.start = cell.stop && start <= cell.start && cell.start <= stop ->
-          ctx.placed <- true;
-          Some (cell.start = start)
-        | _ -> None
-      in
-      if at = Some true then Dom.appendChild !line st.area;
-      put gap break;
-      if at = Some false then Dom.appendChild !line st.area
+    let cell at =
+      match st.editing with
+      | Some cell when cell.at = at ->
+        ctx.placed <- true;
+        Dom.appendChild !line st.area
+      | _ -> ()
     in
     let breaks =
-      List.mapi (fun i child -> if block then line_break node i child else None) node.children
+      List.mapi (fun i child -> if block then line_break node i child else None) (children typed node)
     in
     (* Brackets go on their own lines only when what's between them does *)
-    let bracketed = List.exists (fun b -> b <> None) breaks && closing_break node <> None in
-    let pos = ref node.start in
-    List.iteri (fun i (child : Syntax.t) ->
-        let gap = between st.source !pos child.start in
-        let break = List.nth breaks i in
-        (* Space after an opening bracket, to line up with the separators *)
-        let gap =
-          if i = 0 && bracketed && String.trim gap <> "" then String.trim gap ^ " " else gap
-        in
-        put_around !pos child.start gap break;
-        Option.iter (fun v -> Dom.appendChild !line (value v)) (List.assoc_opt (path @ [i]) ctx.values);
-        Dom.appendChild !line (render st ctx (path @ [i]) child);
-        after_block := is_block child;
-        pos := child.stop)
-      node.children;
-    let gap = between st.source !pos node.stop in
-    if bracketed then put_around !pos node.stop (String.trim gap) (closing_break node)
-    else put_around !pos node.stop gap None;
+    let bracketed = List.exists Option.is_some breaks && closing_break node <> None in
+    let gap = Buffer.create 16 in
+    let take () = let g = Buffer.contents gap in Buffer.clear gap; g in
+    ignore (List.fold_left (fun i -> function
+        | Text t -> Buffer.add_string gap t; i
+        | Part child ->
+          let g = take () in
+          (* Space after an opening bracket, to line up with the separators *)
+          let g = if i = 0 && bracketed && String.trim g <> "" then String.trim g ^ " " else g in
+          put g (List.nth breaks i);
+          let p = path @ [i] in
+          cell (Before p);
+          Option.iter (fun v -> Dom.appendChild !line (value v)) (List.assoc_opt p ctx.values);
+          Dom.appendChild !line (render st ctx p child);
+          cell (After p);
+          after_block := is_block child;
+          i + 1)
+        0 (parts typed node));
+    let g = take () in
+    if bracketed then put (String.trim g) (closing_break node) else put g None;
     (el :> Dom.node Js.t)
-
-(* The source with each span replaced by its text, if it parses *)
-let reparse st edits =
-  (* Last first, so the earlier spans stay put *)
-  let edits = List.sort (fun (a, _, _) (b, _, _) -> Int.compare b a) edits in
-  let source = List.fold_left (fun source (start, stop, text) -> splice source start stop text) st.source edits in
-  match parse source with
-  | parsed -> Ok (source, parsed)
-  | exception Parsing.Syntax_error {pos; msg; _} -> Error (Parsing.describe source pos msg)
-
-let change st (source, (parsed : Parsing.result)) cursor =
-  st.undo <- st.source :: st.undo;
-  st.source <- source;
-  st.parsed <- parsed;
-  st.cursor <- valid parsed.syntax cursor;
-  st.message <- "";
-  save source
-
-(* Moves the cursor to the node with the span [select] in the result *)
-let rewrite st edits (start, stop) =
-  match reparse st edits with
-  | Ok ((_, parsed) as result) ->
-    change st result (Option.value (path_to start stop parsed.syntax) ~default:st.cursor);
-    true
-  | Error msg ->
-    st.message <- msg;
-    false
-
-(* Rows are a record's entries, a match's clauses, and the bindings of a
-   chain of lets, which can be rearranged *)
-let is_row (node : Syntax.t) = List.mem node.form ["entry"; "clause"; "binding"]
-
-let split_last path =
-  match List.rev path with
-  | last :: rest -> List.rev rest, last
-  | [] -> invalid_arg "split_last"
-
-(* The innermost row at or around the cursor *)
-let enclosing_row st =
-  let rec go path =
-    if is_row (node_at st path) then Some path
-    else if path = [] then None
-    else go (fst (split_last path))
-  in
-  go st.cursor
-
-(* The paths of the rows before and after one. A binding's are the bindings
-   of the lets around and within its own. *)
-let neighbours st path =
-  let node = node_at st path in
-  let parent_path, i = split_last path in
-  let parent = node_at st parent_path in
-  let last_child (node : Syntax.t) = List.length node.children - 1 in
-  match node.form with
-  | "binding" ->
-    let before =
-      if parent_path = [] then None
-      else
-        let outer_path, j = split_last parent_path in
-        let outer = node_at st outer_path in
-        if outer.form = "let" && j = last_child outer then Some (outer_path @ [0]) else None
-    in
-    let body = last_child parent in
-    let after =
-      if (List.nth parent.children body).form = "let" then Some (parent_path @ [body; 0]) else None
-    in
-    before, after
-  | _ ->
-    let rows =
-      List.concat (List.mapi (fun j (child : Syntax.t) ->
-          if child.form = node.form then [j] else [])
-          parent.children)
-    in
-    let before = List.fold_left (fun acc j -> if j < i then Some j else acc) None rows in
-    let after = List.find_opt (fun j -> j > i) rows in
-    Option.map (fun j -> parent_path @ [j]) before, Option.map (fun j -> parent_path @ [j]) after
-
-(* Swaps the row around the cursor with the one before or after it *)
-let move_row st up =
-  match enclosing_row st with
-  | None -> st.message <- "not in a row"
-  | Some path ->
-    let before, after = neighbours st path in
-    match if up then before else after with
-    | None -> ()
-    | Some other ->
-      let node = node_at st path and other = node_at st other in
-      let a, b = if up then other, node else node, other in
-      let length (n : Syntax.t) = n.stop - n.start in
-      (* Where the moved row ends up *)
-      let start = if up then a.start else a.start + length b + (b.start - a.stop) in
-      ignore (rewrite st
-                [a.start, a.stop, text_of st b; b.start, b.stop, text_of st a]
-                (start, start + length node))
-
-(* Deletes a row. An entry or clause goes with the comma on one side of it,
-   and a binding with the rest of its let, leaving the let's body. *)
-let delete_row st path =
-  let node = node_at st path in
-  let parent_path, i = split_last path in
-  match node.form with
-  | "binding" ->
-    let parent = node_at st parent_path in
-    let body = List.nth parent.children (List.length parent.children - 1) in
-    ignore (rewrite st [parent.start, parent.stop, text_of st body]
-              (parent.start, parent.start + body.stop - body.start))
-  | _ ->
-    let source = st.source in
-    let after = Parsing.skip source node.stop in
-    let rec back pos =
-      if pos > 0 && String.contains " \t\r\n" source.[pos - 1] then back (pos - 1) else pos
-    in
-    let start, stop =
-      if after < String.length source && source.[after] = ',' then
-        node.start, Parsing.skip source (after + 1)
-      else
-        let before = back node.start in
-        if before > 0 && source.[before - 1] = ',' then before - 1, node.stop
-        else node.start, node.stop
-    in
-    match reparse st [start, stop, ""] with
-    | Error msg -> st.message <- msg
-    | Ok ((_, parsed) as result) ->
-      (* The next row, which takes its place, or else the one before *)
-      let is_row path =
-        match find parsed.syntax path with
-        | Some n -> n.form = node.form
-        | None -> false
-      in
-      let cursor = List.find_opt is_row [path; parent_path @ [i - 1]] in
-      change st result (Option.value cursor ~default:parent_path)
-
-(* Inserts a row of holes before or after the one around the cursor, and
-   edits its first hole *)
-let insert_row st after =
-  match enclosing_row st with
-  | None -> st.message <- "not in a row"
-  | Some path ->
-    let node = node_at st path in
-    let template = match node.form with "clause" -> "_ -> _" | "binding" -> "_ = _" | _ -> "_" in
-    let pos, text, offset =
-      match node.form with
-      | "binding" ->
-        let parent = node_at st (fst (split_last path)) in
-        let body = List.nth parent.children (List.length parent.children - 1) in
-        (if after then body.start else parent.start), "let " ^ template ^ " in ", 4
-      | _ -> if after then node.stop, ", " ^ template, 2 else node.start, template ^ ", ", 0
-    in
-    let start = pos + offset in
-    if rewrite st [pos, pos, text] (start, start + 1) then edit st
-
-let parse_or_hole source =
-  match parse source with
-  | parsed -> source, parsed
-  | exception Parsing.Syntax_error _ -> "_", parse "_"
 
 (* The values bound by the program's top-level lets, and the value of the
    whole program, by the paths of the bindings and the final body. Each has
    a tooltip, which for the whole program includes its type. *)
-let values st =
+let values (program : unit Type.expr) =
   let show_bound env env' =
     let bound = List.filteri (fun i _ -> i < List.length env' - List.length env) env' in
     String.concat ", " (List.rev_map (fun (name, v) -> name ^ " = " ^ Runtime.show v) bound)
   in
-  let rec bindings env path (node : Syntax.t) =
-    match node.form, node.info with
-    | "let", Expr {expr = Let {pat; defn; _}; _} ->
+  let rec bindings env path (e : unit Type.expr) =
+    match e.expr with
+    | Let {pat; defn; body} ->
       begin match Runtime.define env pat defn with
-        | Some env' -> (path @ [0], show_bound env env') :: bindings env' (path @ [1]) (List.nth node.children 1)
+        | Some env' -> (path @ [0], show_bound env env') :: bindings env' (path @ [1]) body
         | None -> []
       end
-    | "abstract", _ -> bindings env (path @ [0]) (List.hd node.children)
+    | Abstract (_, body) -> bindings env (path @ [0]) body
     | _ -> []
   in
-  let rec body path (node : Syntax.t) =
-    match node.form with
-    | "let" -> body (path @ [1]) (List.nth node.children 1)
-    | "abstract" -> body (path @ [0]) (List.hd node.children)
+  let rec body path (e : unit Type.expr) =
+    match e.expr with
+    | Let {body = b; _} -> body (path @ [1]) b
+    | Abstract (_, b) -> body (path @ [0]) b
     | _ -> path
   in
-  let expr = st.parsed.expr in
   let result =
-    match Runtime.show (Runtime.eval prelude.env expr) with
-    | value -> value, Printf.sprintf "the %s %s" (Type.show expr.ty) value
+    match Runtime.show (Runtime.eval prelude.env program) with
+    | value -> value, Printf.sprintf "the %s %s" (Type.show program.ty) value
     | exception e -> let msg = "evaluation failed: " ^ Printexc.to_string e in msg, msg
   in
-  match st.parsed.syntax.children with
-  | [program] ->
-    let bound = List.filter (fun (_, v) -> v <> "") (bindings prelude.env [0] program) in
-    (body [0] program, result) :: List.map (fun (path, v) -> path, (v, v)) bound
-  | _ -> []
+  let bound = List.filter (fun (_, v) -> v <> "") (bindings prelude.env [] program) in
+  (body [] program, result) :: List.map (fun (path, v) -> path, (v, v)) bound
 
-let output st =
-  String.concat "\n" (List.filter (( <> ) "") [prelude_error; describe_errors st.source st.parsed.errors])
+let output errors =
+  String.concat "\n"
+    (List.filter (( <> ) "") (prelude_error :: List.map (fun (_, problem) -> Type.describe problem) errors))
 
-(* The selected node, or while editing, the cell's node or the node it's after *)
-let status st =
-  let path =
-    match st.editing with
-    | Some cell when cell.start < cell.stop -> path_to cell.start cell.stop st.parsed.syntax
-    | Some cell -> ending_at cell.start [] st.parsed.syntax
-    | None -> Some st.cursor
-  in
-  let node = node_at st (Option.value path ~default:[]) in
+(* The selected node, or while editing, the cell's node *)
+let status st root =
+  let path = match st.editing with Some cell -> path_of cell.at | None -> st.cursor in
+  let node = Option.value (find typed root path) ~default:root in
   let ty =
     match type_of node with
     | Some ty when not (Type.is_error ty) -> " : " ^ Type.show ty
@@ -911,7 +1426,7 @@ let status st =
   in
   let problem = Option.fold ~none:"" ~some:(fun msg -> " - " ^ msg) (problem node) in
   let message = if st.message = "" then "" else "\n" ^ st.message in
-  node.form ^ ty ^ problem ^ message
+  form typed node ^ ty ^ problem ^ message
 
 (* The cell's text and selection, as the browser has them *)
 let read_cell st cell =
@@ -951,10 +1466,22 @@ let show_cell st cell =
   selection##addRange range
 
 let draw st =
+  let program, errors = check ~vars:prelude.vars st.doc in
+  let root = E program in
   let editor = Dom_html.getElementById "editor" in
   editor##.innerHTML := Js.string "";
-  let ctx = {values = values st; placed = false} in
-  Dom.appendChild editor (render st ctx [] st.parsed.syntax);
+  let ctx = {values = values program; placed = false} in
+  let cell at =
+    match st.editing with
+    | Some cell when cell.at = at ->
+      ctx.placed <- true;
+      Dom.appendChild editor st.area
+    | _ -> ()
+  in
+  Option.iter (fun v -> Dom.appendChild editor (value v)) (List.assoc_opt [] ctx.values);
+  cell (Before []);
+  Dom.appendChild editor (render st ctx [] root);
+  cell (After []);
   if st.editing <> None && not ctx.placed then Dom.appendChild editor st.area;
   (* The gutter is as wide as the widest value, up to a limit *)
   let values = Dom.list_of_nodeList (editor##querySelectorAll (Js.string ".value")) in
@@ -962,15 +1489,12 @@ let draw st =
   List.iter (fun (v : Dom_html.element Js.t) -> v##.style##.width := Js.string (Printf.sprintf "%dpx" width)) values;
   editor##.style##.paddingRight := Js.string (Printf.sprintf "calc(%dpx + 3ch)" width);
   let set id s = (Dom_html.getElementById id)##.textContent := Js.some (Js.string s) in
-  set "status" (status st);
-  set "output" (output st);
-  set "source" st.source;
+  set "status" (status st root);
+  set "output" (output errors);
+  set "source" (print untyped (E st.doc));
   Option.iter (show_cell st) st.editing
 
-let move st path =
-  match find st.parsed.syntax path with
-  | Some _ -> st.cursor <- path
-  | None -> ()
+let move st path = if find untyped (root st) path <> None then st.cursor <- path
 
 let normal_key st key =
   let last = List.length st.cursor - 1 in
@@ -988,38 +1512,33 @@ let normal_key st key =
   | "Enter" | "i" -> edit st; true
   | "I" -> insert st ~before:true; true
   | "A" -> insert st ~before:false; true
-  | "d" | "Delete" | "Backspace" ->
-    let node = selected st in
-    if is_row node then delete_row st st.cursor
-    else ignore (rewrite st [node.start, node.stop, "_"] (node.start, node.start + 1));
-    true
+  | "d" | "Delete" | "Backspace" -> delete st; true
   | "K" -> move_row st true; true
   | "J" -> move_row st false; true
   | "o" -> insert_row st true; true
   | "O" -> insert_row st false; true
   | "u" ->
     begin match st.undo with
-      | source :: rest ->
-        let source, parsed = parse_or_hole source in
-        st.source <- source;
-        st.parsed <- parsed;
+      | previous :: rest ->
+        st.doc <- previous;
         st.undo <- rest;
-        st.cursor <- valid parsed.syntax st.cursor
+        st.cursor <- valid (root st) st.cursor;
+        save st
       | [] -> st.message <- "nothing to undo"
     end;
     true
   | _ -> false
 
 let () =
-  let source, parsed =
-    parse_or_hole (Option.value (load ()) ~default:"let id(x) = x in id(#hello)")
+  let program =
+    let source = Option.value (load ()) ~default:"let id(x) = x in id(#hello)" in
+    try strip (Parsing.parse source) with Parsing.Syntax_error _ -> hole_expr
   in
   let area = Dom_html.createSpan doc in
   area##.className := Js.string "cell";
   area##setAttribute (Js.string "contenteditable") (Js.string "plaintext-only");
   area##setAttribute (Js.string "spellcheck") (Js.string "false");
-  let st = {source; parsed; cursor = []; editing = None; message = ""; undo = []; area} in
-  st.cursor <- valid parsed.syntax [0];
+  let st = {doc = program; cursor = []; editing = None; message = ""; undo = []; area} in
   redraw := (fun () -> draw st);
   let composing ev = Js.to_bool (Js.Unsafe.coerce ev)##.isComposing in
   (* Typing finishes tokens, but deleting doesn't, so they can be changed *)

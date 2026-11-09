@@ -40,12 +40,15 @@ module Pat = struct
   (* Patterns as read, at a location ['loc] of the front end's choosing *)
   type 'loc untyped = {pat : 'loc untyped t; loc : 'loc}
 
-  (* Applies [f] to each subpattern *)
-  let iter f = function
-    | Record {fields; _} | Variant (_, fields) -> List.iter (fun (_, p) -> f p) fields
-    | Roll p | The (_, p) -> f p
-    | Or (p, q) -> f p; f q
-    | Var _ | Wildcard -> ()
+  (* The shape with [f] applied to each subpattern *)
+  let map f = function
+    | Var name -> Var name
+    | Wildcard -> Wildcard
+    | Record {fields; rest} -> Record {fields = List.map (fun (name, p) -> name, f p) fields; rest}
+    | Variant (tag, fields) -> Variant (tag, List.map (fun (name, p) -> name, f p) fields)
+    | Roll p -> Roll (f p)
+    | Or (p, q) -> Or (f p, f q)
+    | The (ann, p) -> The (ann, f p)
 end
 
 (* The shapes of expressions, whose subexpressions are ['e] and patterns
@@ -97,24 +100,28 @@ module Expr = struct
   (* Expressions as read, at a location ['loc] of the front end's choosing *)
   type 'loc untyped = {expr : ('loc untyped, 'loc Pat.untyped) t; loc : 'loc}
 
-  (* Applies [e] to each subexpression and [p] to each pattern *)
-  let iter e p = function
-    | Record {fields; rest} -> List.iter (fun (_, x) -> e x) fields; Option.iter e rest
-    | Field (x, _) | Roll x | The (_, x) | Abstract (_, x) -> e x
-    | Variant (_, fields) -> List.iter (fun (_, x) -> e x) fields
-    | Match (x, clauses) -> e x; List.iter (fun (q, x) -> p q; e x) clauses
+  (* The shape with [e] applied to each subexpression and [p] to each
+     pattern *)
+  let map e p =
+    let fields f = List.map (fun (name, x) -> name, f x) in
+    function
+    | Record {fields = fs; rest} -> Record {fields = fields e fs; rest = Option.map e rest}
+    | Field (x, name) -> Field (e x, name)
+    | Variant (tag, fs) -> Variant (tag, fields e fs)
+    | Match (x, clauses) -> Match (e x, List.map (fun (q, x) -> p q, e x) clauses)
     | Function {params; deps; body} ->
-      List.iter (fun (_, q) -> p q) params;
-      Option.iter p deps;
-      e body
-    | Apply {f; args; deps} -> e f; List.iter (fun (_, x) -> e x) args; Option.iter e deps
-    | Let {pat; defn; body} -> p pat; e defn; e body
-    | Recur {root; input; accs; body; _} ->
-      p root;
-      e input;
-      List.iter (fun (q, x) -> p q; e x) accs;
-      e body
-    | Dep _ | Var _ | Hole -> ()
+      Function {params = fields p params; deps = Option.map p deps; body = e body}
+    | Apply {f; args; deps} -> Apply {f = e f; args = fields e args; deps = Option.map e deps}
+    | Dep name -> Dep name
+    | Var name -> Var name
+    | Let {pat; defn; body} -> Let {pat = p pat; defn = e defn; body = e body}
+    | Roll x -> Roll (e x)
+    | Recur {continue; forget; root; input; accs; body} ->
+      Recur {continue; forget; root = p root; input = e input;
+             accs = List.map (fun (q, x) -> p q, e x) accs; body = e body}
+    | The (ann, x) -> The (ann, e x)
+    | Abstract (name, x) -> Abstract (name, e x)
+    | Hole -> Hole
 end
 
 (* Types, and checking programs: the typed tree, and the checker that builds
@@ -1168,38 +1175,10 @@ module Type = struct
     e
 end
 
-(* The concrete syntax tree, for the editor: each construct's [form], like
-   "let" or "match", with the node it was read as, its span in the
-   source, and the constructs within it. Keywords and punctuation are in the
-   text between the children's spans. The sugar `let f(x) = e` and
-   `.f(x) = e` has no node for the function, so its parameters and body are
-   the binding's or the field's.
-
-   Some nodes are rows, which the editor can rearrange: a record's entries,
-   a match's clauses, and a let's binding, `p = e` without the body. *)
-module Syntax = struct
-  (* Where a node was in the source, from its start to its stop. Every
-     construct has tokens of its own, so no two nodes of a kind have the
-     same span. *)
+module Parsing = struct
+  (* Where a node was in the source, from its start to its stop *)
   type span = int * int
 
-  type 'info node = {
-    form : string;
-    info : 'info;
-    start : int;
-    stop : int;
-    children : 'info node list
-  }
-
-  type info = Expr of span Type.expr | Pat of span Type.pat | Other
-
-  type t = info node
-
-  let rec map f node =
-    {node with info = f node.info; children = List.map (map f) node.children}
-end
-
-module Parsing = struct
   type token =
       Let
     | In
@@ -1370,16 +1349,9 @@ module Parsing = struct
     | '\000' when pos >= String.length input -> EOF, pos
     | c -> fail pos (Printf.sprintf "unexpected character '%c'" c)
 
-  type result = {
-    expr : Syntax.span Type.expr;
-    errors : (Syntax.span * Type.error) list; (* in order *)
-    syntax : Syntax.t
-  }
-
-  (* Parses a program, then checks it with [vars] in scope. A syntax error
-     stops parsing with Syntax_error, but type errors are marked in the tree,
-     which goes on being checked. *)
-  let parse ?vars input =
+  (* The grammar, reading [input]: an expression, a pattern, and a type, each
+     of the whole input. A syntax error stops reading with Syntax_error. *)
+  let grammar input =
     let tokenize = tokenize input in
     let fail ?expected pos = fail ?expected (skip input pos) in
 
@@ -1394,45 +1366,23 @@ module Parsing = struct
       | _ -> unexpected ~expected:(string_of_token token) pos
     in
 
-    (* Each node adopts the nodes recorded since its start as its children.
-       Its info is the span of the node of the program it was read as. *)
-    let nodes = ref [] in
-    let node form info start stop =
-      let rec adopt children = function
-        | (n : _ Syntax.node) :: rest when n.start >= start -> adopt (n :: children) rest
-        | rest -> children, rest
-      in
-      let children, rest = adopt [] !nodes in
-      nodes := {Syntax.form; info; start; stop; children} :: rest
-    in
-    let make expr start stop = {Expr.expr; loc = (start, stop)} in
-    (* Records a node of the program, and goes on after it *)
-    let enode form expr start stop =
-      node form (`Expr (start, stop)) start stop;
-      make expr start stop, stop
-    in
-    let pnode form pat start stop =
-      node form (`Pat (start, stop)) start stop;
-      {Pat.pat; loc = (start, stop)}, stop
-    in
+    let enode expr start stop = {Expr.expr; loc = (start, stop)}, stop in
+    let pnode pat start stop = {Pat.pat; loc = (start, stop)}, stop in
 
     (* Comma separated, up to [closer]: positional items, `.name <sep> item`,
-       `.name(params) <sep> body` given [func], `..rest`, and `using item`.
-       Named items are nodes, and given a [row] form, positional ones are too. *)
-    let sequence ?func ?rest ?using ?(row = "item") ~sep item closer pos =
+       `.name(params) <sep> body` given [func], `..rest`, and `using item` *)
+    let sequence ?func ?rest ?using ~sep item closer pos =
       let rec aux i fields tail deps pos =
         let i, fields, tail, deps, pos =
           match tokenize pos, rest, using with
           | (Field name, next), _, _ ->
             if List.mem_assoc name fields then
               fail pos "duplicate field";
-            let start = skip input pos in
             let x, pos =
               match tokenize next, func with
               | (LeftParen, _), Some func -> func next
               | _ -> item (expect sep next)
             in
-            node row `Other start pos;
             i, (name, x) :: fields, tail, deps, pos
           | (DotDot, next), Some rest, _ ->
             let x, pos = rest next in
@@ -1441,9 +1391,7 @@ module Parsing = struct
             let x, pos = using next in
             i, fields, tail, Some x, pos
           | _ ->
-            let start = skip input pos in
             let x, pos = item pos in
-            if row <> "item" then node row `Other start pos;
             i+1, (label i, x) :: fields, tail, deps, pos
         in
         match tokenize pos with
@@ -1511,52 +1459,43 @@ module Parsing = struct
       | _ -> unexpected pos
     in
 
-    let annotation pos =
-      let start = skip input pos in
-      let ty, pos = type_expr pos in
-      node "type" `Other start pos;
-      ty, pos
-    in
-
     let rec pattern pos =
       let start = skip input pos in
       let p, pos = atomic_pattern pos in
       match tokenize pos with
       | Or, next ->
         let q, next = pattern next in
-        pnode "or" (Pat.Or (p, q)) start next
+        pnode (Pat.Or (p, q)) start next
       | _ -> p, pos
 
     and atomic_pattern pos =
       let start = skip input pos in
       match tokenize pos with
-      | Ident name, next -> pnode "var" (Pat.Var name) start next
-      | Underscore, next -> pnode "wildcard" Pat.Wildcard start next
+      | Ident name, next -> pnode (Pat.Var name) start next
+      | Underscore, next -> pnode Pat.Wildcard start next
 
       | LeftParen, next ->
         let p, pos = pattern next in
-        let next = expect RightParen pos in
-        node "parens" (`Pat p.loc) start next;
-        p, next
+        p, expect RightParen pos
 
       | LeftCurly, next ->
         let fields, rest, _, pos =
-          sequence ~rest:(fun pos -> (), pos) ~row:"entry" ~sep:Equal pattern RightCurly next
+          sequence ~rest:(fun pos -> (), pos) ~sep:Equal pattern RightCurly next
         in
-        pnode "record" (Pat.Record {fields; rest = rest <> None}) start pos
+        pnode (Pat.Record {fields; rest = rest <> None}) start pos
 
       | Tag tag, next ->
         let fields, pos = payload pattern next in
-        pnode "variant" (Pat.Variant (tag, fields)) start pos
+        pnode (Pat.Variant (tag, fields)) start pos
 
       | Ampersand, next ->
         let p, pos = atomic_pattern next in
-        pnode "roll" (Pat.Roll p) start pos
+        pnode (Pat.Roll p) start pos
 
       | The, next ->
-        let ty, pos = annotation next in
+        let ty, pos = type_expr next in
         let p, next = pattern pos in
-        pnode "the" (Pat.The (ty, p)) start next
+        pnode (Pat.The (ty, p)) start next
 
       | _ -> unexpected ~expected:"_" pos
     in
@@ -1578,68 +1517,59 @@ module Parsing = struct
     and compound_expr ?(matches = true) start left pos =
       let continue ?(matches = matches) (e, next) = compound_expr ~matches start e next in
       match tokenize pos with
-      | Field name, next -> continue (enode "field" (Expr.Field (left, name)) start next)
+      | Field name, next -> continue (enode (Expr.Field (left, name)) start next)
 
       | LeftParen, next ->
         let args, _, deps, next = sequence ~using:expr ~sep:Equal expr RightParen next in
-        continue (enode "apply" (Expr.Apply {f = left; args; deps}) start next)
+        continue (enode (Expr.Apply {f = left; args; deps}) start next)
 
       | LeftSquare, next when matches ->
         let clause pos =
-          let clause_start = skip input pos in
           let pat, pos = pattern pos in
           let body, next = expr (expect Arrow pos) in
-          node "clause" `Other clause_start next;
           (pat, body), next
         in
         let clauses, _, _, next = sequence ~sep:Equal clause RightSquare next in
-        continue ~matches:true (enode "match" (Expr.Match (left, List.map snd clauses)) start next)
+        continue ~matches:true (enode (Expr.Match (left, List.map snd clauses)) start next)
 
       | _ -> left, pos
 
     and atomic_expr pos =
       let start = skip input pos in
       match tokenize pos with
-      | Ident name, next -> enode "var" (Expr.Var name) start next
-      | Underscore, next -> enode "hole" Expr.Hole start next
-      | Dep name, next -> enode "dep" (Expr.Dep name) start next
+      | Ident name, next -> enode (Expr.Var name) start next
+      | Underscore, next -> enode Expr.Hole start next
+      | Dep name, next -> enode (Expr.Dep name) start next
 
       | LeftParen, next ->
         let e, pos = expr next in
-        let next = expect RightParen pos in
-        node "parens" (`Expr e.loc) start next;
-        e, next
+        e, expect RightParen pos
 
       | Let, next ->
-        let binding = skip input next in
         let pat, pos = pattern next in
         let defn, next =
           match pat.pat, tokenize pos with
           | Pat.Var _, (LeftParen, _) -> lambda Equal pos (* `let f(x) = e` *)
           | _ -> expr (expect Equal pos)
         in
-        node "binding" `Other binding next;
         let body, next = expr (expect In next) in
-        enode "let" (Expr.Let {pat; defn; body}) start next
+        enode (Expr.Let {pat; defn; body}) start next
 
-      | Fun, next ->
-        let e, next = lambda ~start Arrow next in
-        node "fun" (`Expr e.loc) start next;
-        e, next
+      | Fun, next -> lambda ~start Arrow next
 
       | LeftCurly, next ->
         let fields, rest, _, next =
-          sequence ~func:(lambda Equal) ~rest:expr ~row:"entry" ~sep:Equal expr RightCurly next
+          sequence ~func:(lambda Equal) ~rest:expr ~sep:Equal expr RightCurly next
         in
-        enode "record" (Expr.Record {fields; rest}) start next
+        enode (Expr.Record {fields; rest}) start next
 
       | Tag tag, next ->
         let fields, next = payload expr next in
-        enode "variant" (Expr.Variant (tag, fields)) start next
+        enode (Expr.Variant (tag, fields)) start next
 
       | Ampersand, next ->
         let e, next = operand next in
-        enode "roll" (Expr.Roll e) start next
+        enode (Expr.Roll e) start next
 
       | Recur, next -> recur start (expect LeftParen next)
 
@@ -1647,20 +1577,20 @@ module Parsing = struct
         begin match tokenize next with
           | Ident name, next ->
             let body, next = expr (expect In next) in
-            enode "abstract" (Expr.Abstract (name, body)) start next
+            enode (Expr.Abstract (name, body)) start next
           | _ -> unexpected next
         end
 
       | The, next ->
-        let ty, pos = annotation next in
+        let ty, pos = type_expr next in
         let e, next = operand pos in
-        enode "the" (Expr.The (ty, e)) start next
+        enode (Expr.The (ty, e)) start next
 
       | _ -> unexpected ~expected:"_" pos
 
     (* `(params) <arrow> body`: [arrow] is `->` after `fun`, and `=` in the
-       sugar `let f(x) = e` and `{.f(x) = e}`, where the function has no node
-       of its own, but is located from its parameters *)
+       sugar `let f(x) = e` and `{.f(x) = e}`, where the function is located
+       from its parameters *)
     and lambda ?start arrow pos =
       let params_start = skip input pos in
       let params, _, deps, pos =
@@ -1668,7 +1598,7 @@ module Parsing = struct
       in
       let body, next = expr (expect arrow pos) in
       let start = Option.value start ~default:params_start in
-      make (Expr.Function {params; deps; body}) start next, next
+      enode (Expr.Function {params; deps; body}) start next
 
     (* `recur (p <- e, acc = init, ...) do body` *)
     and recur start pos =
@@ -1686,34 +1616,20 @@ module Parsing = struct
       in
       let accs, pos = accs pos in
       let body, next = expr (expect Do pos) in
-      enode "recur" (Expr.Recur {continue = "continue"; forget = "forget"; root; input; accs; body}) start next
+      enode (Expr.Recur {continue = "continue"; forget = "forget"; root; input; accs; body}) start next
     in
 
-    let expr, pos = expr 0 in
-    match tokenize pos with
-    | EOF, _ ->
-      let errors = ref [] in
-      let expr = Type.program ?vars (fun loc problem -> errors := (loc, problem) :: !errors) expr in
-      let errors = List.stable_sort (fun ((a, _), _) ((b, _), _) -> Int.compare a b) (List.rev !errors) in
-      (* The typed nodes, by span *)
-      let exprs = Hashtbl.create 64 and pats = Hashtbl.create 64 in
-      let rec visit (e : _ Type.expr) =
-        Hashtbl.replace exprs e.loc e;
-        Expr.iter visit pvisit e.expr
-      and pvisit (p : _ Type.pat) =
-        Hashtbl.replace pats p.loc p;
-        Pat.iter pvisit p.pat
-      in
-      visit expr;
-      let typed = function
-        | `Expr span -> Syntax.Expr (Hashtbl.find exprs span)
-        | `Pat span -> Syntax.Pat (Hashtbl.find pats span)
-        | `Other -> Syntax.Other
-      in
-      let stop = String.length input in
-      let syntax = {Syntax.form = "program"; info = `Other; start = 0; stop; children = !nodes} in
-      {expr; errors; syntax = Syntax.map typed syntax}
-    | _ -> unexpected pos
+    let whole read () =
+      let x, pos = read 0 in
+      match tokenize pos with
+      | EOF, _ -> x
+      | _ -> unexpected pos
+    in
+    whole expr, whole pattern, whole type_expr
+
+  let parse input = let expr, _, _ = grammar input in expr ()
+  let parse_pattern input = let _, pattern, _ = grammar input in pattern ()
+  let parse_type input = let _, _, ty = grammar input in ty ()
 end
 
 module Runtime : sig
@@ -1877,17 +1793,25 @@ end
    fields of the prelude, which must be a record *)
 type prelude = {vars : (string * Type.t) list; env : (string * Runtime.value) list}
 
+(* Checks a program, with its type errors as they're found *)
+let check ?vars e =
+  let errors = ref [] in
+  let e = Type.program ?vars (fun loc problem -> errors := (loc, problem) :: !errors) e in
+  e, List.rev !errors
+
+(* Errors in source code, in order *)
 let describe_errors code errors =
+  let errors = List.stable_sort (fun ((a, _), _) ((b, _), _) -> Int.compare a b) errors in
   String.concat "\n" (List.map (fun ((pos, _), problem) ->
       Parsing.describe code pos (Type.describe problem))
       errors)
 
 let load_prelude source =
-  match Parsing.parse source with
+  match check (Parsing.parse source) with
   | exception Parsing.Syntax_error {pos; msg; _} ->
     Error ("in the prelude, " ^ Parsing.describe source pos msg)
-  | {errors = _ :: _ as errors; _} -> Error ("in the prelude, " ^ describe_errors source errors)
-  | {expr; _} ->
+  | _, (_ :: _ as errors) -> Error ("in the prelude, " ^ describe_errors source errors)
+  | expr, [] ->
     match Type.prune expr.ty with
     | Record {fields; _} ->
       let value = Runtime.eval [] expr in
@@ -1895,8 +1819,7 @@ let load_prelude source =
     | ty -> Error ("the prelude must be a record, but it's a " ^ Type.show ty)
 
 let run prelude code =
-  match Parsing.parse ~vars:prelude.vars code with
+  match check ~vars:prelude.vars (Parsing.parse code) with
   | exception Parsing.Syntax_error {pos; msg; _} -> Error (Parsing.describe code pos msg)
-  | {expr = e; errors = []; _} ->
-    Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show (Runtime.eval prelude.env e)))
-  | {errors; _} -> Error (describe_errors code errors)
+  | e, [] -> Ok (Printf.sprintf "the %s %s" (Type.show e.ty) (Runtime.show (Runtime.eval prelude.env e)))
+  | _, errors -> Error (describe_errors code errors)
