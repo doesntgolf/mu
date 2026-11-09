@@ -16,8 +16,8 @@ environment.
 
 **Status:** The language design is still somewhat in flux. The bootstrapping type checker
 and interpreter in OCaml is still in the beginning stages. The parser reads a program into
-a tree, which the type checker then walks, setting each node's type; another front end,
-like an editor holding a tree, could build the tree just as well. `make` builds
+an untyped tree, from which the type checker builds a typed one; another front end, like
+an editor holding a tree, could build the untyped tree just as well. `make` builds
 `mu`, the command-line interpreter, and `workspace.js` for the editing environment
 prototype in `index.html`, using `ocamlfind` and `js_of_ocaml`. `make test` runs the tests.
 Both load the prelude in `prelude.ml`: a Mu record, as an OCaml string, whose fields are

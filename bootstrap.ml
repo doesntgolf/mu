@@ -36,6 +36,16 @@ module Pat = struct
     | Roll of 'p
     | Or of 'p * 'p
     | The of Annot.t * 'p
+
+  (* Patterns as read, at a location ['loc] of the front end's choosing *)
+  type 'loc untyped = {pat : 'loc untyped t; loc : 'loc}
+
+  (* Applies [f] to each subpattern *)
+  let iter f = function
+    | Record {fields; _} | Variant (_, fields) -> List.iter (fun (_, p) -> f p) fields
+    | Roll p | The (_, p) -> f p
+    | Or (p, q) -> f p; f q
+    | Var _ | Wildcard -> ()
 end
 
 (* The shapes of expressions, whose subexpressions are ['e] and patterns
@@ -68,13 +78,14 @@ module Expr = struct
       }
 
     | Roll of 'e
-    (* `recur (p <- e, ...) do body`: [params] start with `&p`, and body sees
-       [continue] and [forget] *)
+    (* `recur (p <- e, acc = init, ...) do body`, where p matches [root] and
+       body sees [continue] and [forget] *)
     | Recur of {
         continue : string;
         forget : string;
-        params : (string * 'p) list;
-        args : (string * 'e) list;
+        root : 'p;
+        input : 'e;
+        accs : ('p * 'e) list;
         body : 'e
       }
 
@@ -82,10 +93,32 @@ module Expr = struct
     | Abstract of string * 'e (* `abstract t in e` *)
 
     | Hole (* `_` *)
+
+  (* Expressions as read, at a location ['loc] of the front end's choosing *)
+  type 'loc untyped = {expr : ('loc untyped, 'loc Pat.untyped) t; loc : 'loc}
+
+  (* Applies [e] to each subexpression and [p] to each pattern *)
+  let iter e p = function
+    | Record {fields; rest} -> List.iter (fun (_, x) -> e x) fields; Option.iter e rest
+    | Field (x, _) | Roll x | The (_, x) | Abstract (_, x) -> e x
+    | Variant (_, fields) -> List.iter (fun (_, x) -> e x) fields
+    | Match (x, clauses) -> e x; List.iter (fun (q, x) -> p q; e x) clauses
+    | Function {params; deps; body} ->
+      List.iter (fun (_, q) -> p q) params;
+      Option.iter p deps;
+      e body
+    | Apply {f; args; deps} -> e f; List.iter (fun (_, x) -> e x) args; Option.iter e deps
+    | Let {pat; defn; body} -> p pat; e defn; e body
+    | Recur {root; input; accs; body; _} ->
+      p root;
+      e input;
+      List.iter (fun (q, x) -> p q; e x) accs;
+      e body
+    | Dep _ | Var _ | Hole -> ()
 end
 
-(* Types, and checking programs: the tree of a program, which checking sets
-   the types of *)
+(* Types, and checking programs: the typed tree, and the checker that builds
+   it from the untyped one *)
 module Type = struct
   type t =
     | Record of row
@@ -603,19 +636,18 @@ module Type = struct
   (* Closes a variant row by its tail, so it can't take more tags *)
   let close tail = unify (Var tail) (Variant {fields = []; rest = None})
 
-  (* Programs, and once they're checked, their types. [ty] is set by
-     checking, and is an error if the node has one, which makes it evaluate
-     to a hole. [loc] is where the node is, in whatever the program was read
-     from. *)
+  (* Typed programs. [ty] is an error if the node has one, which makes it
+     evaluate to a hole, and [loc] is where it is, in whatever the program
+     was read from. *)
   type 'loc expr = {
     expr : ('loc expr, 'loc pat) Expr.t;
-    mutable ty : t;
+    ty : t;
     loc : 'loc
   }
 
   and 'loc pat = {
     pat : 'loc pat Pat.t;
-    mutable ty : t;
+    ty : t;
     loc : 'loc
   }
 
@@ -742,9 +774,9 @@ module Type = struct
       | None -> List.iter close forced; None
       | Some _ -> Some Ambiguous
 
-  (* Checking a program sets each node's type. A node with a type error has
-     the error as its type, and the error is reported to the front end the
-     program was read from, at the node's location. *)
+  (* Checking builds the typed tree from the untyped one. A node with a type
+     error has the error as its type, and the error is reported to the front
+     end the program was read from, at the node's location. *)
 
   type 'loc scope = {
     vars : (string * t) list;
@@ -753,16 +785,16 @@ module Type = struct
     report : 'loc -> error -> unit
   }
 
+  (* A node, unless it has [problem], which becomes its type *)
   let mark scope (e : _ expr) problem =
-    scope.report e.loc problem;
-    e.ty <- Error problem
+    match problem with
+    | None -> e
+    | Some problem -> scope.report e.loc problem; {e with ty = Error problem}
 
   let pmark scope (p : _ pat) problem =
-    scope.report p.loc problem;
-    p.ty <- Error problem
-
-  let mark_if scope e problem = Option.iter (mark scope e) problem
-  let pmark_if scope p problem = Option.iter (pmark scope p) problem
+    match problem with
+    | None -> p
+    | Some problem -> scope.report p.loc problem; {p with ty = Error problem}
 
   (* Checks return the problem they find, if any. Here, that [found] doesn't
      unify with [expected]. *)
@@ -770,6 +802,9 @@ module Type = struct
     match unify expected found with
     | () -> None
     | exception Compile_error why -> Some (Mismatch {expected; found; why})
+
+  (* The first problem: [problem], or else the one [next] finds *)
+  let first problem next = if problem = None then next () else problem
 
   (* For `the T e`, e has type T with each abstract type written in T replaced
      by its underlying type, so T can be a whole signature *)
@@ -837,9 +872,9 @@ module Type = struct
   (* The names patterns bind, with their types *)
   type binds = (string * t) list ref
 
-  let bind scope (binds : binds) p name ty =
-    if List.mem_assoc name !binds then pmark scope p (Bound_twice name)
-    else binds := (name, ty) :: !binds
+  let bind (binds : binds) name ty =
+    if List.mem_assoc name !binds then Some (Bound_twice name)
+    else (binds := (name, ty) :: !binds; None)
 
   (* Checking is bidirectional: each node is checked against the type
      expected of it, which is passed down to its parts as far as it's
@@ -849,22 +884,22 @@ module Type = struct
      part's. If the [expected] type has that shape, the parts are checked
      against what it has there. Otherwise they're checked against the
      variables, and the problem is the node's, found with the parts' types
-     filled in. *)
+     filled in. Returns the checked parts, and the problem. *)
   let against expected shape parts =
     match unify expected shape with
-    | () -> parts (); None
-    | exception Compile_error _ -> parts (); expect expected shape
+    | () -> parts (), None
+    | exception Compile_error _ ->
+      let parts = parts () in
+      parts, expect expected shape
 
   let slots fields = List.map (fun (name, _) -> name, fresh ()) fields
 
   (* Checks each of [xs] against its slot's type *)
-  let each check xs slots = List.iter2 (fun (_, x) (_, ty) -> check ty x) xs slots
+  let each check xs slots = List.map2 (fun (name, x) (_, ty) -> name, check ty x) xs slots
 
   (* A node found to have type [ty], unless it has [problem], must have the
      expected type *)
-  let found scope (e : _ expr) expected ty problem =
-    e.ty <- ty;
-    mark_if scope e (if problem = None then expect expected ty else problem)
+  let found expected ty problem = first problem (fun () -> expect expected ty)
 
   (* A copy of a type with fresh variables in place of its own, sharing a
      copy for each *)
@@ -876,138 +911,149 @@ module Type = struct
 
   (* Checks a pattern against the type of what it matches, adding the names
      it binds to [binds] *)
-  let rec pattern scope binds expected (p : _ pat) =
+  let rec pattern scope binds expected (p : _ Pat.untyped) : _ pat =
+    let node pat ty problem = pmark scope {pat; ty; loc = p.loc} problem in
     match p.pat with
-    | Var name ->
-      p.ty <- expected;
-      bind scope binds p name expected
+    | Var name -> node (Var name) expected (bind binds name expected)
 
-    | Wildcard -> p.ty <- expected
+    | Wildcard -> node Wildcard expected None
 
     (* With `..`, it matches records with more fields *)
     | Record {fields; rest} ->
       let slots = slots fields in
-      p.ty <- Record {fields = slots; rest = if rest then Some (fresh ()) else None};
-      pmark_if scope p (against expected p.ty (fun () -> each (pattern scope binds) fields slots))
+      let ty = Record {fields = slots; rest = if rest then Some (fresh ()) else None} in
+      let fields, problem = against expected ty (fun () -> each (pattern scope binds) fields slots) in
+      node (Record {fields; rest}) ty problem
 
     | Variant (tag, fields) ->
       let slots = slots fields in
-      p.ty <- tagged tag slots;
-      pmark_if scope p (against expected p.ty (fun () -> each (pattern scope binds) fields slots))
+      let ty = tagged tag slots in
+      let fields, problem = against expected ty (fun () -> each (pattern scope binds) fields slots) in
+      node (Variant (tag, fields)) ty problem
 
     | Roll q ->
       let body = fresh () in
-      p.ty <- Recurs {body; index = fresh ()};
-      pmark_if scope p (against expected p.ty (fun () -> pattern scope binds body q))
+      let ty = Recurs {body; index = fresh ()} in
+      let q, problem = against expected ty (fun () -> pattern scope binds body q) in
+      node (Roll q) ty problem
 
     | The (ann, q) ->
       let ty = annotation scope p.loc ann in
-      pattern scope binds (repr ty) q;
-      p.ty <- ty;
-      pmark_if scope p (expect expected ty)
+      let q = pattern scope binds (repr ty) q in
+      node (The (ann, q)) ty (expect expected ty)
 
     (* Both sides must bind the same names, with the same types. All of them
        are bound either way, so none are found unbound. *)
     | Or (q, r) ->
       let left = ref [] and right = ref [] in
-      pattern scope left expected q;
-      pattern scope right expected r;
-      p.ty <- expected;
+      let q = pattern scope left expected q in
+      let r = pattern scope right expected r in
       let same = List.compare_lengths !left !right = 0
                  && List.for_all (fun (name, _) -> List.mem_assoc name !right) !left in
-      if not same then pmark scope p Or_binds
-      else pmark_if scope p (List.find_map (fun (name, ty) -> expect ty (List.assoc name !right)) !left);
+      let problem =
+        if not same then Some Or_binds
+        else List.find_map (fun (name, ty) -> expect ty (List.assoc name !right)) !left
+      in
       let extra = List.filter (fun (name, _) -> not (List.mem_assoc name !left)) !right in
-      List.iter (fun (name, ty) -> bind scope binds p name ty) (!left @ extra)
+      let bound = List.filter_map (fun (name, ty) -> bind binds name ty) (!left @ extra) in
+      node (Or (q, r)) expected (first problem (fun () -> List.nth_opt bound 0))
 
-  let rec check scope expected (e : _ expr) =
+  let rec check scope expected (e : _ Expr.untyped) : _ expr =
+    let node expr ty problem = mark scope {expr; ty; loc = e.loc} problem in
     match e.expr with
     | Var name ->
       begin match List.assoc_opt name scope.vars with
-        | Some ty -> found scope e expected (instantiate ty) None
-        | None -> mark scope e (Unbound_variable name)
+        | Some ty ->
+          let ty = instantiate ty in
+          node (Var name) ty (expect expected ty)
+        | None -> node (Var name) expected (Some (Unbound_variable name))
       end
 
-    | Hole -> e.ty <- expected
+    | Hole -> node Hole expected None
 
     | Dep name ->
       let ty = fresh () in
       let record = Record {fields = [name, ty]; rest = Some (fresh ())} in
-      found scope e expected ty (expect record scope.deps)
+      node (Dep name) ty (found expected ty (expect record scope.deps))
 
     | Field (left, name) ->
-      let left_ty = fresh () in
-      check scope left_ty left;
+      let left = check scope (fresh ()) left in
       let ty = fresh () in
       let record = Record {fields = [name, ty]; rest = Some (fresh ())} in
-      found scope e expected ty (expect record left_ty)
+      node (Field (left, name)) ty (found expected ty (expect record left.ty))
 
     (* The arguments are checked against the function's parameters *)
     | Apply {f; args; deps} ->
-      let f_ty = fresh () in
-      check scope f_ty f;
+      let f = check scope (fresh ()) f in
       let slots = slots args in
       let deps_ty = if deps = None then empty else fresh () in
       let output = fresh () in
       let shape = Function {inputs = Record {fields = slots; rest = None}; deps = deps_ty; exists = []; output} in
-      found scope e expected output (against shape (open_exists f_ty) (fun () ->
-          each (check scope) args slots;
-          Option.iter (check scope deps_ty) deps))
+      let (args, deps), problem =
+        against shape (open_exists f.ty) (fun () ->
+            let args = each (check scope) args slots in
+            args, Option.map (check scope deps_ty) deps)
+      in
+      node (Apply {f; args; deps}) output (found expected output problem)
 
     (* Each clause's pattern is checked before its body, so its variables'
        types are known there *)
     | Match (left, clauses) ->
       let ty = fresh () in
-      check scope ty left;
-      List.iter (fun (pat, body) ->
+      let left = check scope ty left in
+      let clauses = List.map (fun (pat, body) ->
           let binds = ref [] in
-          pattern scope binds ty pat;
-          check {scope with vars = !binds @ scope.vars} expected body)
-        clauses;
-      e.ty <- expected;
-      mark_if scope e (exhaustive (List.map fst clauses))
+          let pat = pattern scope binds ty pat in
+          pat, check {scope with vars = !binds @ scope.vars} expected body)
+          clauses
+      in
+      node (Match (left, clauses)) expected (exhaustive (List.map fst clauses))
 
     | Record {fields; rest} ->
       let slots = slots fields in
       let tail = Option.map (fun _ -> fresh ()) rest in
-      e.ty <- Record {fields = slots; rest = tail};
-      mark_if scope e (against expected e.ty (fun () ->
-          each (check scope) fields slots;
-          Option.iter (check scope (Record {fields = []; rest = tail})) rest))
+      let ty = Record {fields = slots; rest = tail} in
+      let (fields, rest), problem =
+        against expected ty (fun () ->
+            let fields = each (check scope) fields slots in
+            fields, Option.map (check scope (Record {fields = []; rest = tail})) rest)
+      in
+      node (Record {fields; rest}) ty problem
 
     | Variant (tag, fields) ->
       let slots = slots fields in
-      e.ty <- tagged tag slots;
-      mark_if scope e (against expected e.ty (fun () -> each (check scope) fields slots))
+      let ty = tagged tag slots in
+      let fields, problem = against expected ty (fun () -> each (check scope) fields slots) in
+      node (Variant (tag, fields)) ty problem
 
     | Roll x ->
       let body = fresh () in
-      e.ty <- Recurs {body; index = empty};
-      mark_if scope e (against expected e.ty (fun () -> check scope body x))
+      let ty = Recurs {body; index = empty} in
+      let x, problem = against expected ty (fun () -> check scope body x) in
+      node (Roll x) ty problem
 
     (* p and e are checked a level deeper, so that p's variables are
        generalized for body *)
     | Let {pat; defn; body} ->
       incr level;
-      let ty = fresh () in
-      let binds = ref [] in
-      pattern scope binds ty pat;
-      check scope ty defn;
-      pmark_if scope pat (exhaustive [pat]);
+      let ty = fresh () and binds = ref [] in
+      let pat = pattern scope binds ty pat in
+      let defn = check scope ty defn in
+      let pat = pmark scope pat (exhaustive [pat]) in
       decr level;
       List.iter (fun (_, ty) -> generalize ty) !binds;
-      check {scope with vars = !binds @ scope.vars} expected body;
-      e.ty <- expected
+      let body = check {scope with vars = !binds @ scope.vars} expected body in
+      node (Let {pat; defn; body}) expected None
 
     (* body sees t as a new abstract type *)
     | Abstract (name, body) ->
-      check {scope with types = (name, rigid name (fresh ())) :: scope.types} expected body;
-      e.ty <- expected
+      let scope = {scope with types = (name, rigid name (fresh ())) :: scope.types} in
+      node (Abstract (name, check scope expected body)) expected None
 
     | The (ann, x) ->
       let ty = annotation scope e.loc ann in
-      check scope (repr ty) x;
-      found scope e expected ty None
+      let x = check scope (repr ty) x in
+      node (The (ann, x)) ty (expect expected ty)
 
     (* The parameters and body are checked against a refreshed copy of the
        function type expected, unless it has existential types, which the
@@ -1026,13 +1072,14 @@ module Type = struct
       let binds = ref [] in
       let slots = slots params in
       let fields = Record {fields = slots; rest = None} in
-      ignore (against inputs fields (fun () -> each (pattern scope binds) params slots));
+      let params, _ = against inputs fields (fun () -> each (pattern scope binds) params slots) in
       let problem = exhaustive [{pat = Record {fields = params; rest = false}; ty = fields; loc = e.loc}] in
-      Option.iter (fun p ->
-          pattern scope binds deps_ty p;
-          pmark_if scope p (exhaustive [p]))
-        deps;
-      check {scope with vars = !binds @ scope.vars; deps = deps_ty} output body;
+      let deps = Option.map (fun p ->
+          let p = pattern scope binds deps_ty p in
+          pmark scope p (exhaustive [p]))
+          deps
+      in
+      let body = check {scope with vars = !binds @ scope.vars; deps = deps_ty} output body in
       decr fun_level;
       let exists = existentials output in
       let escapes =
@@ -1040,13 +1087,12 @@ module Type = struct
         else None
       in
       let ty = Function {inputs = fields; deps = deps_ty; exists; output} in
-      found scope e expected ty (if problem = None then escapes else problem)
+      node (Function {params; deps; body}) ty (found expected ty (first problem (fun () -> escapes)))
 
-    (* `recur (p <- e, acc = init, ...) do body`, where [params] are `&p` and
-       the accumulators, and [args] e and their initial values. Within body,
-       [continue] continues with a subterm of e and new accumulators. p
-       matches e's top layer, whose subterms get a fresh index, so only they
-       can be continued with. The index can't escape into the accumulators or
+    (* `recur (p <- e, acc = init, ...) do body`. Within body, [continue]
+       continues with a subterm of e and new accumulators. p matches e's top
+       layer, whose subterms get a fresh index, so only they can be
+       continued with. The index can't escape into the accumulators or
        anything outside, which is checked like an existential's level. On the
        way out it becomes e's own index, since the subterms are still e's
        subterms, and [forget] does the same for a layer within body.
@@ -1054,34 +1100,27 @@ module Type = struct
        p is checked a function level deeper, so its variables can't be
        unified with anything outside. For the same reason, e is only checked
        against the layer p matches once body is. *)
-    | Recur {continue; forget; params; args; body} ->
+    | Recur {continue; forget; root; input; accs; body} ->
       let level = !fun_level + 1 in
       fun_level := level;
       let binds = ref [] in
-      let rolled, root, accs, input, inits =
-        match params, args with
-        | (_, ({pat = Roll root; _} as rolled)) :: accs, (_, input) :: inits ->
-          rolled, root, List.map snd accs, input, List.map snd inits
-        | _ -> invalid_arg "recur"
-      in
       let root_ty = fresh () in
-      pattern scope binds root_ty root;
-      pmark_if scope root (exhaustive [root]);
+      let root = pattern scope binds root_ty root in
+      let root = pmark scope root (exhaustive [root]) in
       decr fun_level;
       let input_ty = fresh () in
-      check scope input_ty input;
-      let acc_tys = List.map2 (fun p init ->
+      let input = check scope input_ty input in
+      let accs = List.map (fun (p, init) ->
           let ty = fresh () in
-          pattern scope binds ty p;
-          check scope ty init;
-          pmark_if scope p (exhaustive [p]);
-          ty)
-          accs inits
+          let p = pattern scope binds ty p in
+          let init = check scope ty init in
+          ty, (pmark scope p (exhaustive [p]), init))
+          accs
       in
+      let acc_tys = List.map fst accs and accs = List.map snd accs in
       fun_level := level;
       let index = abstract "recur" empty in
       let layer = {body = root_ty; index = Rigid {abs = index; view = empty}} in
-      rolled.ty <- Recurs layer;
       let output = fresh () in
       let continue_ty = Function {
           inputs = Record {fields = List.mapi (fun i ty -> label i, ty) (Recurs layer :: acc_tys); rest = None};
@@ -1103,7 +1142,7 @@ module Type = struct
       in
       let counter = !counter in (* abstract types made after this are made within *)
       let vars = !binds @ [continue, continue_ty; forget, forget_ty] @ scope.vars in
-      check {scope with vars} output body;
+      let body = check {scope with vars} output body in
       decr fun_level;
       (* Each iteration introduces its own abstract types, so they can't be
          passed between iterations, through the result or the accumulators *)
@@ -1116,15 +1155,17 @@ module Type = struct
       let outer = fresh () in
       let copy = copy (function Rigid x when x.abs == index -> Some outer | _ -> None) in
       let layer_ty = copy (Recurs layer) and ty = copy output in
-      found scope e expected ty (if problem = None then expect layer_ty input_ty else problem)
+      let problem = first problem (fun () -> expect layer_ty input_ty) in
+      node (Recur {continue; forget; root; input; accs; body}) ty (found expected ty problem)
 
   (* A program, with [vars] in scope, is checked like a let's definition *)
-  let program ?(vars = []) report (e : _ expr) =
+  let program ?(vars = []) report e =
     level := 0;
     fun_level := 0;
-    check {vars; types = []; deps = empty; report} (fresh ()) e;
+    let e = check {vars; types = []; deps = empty; report} (fresh ()) e in
     decr level;
-    generalize e.ty
+    generalize e.ty;
+    e
 end
 
 (* The concrete syntax tree, for the editor: each construct's [form], like
@@ -1137,18 +1178,25 @@ end
    Some nodes are rows, which the editor can rearrange: a record's entries,
    a match's clauses, and a let's binding, `p = e` without the body. *)
 module Syntax = struct
-  (* Where a node was in the source, from its start to its stop *)
+  (* Where a node was in the source, from its start to its stop. Every
+     construct has tokens of its own, so no two nodes of a kind have the
+     same span. *)
   type span = int * int
 
-  type t = {
+  type 'info node = {
     form : string;
-    info : info;
+    info : 'info;
     start : int;
     stop : int;
-    children : t list
+    children : 'info node list
   }
 
-  and info = Expr of span Type.expr | Pat of span Type.pat | Other
+  type info = Expr of span Type.expr | Pat of span Type.pat | Other
+
+  type t = info node
+
+  let rec map f node =
+    {node with info = f node.info; children = List.map (map f) node.children}
 end
 
 module Parsing = struct
@@ -1346,28 +1394,26 @@ module Parsing = struct
       | _ -> unexpected ~expected:(string_of_token token) pos
     in
 
-    (* Each node adopts the nodes recorded since its start as its children *)
+    (* Each node adopts the nodes recorded since its start as its children.
+       Its info is the span of the node of the program it was read as. *)
     let nodes = ref [] in
     let node form info start stop =
       let rec adopt children = function
-        | (n : Syntax.t) :: rest when n.start >= start -> adopt (n :: children) rest
+        | (n : _ Syntax.node) :: rest when n.start >= start -> adopt (n :: children) rest
         | rest -> children, rest
       in
       let children, rest = adopt [] !nodes in
       nodes := {Syntax.form; info; start; stop; children} :: rest
     in
-    (* Nodes of the program, whose types are set when it's checked *)
-    let make expr start stop = {Type.expr; ty = Type.empty; loc = (start, stop)} in
-    (* Records a node, and goes on after it *)
+    let make expr start stop = {Expr.expr; loc = (start, stop)} in
+    (* Records a node of the program, and goes on after it *)
     let enode form expr start stop =
-      let e = make expr start stop in
-      node form (Expr e) start stop;
-      e, stop
+      node form (`Expr (start, stop)) start stop;
+      make expr start stop, stop
     in
     let pnode form pat start stop =
-      let p = {Type.pat; ty = Type.empty; loc = (start, stop)} in
-      node form (Pat p) start stop;
-      p, stop
+      node form (`Pat (start, stop)) start stop;
+      {Pat.pat; loc = (start, stop)}, stop
     in
 
     (* Comma separated, up to [closer]: positional items, `.name <sep> item`,
@@ -1386,7 +1432,7 @@ module Parsing = struct
               | (LeftParen, _), Some func -> func next
               | _ -> item (expect sep next)
             in
-            node row Other start pos;
+            node row `Other start pos;
             i, (name, x) :: fields, tail, deps, pos
           | (DotDot, next), Some rest, _ ->
             let x, pos = rest next in
@@ -1397,7 +1443,7 @@ module Parsing = struct
           | _ ->
             let start = skip input pos in
             let x, pos = item pos in
-            if row <> "item" then node row Other start pos;
+            if row <> "item" then node row `Other start pos;
             i+1, (label i, x) :: fields, tail, deps, pos
         in
         match tokenize pos with
@@ -1468,7 +1514,7 @@ module Parsing = struct
     let annotation pos =
       let start = skip input pos in
       let ty, pos = type_expr pos in
-      node "type" Other start pos;
+      node "type" `Other start pos;
       ty, pos
     in
 
@@ -1490,7 +1536,7 @@ module Parsing = struct
       | LeftParen, next ->
         let p, pos = pattern next in
         let next = expect RightParen pos in
-        node "parens" (Pat p) start next;
+        node "parens" (`Pat p.loc) start next;
         p, next
 
       | LeftCurly, next ->
@@ -1543,7 +1589,7 @@ module Parsing = struct
           let clause_start = skip input pos in
           let pat, pos = pattern pos in
           let body, next = expr (expect Arrow pos) in
-          node "clause" Other clause_start next;
+          node "clause" `Other clause_start next;
           (pat, body), next
         in
         let clauses, _, _, next = sequence ~sep:Equal clause RightSquare next in
@@ -1561,7 +1607,7 @@ module Parsing = struct
       | LeftParen, next ->
         let e, pos = expr next in
         let next = expect RightParen pos in
-        node "parens" (Expr e) start next;
+        node "parens" (`Expr e.loc) start next;
         e, next
 
       | Let, next ->
@@ -1572,13 +1618,13 @@ module Parsing = struct
           | Pat.Var _, (LeftParen, _) -> lambda Equal pos (* `let f(x) = e` *)
           | _ -> expr (expect Equal pos)
         in
-        node "binding" Other binding next;
+        node "binding" `Other binding next;
         let body, next = expr (expect In next) in
         enode "let" (Expr.Let {pat; defn; body}) start next
 
       | Fun, next ->
         let e, next = lambda ~start Arrow next in
-        node "fun" (Expr e) start next;
+        node "fun" (`Expr e.loc) start next;
         e, next
 
       | LeftCurly, next ->
@@ -1624,8 +1670,7 @@ module Parsing = struct
       let start = Option.value start ~default:params_start in
       make (Expr.Function {params; deps; body}) start next, next
 
-    (* `recur (p <- e, acc = init, ...) do body`, whose parameters are `&p`
-       and the accumulators *)
+    (* `recur (p <- e, acc = init, ...) do body` *)
     and recur start pos =
       let root, pos = pattern pos in
       let input, pos = expr (expect LeftArrow pos) in
@@ -1641,21 +1686,33 @@ module Parsing = struct
       in
       let accs, pos = accs pos in
       let body, next = expr (expect Do pos) in
-      let labelled xs = List.mapi (fun i x -> label i, x) xs in
-      let params = labelled ({root with pat = Pat.Roll root} :: List.map fst accs) in
-      let args = labelled (input :: List.map snd accs) in
-      let recur = Expr.Recur {continue = "continue"; forget = "forget"; params; args; body} in
-      enode "recur" recur start next
+      enode "recur" (Expr.Recur {continue = "continue"; forget = "forget"; root; input; accs; body}) start next
     in
 
     let expr, pos = expr 0 in
     match tokenize pos with
     | EOF, _ ->
       let errors = ref [] in
-      Type.program ?vars (fun loc problem -> errors := (loc, problem) :: !errors) expr;
+      let expr = Type.program ?vars (fun loc problem -> errors := (loc, problem) :: !errors) expr in
       let errors = List.stable_sort (fun ((a, _), _) ((b, _), _) -> Int.compare a b) (List.rev !errors) in
+      (* The typed nodes, by span *)
+      let exprs = Hashtbl.create 64 and pats = Hashtbl.create 64 in
+      let rec visit (e : _ Type.expr) =
+        Hashtbl.replace exprs e.loc e;
+        Expr.iter visit pvisit e.expr
+      and pvisit (p : _ Type.pat) =
+        Hashtbl.replace pats p.loc p;
+        Pat.iter pvisit p.pat
+      in
+      visit expr;
+      let typed = function
+        | `Expr span -> Syntax.Expr (Hashtbl.find exprs span)
+        | `Pat span -> Syntax.Pat (Hashtbl.find pats span)
+        | `Other -> Syntax.Other
+      in
       let stop = String.length input in
-      {expr; errors; syntax = {form = "program"; info = Other; start = 0; stop; children = !nodes}}
+      let syntax = {Syntax.form = "program"; info = `Other; start = 0; stop; children = !nodes} in
+      {expr; errors; syntax = Syntax.map typed syntax}
     | _ -> unexpected pos
 end
 
@@ -1795,13 +1852,17 @@ end = struct
     | Expr.The (_, e) | Expr.Abstract (_, e) -> eval env e
 
     (* Unlike a closure, keeps the enclosing function's dependencies *)
-    | Expr.Recur {continue; forget; params; args; body} ->
+    | Expr.Recur {continue; forget; root; input; accs; body} ->
       let identity = Native (fun args -> List.assoc (label 0) args) in
+      let accs = List.mapi (fun i (p, init) -> label (i + 1), p, init) accs in
+      (* The first argument is a layer of e, which root matches unrolled *)
       let rec loop args =
         let env = (continue, Native loop) :: (forget, identity) :: env in
-        eval (Option.get (bind_fields env params args)) body
+        let layer = match List.assoc (label 0) args with Roll value -> value | hole -> hole in
+        let env = Option.get (bind env root layer) in
+        eval (Option.get (bind_fields env (List.map (fun (name, p, _) -> name, p) accs) args)) body
       in
-      loop (List.map (fun (name, e) -> name, eval env e) args)
+      loop ((label 0, eval env input) :: List.map (fun (name, _, init) -> name, eval env init) accs)
 
     | Expr.Hole -> Hole
 
