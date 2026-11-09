@@ -53,7 +53,8 @@ type expr = unit Expr.untyped
 type pat = unit Pat.untyped
 type tree = (expr, pat) node
 
-type checked = (unit Type.expr, unit Type.pat) node
+(* The program checked, located by path *)
+type checked = (path Type.expr, path Type.pat) node
 
 (* What's read from text, located in it *)
 type fragment = (Parsing.span Expr.untyped, Parsing.span Pat.untyped) node
@@ -330,8 +331,10 @@ let parts_at root path = parts ~sugared:(sugared root path) untyped (get untyped
 let print_spans_at root path = print_spans ~sugared:(sugared root path) untyped (get untyped root path)
 let print_at root path = fst (print_spans_at root path)
 
-(* A node with new children, which must be the kinds of node it can hold *)
-let rebuild (node : tree) (children : tree list) : tree =
+(* A node with new children, which must be the kinds of node it can hold, and
+the location [loc], if it has one *)
+let rebuild_at (type a l) (loc : l) (node : (a Expr.untyped, a Pat.untyped) node)
+    (children : (l Expr.untyped, l Pat.untyped) node list) : (l Expr.untyped, l Pat.untyped) node =
   let bad () = invalid_arg "rebuild" in
   let e = function E x -> x | _ -> bad () in
   let p = function P x -> x | _ -> bad () in
@@ -344,7 +347,7 @@ let rebuild (node : tree) (children : tree list) : tree =
   in
   let plain get cs = match items get cs with fields, None -> fields | _ -> bad () in
   let entries get cs = unnamed (List.map (function Entry (name, x) -> name, get x | _ -> bad ()) cs) in
-  let fn cs : (expr, pat) Expr.t =
+  let fn cs : (l Expr.untyped, l Pat.untyped) Expr.t =
     match List.rev cs with
     | E body :: rest ->
       let params, deps = items p (List.rev rest) in
@@ -353,7 +356,7 @@ let rebuild (node : tree) (children : tree list) : tree =
   in
   match node, children with
   | E x, cs ->
-    let shape : (expr, pat) Expr.t =
+    let shape : (l Expr.untyped, l Pat.untyped) Expr.t =
       match x.expr, cs with
       | Record _, cs ->
         let cs, rest =
@@ -376,18 +379,20 @@ let rebuild (node : tree) (children : tree list) : tree =
         begin match List.rev cs with
           | E body :: accs ->
             let accs = List.rev_map (function Acc (q, init) -> q, init | _ -> bad ()) accs in
-            Recur {r with root; input; accs; body}
+            Recur {continue = r.continue; forget = r.forget; root; input; accs; body}
           | _ -> bad ()
         end
       | The _, [T ann; r] -> The (ann, e r)
       | Abstract (name, _), [body] -> Abstract (name, e body)
       | Alias (name, _, _), [T ann; body] -> Alias (name, ann, e body)
-      | (Var _ | Dep _ | Hole) as leaf, [] -> leaf
+      | Var name, [] -> Var name
+      | Dep name, [] -> Dep name
+      | Hole, [] -> Hole
       | _ -> bad ()
     in
-    E {x with expr = shape}
+    E {expr = shape; loc}
   | P x, cs ->
-    let shape : pat Pat.t =
+    let shape : l Pat.untyped Pat.t =
       match x.pat, cs with
       | Record _, cs ->
         let cs, rest =
@@ -400,20 +405,28 @@ let rebuild (node : tree) (children : tree list) : tree =
       | Roll _, [r] -> Roll (p r)
       | The _, [T ann; r] -> The (ann, p r)
       | Or _, [l; r] -> Or (p l, p r)
-      | (Var _ | Wildcard) as leaf, [] -> leaf
+      | Var name, [] -> Var name
+      | Wildcard, [] -> Wildcard
       | _ -> bad ()
     in
-    P {x with pat = shape}
-  | T _, [] -> node
+    P {pat = shape; loc}
+  | T ann, [] -> T ann
   | Entry (name, _), [x] -> Entry (name, x)
   | Item (name, _), [x] -> Item (name, x)
   | Using _, [x] -> Using x
   | Rest (Some _), [x] -> Rest (Some x)
-  | Rest None, [] -> node
+  | Rest None, [] -> Rest None
   | Clause _, [P q; E b] -> Clause (q, b)
   | Binding _, [P q; E d] -> Binding (q, d)
   | Acc _, [P q; E init] -> Acc (q, init)
   | _ -> bad ()
+
+let rebuild (node : tree) (children : tree list) : tree = rebuild_at () node children
+
+(* The program, with each expression and pattern located by its path, to
+   check it *)
+let rec locate path node =
+  rebuild_at path node (List.mapi (fun i child -> locate (path @ [i]) child) (children untyped node))
 
 let rec update node path f =
   match path with
@@ -1258,17 +1271,6 @@ let delete st =
 
 (* Drawing *)
 
-(* The type of a checked node, and what's wrong with it *)
-let type_of : checked -> Type.t option = function
-  | E e -> Some e.ty
-  | P p -> Some p.ty
-  | _ -> None
-
-let problem node =
-  match type_of node with
-  | Some (Type.Error problem) -> Some (Type.describe problem)
-  | _ -> None
-
 (* Layout. Blocks span several lines; everything else is inline. *)
 let rec is_block node =
   match form typed node with
@@ -1320,10 +1322,25 @@ let value (s, title) =
   Dom.appendChild el (text s);
   (el :> Dom.node Js.t)
 
-(* The values to show by path, and whether the cell has been put in yet *)
-type context = {values : (path * (string * string)) list; mutable placed : bool}
+(* A type error, in a block under the line it's on *)
+let problem_block indent msg =
+  let el = Dom_html.createDiv doc in
+  el##.className := Js.string (if indent then "problem indent" else "problem");
+  Dom.appendChild el (text msg);
+  (el :> Dom.node Js.t)
 
-let rec render st ctx ?sugared path (node : checked) : Dom.node Js.t =
+(* The values and type errors to show by path, and whether the cell has been
+   put in yet *)
+type context = {
+  values : (path * (string * string)) list;
+  problems : (path * string) list;
+  mutable placed : bool;
+}
+
+(* Draws a node, giving [report] its errors and those of the inline nodes
+   within it, for the line they're on. A block shows those on each of its own
+   lines under it. *)
+let rec render st ctx ~report ?sugared path (node : checked) : Dom.node Js.t =
   match st.editing with
   | Some {at = Into p; _} when p = path ->
     ctx.placed <- true;
@@ -1334,9 +1351,10 @@ let rec render st ctx ?sugared path (node : checked) : Dom.node Js.t =
     let el = Dom_html.createSpan doc in
     let classes = ["node"; "form-" ^ form typed node] in
     let classes = if path = st.cursor && st.editing = None then "selected" :: classes else classes in
-    let classes = if problem node <> None then "error" :: classes else classes in
+    let problems = List.filter_map (fun (p, msg) -> if p = path then Some msg else None) ctx.problems in
+    let classes = if problems <> [] then "error" :: classes else classes in
     el##.className := Js.string (String.concat " " classes);
-    Option.iter (fun msg -> el##.title := Js.string msg) (problem node);
+    List.iter report problems;
     let select ev =
       Dom_html.stopPropagation ev;
       Option.iter (leave st) st.editing;
@@ -1345,8 +1363,16 @@ let rec render st ctx ?sugared path (node : checked) : Dom.node Js.t =
     in
     el##.onclick := Dom_html.handler (fun ev -> select ev; !redraw (); Js._false);
     el##.ondblclick := Dom_html.handler (fun ev -> select ev; edit st; !redraw (); Js._false);
-    let line = ref (el :> Dom.node Js.t) in
+    let line = ref (el :> Dom.node Js.t) and indented = ref false in
+    let pending = ref [] in
+    let flush () =
+      List.iter (fun msg -> Dom.appendChild el (problem_block !indented msg)) (List.rev !pending);
+      pending := []
+    in
+    let report = if block then (fun msg -> pending := msg :: !pending) else report in
     let new_line indent =
+      flush ();
+      indented := indent;
       let div = Dom_html.createDiv doc in
       div##.className := Js.string (if indent then "line indent" else "line");
       Dom.appendChild el div;
@@ -1389,24 +1415,25 @@ let rec render st ctx ?sugared path (node : checked) : Dom.node Js.t =
           let p = path @ [i] in
           cell (Before p);
           Option.iter (fun v -> Dom.appendChild !line (value v)) (List.assoc_opt p ctx.values);
-          Dom.appendChild !line (render st ctx ~sugared:(shows_sugar typed node i) p child);
+          Dom.appendChild !line (render st ctx ~report ~sugared:(shows_sugar typed node i) p child);
           cell (After p);
           after_block := is_block child;
           i + 1)
         0 (parts ?sugared typed node));
     let g = take () in
     if bracketed then put (String.trim g) (closing_break node) else put g None;
+    flush ();
     (el :> Dom.node Js.t)
 
 (* The values bound by the program's top-level lets, and the value of the
    whole program, by the paths of the bindings and the final body. Each has
    a tooltip, which for the whole program includes its type. *)
-let values (program : unit Type.expr) =
+let values (program : path Type.expr) =
   let show_bound env env' =
     let bound = List.filteri (fun i _ -> i < List.length env' - List.length env) env' in
     String.concat ", " (List.rev_map (fun (name, v) -> name ^ " = " ^ Runtime.show v) bound)
   in
-  let rec bindings env path (e : unit Type.expr) =
+  let rec bindings env path (e : path Type.expr) =
     match e.expr with
     | Let {pat; defn; body} ->
       begin match Runtime.define env pat defn with
@@ -1417,7 +1444,7 @@ let values (program : unit Type.expr) =
     | Alias (_, _, body) -> bindings env (path @ [1]) body
     | _ -> []
   in
-  let rec body path (e : unit Type.expr) =
+  let rec body path (e : path Type.expr) =
     match e.expr with
     | Let {body = b; _} -> body (path @ [1]) b
     | Abstract (_, b) -> body (path @ [0]) b
@@ -1431,23 +1458,6 @@ let values (program : unit Type.expr) =
   in
   let bound = List.filter (fun (_, v) -> v <> "") (bindings prelude.env [] program) in
   (body [] program, result) :: List.map (fun (path, v) -> path, (v, v)) bound
-
-let output errors =
-  String.concat "\n"
-    (List.filter (( <> ) "") (prelude_error :: List.map (fun (_, problem) -> Type.describe problem) errors))
-
-(* The selected node, or while editing, the cell's node *)
-let status st root =
-  let path = match st.editing with Some cell -> path_of cell.at | None -> st.cursor in
-  let node = Option.value (find typed root path) ~default:root in
-  let ty =
-    match type_of node with
-    | Some ty when not (Type.is_error ty) -> " : " ^ Type.show ty
-    | _ -> ""
-  in
-  let problem = Option.fold ~none:"" ~some:(fun msg -> " - " ^ msg) (problem node) in
-  let message = if st.message = "" then "" else "\n" ^ st.message in
-  form typed node ^ ty ^ problem ^ message
 
 (* The cell's text and selection, as the browser has them *)
 let read_cell st cell =
@@ -1487,11 +1497,16 @@ let show_cell st cell =
   selection##addRange range
 
 let draw st =
-  let program, errors = check ~vars:prelude.vars st.doc in
+  let program, errors =
+    match locate [] (root st) with
+    | E located -> check ~vars:prelude.vars located
+    | _ -> invalid_arg "draw"
+  in
   let root = E program in
   let editor = Dom_html.getElementById "editor" in
   editor##.innerHTML := Js.string "";
-  let ctx = {values = values program; placed = false} in
+  let problems = List.map (fun (path, problem) -> path, Type.describe problem) errors in
+  let ctx = {values = values program; problems; placed = false} in
   let cell at =
     match st.editing with
     | Some cell when cell.at = at ->
@@ -1501,17 +1516,14 @@ let draw st =
   in
   Option.iter (fun v -> Dom.appendChild editor (value v)) (List.assoc_opt [] ctx.values);
   cell (Before []);
-  Dom.appendChild editor (render st ctx [] root);
+  let pending = ref [] in
+  Dom.appendChild editor (render st ctx ~report:(fun msg -> pending := msg :: !pending) [] root);
   cell (After []);
   if st.editing <> None && not ctx.placed then Dom.appendChild editor st.area;
-  (* The gutter is as wide as the widest value, up to a limit *)
-  let values = Dom.list_of_nodeList (editor##querySelectorAll (Js.string ".value")) in
-  let width = List.fold_left (fun w (v : Dom_html.element Js.t) -> max w v##.offsetWidth) 0 values in
-  List.iter (fun (v : Dom_html.element Js.t) -> v##.style##.width := Js.string (Printf.sprintf "%dpx" width)) values;
-  editor##.style##.paddingRight := Js.string (Printf.sprintf "calc(%dpx + 3ch)" width);
+  List.iter (fun msg -> Dom.appendChild editor (problem_block false msg)) (List.rev !pending);
   let set id s = (Dom_html.getElementById id)##.textContent := Js.some (Js.string s) in
-  set "status" (status st root);
-  set "output" (output errors);
+  (* Why the prelude didn't load, and what's happened in the editor *)
+  set "output" (String.concat "\n" (List.filter (( <> ) "") [prelude_error; st.message]));
   set "source" (print untyped (E st.doc));
   Option.iter (show_cell st) st.editing
 
