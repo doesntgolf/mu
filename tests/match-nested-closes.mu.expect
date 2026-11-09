@@ -1,1 +1,1 @@
-the fun([#some([#a]), #none]) -> [#y, #n, ..'a] <function>
+the fun([#some([#a]), #none]) -> [#y, #n, ..] <function>

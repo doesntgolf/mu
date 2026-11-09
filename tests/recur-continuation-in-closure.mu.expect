@@ -1,1 +1,1 @@
-the rec 'a. [#done, #more(fun() -> 'a), ..'b] &#more(<function>)
+the rec 'a. [#done, #more(fun() -> 'a), ..] &#more(<function>)

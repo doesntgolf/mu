@@ -1,1 +1,1 @@
-the [#none, #some([#a, #b, ..'a]), ..'b] #some(#b)
+the [#none, #some([#a, #b, ..]), ..] #some(#b)

@@ -1,1 +1,1 @@
-line 1, column 137: cannot unify t([#a, ..'a]) with t([#a, ..'a]), a different abstract type
+line 1, column 137: cannot unify t([#a, ..]) with t([#a, ..]), a different abstract type

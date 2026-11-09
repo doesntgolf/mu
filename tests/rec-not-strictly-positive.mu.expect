@@ -1,2 +1,2 @@
 line 1, column 1: recursive type is not strictly positive
-line 1, column 35: cannot unify rec _. [#f(fun(<error>) -> {})] with [#f, ..'a]
+line 1, column 35: cannot unify rec _. [#f(fun(<error>) -> {})] with [#f, ..]

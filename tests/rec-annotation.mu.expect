@@ -1,1 +1,1 @@
-the rec 'a. [#nil, #cons([#x, ..'b], 'a)] &#cons(#x, &#nil)
+the rec 'a. [#nil, #cons([#x, ..], 'a)] &#cons(#x, &#nil)

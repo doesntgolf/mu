@@ -1,1 +1,1 @@
-the fun(rec 'a. [#nil, #cons('b, 'a)]) -> [#nil, ..'c] <function>
+the fun(rec 'a. [#nil, #cons(*, 'a)]) -> [#nil, ..] <function>

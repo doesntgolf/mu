@@ -1,1 +1,1 @@
-the rec 'a. [#cons([#lo, #hi, #mid, ..'b], 'a), #nil] &#cons(#lo, &#cons(#mid, &#cons(#hi, &#nil)))
+the rec 'a. [#cons([#lo, #hi, #mid, ..], 'a), #nil] &#cons(#lo, &#cons(#mid, &#cons(#hi, &#nil)))

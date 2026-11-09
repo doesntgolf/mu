@@ -1,1 +1,1 @@
-the fun([#a, #b, #c]) -> [#1, #2, ..'a] <function>
+the fun([#a, #b, #c]) -> [#1, #2, ..] <function>

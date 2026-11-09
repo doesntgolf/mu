@@ -39,9 +39,11 @@ the same type.
 Variant literals are written with a leading `#`, as in `#ok(a, b)` or `#true`. Variant
 types are written with square brackets, like `[#one, #two({}, {}), ..'rest]`, with
 `..'rest` denoting the row variable. Type variables, row variables included, are written
-with a leading apostrophe. The optional payload of a variant is written in parentheses
-after the tag, and is itself a record, which can also contain a row variable. Record
-types are written like `{'a, .x : 'b, ..'rest}`.
+with a leading apostrophe; when a type is shown, a variable that appears only once in it
+is shown as `*`, or for a row variable, as nothing after the `..`, as in `[#one, ..]`. The
+optional payload of a variant is written in parentheses after the tag, and is itself a
+record, which can also contain a row variable. Record types are written like
+`{'a, .x : 'b, ..'rest}`.
 
 Variants are eliminated by `match`, which is written as a list of clauses after the
 scrutinee, as in `x [#some(y) -> y, #none -> d]`. Patterns mirror expressions: variables,
@@ -88,7 +90,7 @@ In Mu - because of its focus on anonymous types - the roll is made explicit with
 inferring recursive types with an explicit roll, because of ambiguity with where the
 roll in the resulting type should be placed. Instead, a roll on its own doesn't infer a
 recursive type. Because of our focus on anonymous types, the two types
-`rec 'l. [#cons('l), #nil]` and `rec _. [#cons(rec _. [#nil, ..'a]), ..'b]` are
+`rec 'l. [#cons('l), #nil]` and `rec _. [#cons(rec _. [#nil, ..]), ..]` are
 compatible, so for `&#cons(&#nil)` we simply infer the latter. An actual recursive type
 comes from a type annotation, as in `the (rec 'l. [#cons('l), #nil]) &#cons(&#nil)`, is
 inferred for the input of a `recur` expression (below), or arises when unification
@@ -235,7 +237,7 @@ let mod = abstract T in {.make(x) = the T x, .unwrap(the T x) = x} in ...
 ```
 
 gives `mod` the type `{.make : fun('a) -> T('a), .unwrap : fun(T('a)) -> 'a}`, so
-`mod.make(#a)` and `mod.make({})` have the different types `T([#a, ..'b])` and `T({})`.
+`mod.make(#a)` and `mod.make({})` have the different types `T([#a, ..])` and `T({})`.
 Without the parameter, both would have type `T`, and `mod.unwrap` would return a value
 of any type at all. Row variables aren't parameters, since they'd expose the shape of the
 underlying type - `abstract T in the T #a` has type `T`, not `T('a)`. Within its `abstract` scope, an abstract type is written without

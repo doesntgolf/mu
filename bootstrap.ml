@@ -266,9 +266,13 @@ module Type = struct
     go abs.repr view;
     List.map snd !found
 
+  (* A variable that appears once is shown as `*`, or a row variable as
+     nothing after `..`, since its name would say nothing. So the variables
+     are counted first, then shown. *)
   let show ty =
     let buf = Buffer.create 32 in
     let count = ref 0 and vars = ref [] and recs = ref [] in
+    let uses = ref [] and counting = ref true in
     let next () =
       let n = !count in
       incr count;
@@ -277,6 +281,11 @@ module Type = struct
     in
     let rec go ty =
       match prune ty with
+      | Var {contents = Unbound {id; _}} when !counting ->
+        let n = Option.value (List.assoc_opt id !uses) ~default:0 in
+        uses := (id, n + 1) :: List.remove_assoc id !uses
+      | Var {contents = Unbound {id; _}} when List.assoc_opt id !uses = Some 1 ->
+        Buffer.add_char buf '*'
       | Var {contents = Unbound {id; _}} ->
         let name =
           match List.assoc_opt id !vars with
@@ -369,9 +378,17 @@ module Type = struct
           if fields <> [] then
             Buffer.add_string buf ", ";
           Buffer.add_string buf "..";
-          go rest)
+          match rest with
+          | Var {contents = Unbound {id; _}} when not !counting && List.assoc_opt id !uses = Some 1 -> ()
+          | rest -> go rest)
         rest
     in
+    go ty;
+    counting := false;
+    Buffer.clear buf;
+    count := 0;
+    vars := [];
+    recs := [];
     go ty;
     Buffer.contents buf
 

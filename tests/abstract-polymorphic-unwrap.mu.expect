@@ -1,1 +1,1 @@
-line 1, column 71: cannot unify fun({}) -> 'a with [#a, ..'a]
+line 1, column 71: cannot unify fun({}) -> * with [#a, ..]

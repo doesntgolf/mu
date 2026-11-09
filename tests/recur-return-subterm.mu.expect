@@ -1,1 +1,1 @@
-the [#none, #some(rec 'a. [#nil, #cons([#b, #a, #c, ..'b], 'a)]), ..'c] #some(&#cons(#c, &#nil))
+the [#none, #some(rec 'a. [#nil, #cons([#b, #a, #c, ..], 'a)]), ..] #some(&#cons(#c, &#nil))

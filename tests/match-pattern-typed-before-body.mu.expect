@@ -1,1 +1,1 @@
-the [#times([#two, ..'a], [#three, ..'b]), ..'c] #times(#two, #three)
+the [#times([#two, ..], [#three, ..]), ..] #times(#two, #three)
