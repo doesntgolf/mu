@@ -1,1 +1,1 @@
-line 1, column 35: cannot unify rec _. [#cons([#a, ..'a], rec _. [#nil, ..'b]), ..'c] with rec [recur] _. 'a
+line 1, column 44: cannot unify rec [recur] _. 'a with rec _. [#cons([#a, ..'a], rec _. [#nil, ..'b]), ..'c]

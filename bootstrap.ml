@@ -785,8 +785,6 @@ module Type = struct
       rest = Some (fresh ())
     }
 
-  let types fields = List.map (fun (name, (x : _ expr)) -> name, x.ty) fields
-  let ptypes fields = List.map (fun (name, (p : _ pat)) -> name, p.ty) fields
 
   (* A type annotation's type, with the problems in it reported at [loc].
      Each type variable stands for one type throughout. Within `rec 'a.
@@ -843,44 +841,78 @@ module Type = struct
     if List.mem_assoc name !binds then pmark scope p (Bound_twice name)
     else binds := (name, ty) :: !binds
 
-  (* Checks a pattern, adding the names it binds to [binds] *)
-  let rec pattern scope binds (p : _ pat) =
+  (* Checking is bidirectional: each node is checked against the type
+     expected of it, which is passed down to its parts as far as it's
+     known, so a problem is found where it is.
+
+     A node made of parts has a [shape]: its type, with a variable for each
+     part's. If the [expected] type has that shape, the parts are checked
+     against what it has there. Otherwise they're checked against the
+     variables, and the problem is the node's, found with the parts' types
+     filled in. *)
+  let against expected shape parts =
+    match unify expected shape with
+    | () -> parts (); None
+    | exception Compile_error _ -> parts (); expect expected shape
+
+  let slots fields = List.map (fun (name, _) -> name, fresh ()) fields
+
+  (* Checks each of [xs] against its slot's type *)
+  let each check xs slots = List.iter2 (fun (_, x) (_, ty) -> check ty x) xs slots
+
+  (* A node found to have type [ty], unless it has [problem], must have the
+     expected type *)
+  let found scope (e : _ expr) expected ty problem =
+    e.ty <- ty;
+    mark_if scope e (if problem = None then expect expected ty else problem)
+
+  (* A copy of a type with fresh variables in place of its own, sharing a
+     copy for each *)
+  let refresh () =
+    let fresh_for = memo () in
+    copy (function
+        | Var {contents = Unbound u} -> Some (fresh_for u.id fresh)
+        | _ -> None)
+
+  (* Checks a pattern against the type of what it matches, adding the names
+     it binds to [binds] *)
+  let rec pattern scope binds expected (p : _ pat) =
     match p.pat with
     | Var name ->
-      p.ty <- fresh ();
-      bind scope binds p name p.ty
+      p.ty <- expected;
+      bind scope binds p name expected
 
-    | Wildcard -> p.ty <- fresh ()
+    | Wildcard -> p.ty <- expected
 
     (* With `..`, it matches records with more fields *)
     | Record {fields; rest} ->
-      List.iter (fun (_, q) -> pattern scope binds q) fields;
-      let rest = if rest then Some (fresh ()) else None in
-      p.ty <- Record {fields = ptypes fields; rest}
+      let slots = slots fields in
+      p.ty <- Record {fields = slots; rest = if rest then Some (fresh ()) else None};
+      pmark_if scope p (against expected p.ty (fun () -> each (pattern scope binds) fields slots))
 
     | Variant (tag, fields) ->
-      List.iter (fun (_, q) -> pattern scope binds q) fields;
-      p.ty <- tagged tag (ptypes fields)
+      let slots = slots fields in
+      p.ty <- tagged tag slots;
+      pmark_if scope p (against expected p.ty (fun () -> each (pattern scope binds) fields slots))
 
     | Roll q ->
-      pattern scope binds q;
-      p.ty <- Recurs {body = q.ty; index = fresh ()}
+      let body = fresh () in
+      p.ty <- Recurs {body; index = fresh ()};
+      pmark_if scope p (against expected p.ty (fun () -> pattern scope binds body q))
 
-    (* An erroneous pattern keeps its error *)
     | The (ann, q) ->
       let ty = annotation scope p.loc ann in
-      pattern scope binds q;
+      pattern scope binds (repr ty) q;
       p.ty <- ty;
-      if not (is_error q.ty) then pmark_if scope p (expect (repr ty) q.ty)
+      pmark_if scope p (expect expected ty)
 
-    (* Both sides must bind the same names. All of them are bound either way,
-       so none are found unbound. *)
+    (* Both sides must bind the same names, with the same types. All of them
+       are bound either way, so none are found unbound. *)
     | Or (q, r) ->
       let left = ref [] and right = ref [] in
-      pattern scope left q;
-      pattern scope right r;
-      p.ty <- q.ty;
-      pmark_if scope p (expect q.ty r.ty);
+      pattern scope left expected q;
+      pattern scope right expected r;
+      p.ty <- expected;
       let same = List.compare_lengths !left !right = 0
                  && List.for_all (fun (name, _) -> List.mem_assoc name !right) !left in
       if not same then pmark scope p Or_binds
@@ -888,120 +920,127 @@ module Type = struct
       let extra = List.filter (fun (name, _) -> not (List.mem_assoc name !left)) !right in
       List.iter (fun (name, ty) -> bind scope binds p name ty) (!left @ extra)
 
-  let rec infer scope (e : _ expr) =
+  let rec check scope expected (e : _ expr) =
     match e.expr with
     | Var name ->
       begin match List.assoc_opt name scope.vars with
-        | Some ty -> e.ty <- instantiate ty
+        | Some ty -> found scope e expected (instantiate ty) None
         | None -> mark scope e (Unbound_variable name)
       end
 
-    | Hole -> e.ty <- fresh ()
+    | Hole -> e.ty <- expected
 
     | Dep name ->
-      e.ty <- fresh ();
-      let record = Record {fields = [name, e.ty]; rest = Some (fresh ())} in
-      mark_if scope e (expect record scope.deps)
+      let ty = fresh () in
+      let record = Record {fields = [name, ty]; rest = Some (fresh ())} in
+      found scope e expected ty (expect record scope.deps)
 
     | Field (left, name) ->
-      infer scope left;
-      e.ty <- fresh ();
-      let record = Record {fields = [name, e.ty]; rest = Some (fresh ())} in
-      mark_if scope e (expect record left.ty)
+      let left_ty = fresh () in
+      check scope left_ty left;
+      let ty = fresh () in
+      let record = Record {fields = [name, ty]; rest = Some (fresh ())} in
+      found scope e expected ty (expect record left_ty)
 
+    (* The arguments are checked against the function's parameters *)
     | Apply {f; args; deps} ->
-      infer scope f;
-      List.iter (fun (_, x) -> infer scope x) args;
-      Option.iter (infer scope) deps;
-      e.ty <- fresh ();
-      let expected = Function {
-          inputs = Record {fields = types args; rest = None};
-          deps = (match deps with Some (x : _ expr) -> x.ty | None -> empty);
-          exists = [];
-          output = e.ty
-        }
-      in
-      mark_if scope e (expect expected (open_exists f.ty))
+      let f_ty = fresh () in
+      check scope f_ty f;
+      let slots = slots args in
+      let deps_ty = if deps = None then empty else fresh () in
+      let output = fresh () in
+      let shape = Function {inputs = Record {fields = slots; rest = None}; deps = deps_ty; exists = []; output} in
+      found scope e expected output (against shape (open_exists f_ty) (fun () ->
+          each (check scope) args slots;
+          Option.iter (check scope deps_ty) deps))
 
     (* Each clause's pattern is checked before its body, so its variables'
        types are known there *)
     | Match (left, clauses) ->
-      infer scope left;
-      e.ty <- fresh ();
-      List.iter (fun ((pat : _ pat), body) ->
+      let ty = fresh () in
+      check scope ty left;
+      List.iter (fun (pat, body) ->
           let binds = ref [] in
-          pattern scope binds pat;
-          pmark_if scope pat (expect left.ty pat.ty);
-          infer {scope with vars = !binds @ scope.vars} body;
-          mark_if scope body (expect e.ty body.ty))
+          pattern scope binds ty pat;
+          check {scope with vars = !binds @ scope.vars} expected body)
         clauses;
+      e.ty <- expected;
       mark_if scope e (exhaustive (List.map fst clauses))
 
     | Record {fields; rest} ->
-      List.iter (fun (_, x) -> infer scope x) fields;
-      Option.iter (infer scope) rest;
+      let slots = slots fields in
       let tail = Option.map (fun _ -> fresh ()) rest in
-      Option.iter (fun (r : _ expr) ->
-          mark_if scope r (expect (Record {fields = []; rest = tail}) r.ty))
-        rest;
-      e.ty <- Record {fields = types fields; rest = tail}
+      e.ty <- Record {fields = slots; rest = tail};
+      mark_if scope e (against expected e.ty (fun () ->
+          each (check scope) fields slots;
+          Option.iter (check scope (Record {fields = []; rest = tail})) rest))
 
     | Variant (tag, fields) ->
-      List.iter (fun (_, x) -> infer scope x) fields;
-      e.ty <- tagged tag (types fields)
+      let slots = slots fields in
+      e.ty <- tagged tag slots;
+      mark_if scope e (against expected e.ty (fun () -> each (check scope) fields slots))
 
     | Roll x ->
-      infer scope x;
-      e.ty <- Recurs {body = x.ty; index = empty}
+      let body = fresh () in
+      e.ty <- Recurs {body; index = empty};
+      mark_if scope e (against expected e.ty (fun () -> check scope body x))
 
     (* p and e are checked a level deeper, so that p's variables are
        generalized for body *)
     | Let {pat; defn; body} ->
       incr level;
+      let ty = fresh () in
       let binds = ref [] in
-      pattern scope binds pat;
-      infer scope defn;
-      mark_if scope defn (expect pat.ty defn.ty);
+      pattern scope binds ty pat;
+      check scope ty defn;
       pmark_if scope pat (exhaustive [pat]);
       decr level;
       List.iter (fun (_, ty) -> generalize ty) !binds;
-      infer {scope with vars = !binds @ scope.vars} body;
-      (* An error in the body is the body's, not the let's *)
-      e.ty <- if is_error body.ty then fresh () else body.ty
+      check {scope with vars = !binds @ scope.vars} expected body;
+      e.ty <- expected
 
     (* body sees t as a new abstract type *)
     | Abstract (name, body) ->
-      infer {scope with types = (name, rigid name (fresh ())) :: scope.types} body;
-      e.ty <- if is_error body.ty then fresh () else body.ty
+      check {scope with types = (name, rigid name (fresh ())) :: scope.types} expected body;
+      e.ty <- expected
 
-    (* An erroneous expression keeps its error, since it can't be evaluated *)
     | The (ann, x) ->
       let ty = annotation scope e.loc ann in
-      infer scope x;
-      e.ty <- ty;
-      if not (is_error x.ty) then mark_if scope e (expect (repr ty) x.ty)
+      check scope (repr ty) x;
+      found scope e expected ty None
 
+    (* The parameters and body are checked against a refreshed copy of the
+       function type expected, unless it has existential types, which the
+       body determines. They're copies so that the function's own abstract
+       types aren't unified with variables from outside it, which would make
+       them the outside's (see [occurs]) rather than existential. *)
     | Function {params; deps; body} ->
       incr fun_level;
+      let inputs, deps_ty, output =
+        match prune expected with
+        | Function fn when fn.exists = [] ->
+          let copy = refresh () in
+          copy fn.inputs, copy fn.deps, copy fn.output
+        | _ -> fresh (), fresh (), fresh ()
+      in
       let binds = ref [] in
-      List.iter (fun (_, p) -> pattern scope binds p) params;
-      Option.iter (pattern scope binds) deps;
-      let inputs = Record {fields = ptypes params; rest = None} in
-      let problem = exhaustive [{pat = Record {fields = params; rest = false}; ty = inputs; loc = e.loc}] in
-      let deps_ty = fresh () in
-      Option.iter (fun (p : _ pat) ->
-          pmark_if scope p (expect deps_ty p.ty);
+      let slots = slots params in
+      let fields = Record {fields = slots; rest = None} in
+      ignore (against inputs fields (fun () -> each (pattern scope binds) params slots));
+      let problem = exhaustive [{pat = Record {fields = params; rest = false}; ty = fields; loc = e.loc}] in
+      Option.iter (fun p ->
+          pattern scope binds deps_ty p;
           pmark_if scope p (exhaustive [p]))
         deps;
-      infer {scope with vars = !binds @ scope.vars; deps = deps_ty} body;
+      check {scope with vars = !binds @ scope.vars; deps = deps_ty} output body;
       decr fun_level;
-      let exists = existentials body.ty in
+      let exists = existentials output in
       let escapes =
-        if mentions exists inputs || mentions exists deps_ty then Some Escapes_parameter
+        if mentions exists fields || mentions exists deps_ty then Some Escapes_parameter
         else None
       in
-      e.ty <- Function {inputs; deps = deps_ty; exists; output = body.ty};
-      mark_if scope e (if problem = None then escapes else problem)
+      let ty = Function {inputs = fields; deps = deps_ty; exists; output} in
+      found scope e expected ty (if problem = None then escapes else problem)
 
     (* `recur (p <- e, acc = init, ...) do body`, where [params] are `&p` and
        the accumulators, and [args] e and their initial values. Within body,
@@ -1013,7 +1052,8 @@ module Type = struct
        subterms, and [forget] does the same for a layer within body.
 
        p is checked a function level deeper, so its variables can't be
-       unified with anything outside. *)
+       unified with anything outside. For the same reason, e is only checked
+       against the layer p matches once body is. *)
     | Recur {continue; forget; params; args; body} ->
       let level = !fun_level + 1 in
       fun_level := level;
@@ -1024,23 +1064,27 @@ module Type = struct
           rolled, root, List.map snd accs, input, List.map snd inits
         | _ -> invalid_arg "recur"
       in
-      pattern scope binds root;
+      let root_ty = fresh () in
+      pattern scope binds root_ty root;
       pmark_if scope root (exhaustive [root]);
       decr fun_level;
-      infer scope input;
-      List.iter2 (fun (p : _ pat) (init : _ expr) ->
-          pattern scope binds p;
-          infer scope init;
-          mark_if scope init (expect p.ty init.ty);
-          pmark_if scope p (exhaustive [p]))
-        accs inits;
+      let input_ty = fresh () in
+      check scope input_ty input;
+      let acc_tys = List.map2 (fun p init ->
+          let ty = fresh () in
+          pattern scope binds ty p;
+          check scope ty init;
+          pmark_if scope p (exhaustive [p]);
+          ty)
+          accs inits
+      in
       fun_level := level;
       let index = abstract "recur" empty in
-      let layer = {body = root.ty; index = Rigid {abs = index; view = empty}} in
+      let layer = {body = root_ty; index = Rigid {abs = index; view = empty}} in
       rolled.ty <- Recurs layer;
       let output = fresh () in
       let continue_ty = Function {
-          inputs = Record {fields = ptypes params; rest = None};
+          inputs = Record {fields = List.mapi (fun i ty -> label i, ty) (Recurs layer :: acc_tys); rest = None};
           deps = empty;
           exists = [];
           output
@@ -1049,40 +1093,36 @@ module Type = struct
       (* Any index, so both subterms and the re-rolled layer can be forgotten *)
       let forget_ty = Function {
           inputs = Record {
-              fields = [label 0, Recurs {body = root.ty; index = fresh ~level:generic ()}];
+              fields = [label 0, Recurs {body = root_ty; index = fresh ~level:generic ()}];
               rest = None
             };
           deps = empty;
           exists = [];
-          output = input.ty
+          output = input_ty
         }
       in
       let counter = !counter in (* abstract types made after this are made within *)
       let vars = !binds @ [continue, continue_ty; forget, forget_ty] @ scope.vars in
-      infer {scope with vars} body;
-      mark_if scope body (expect output body.ty);
+      check {scope with vars} output body;
       decr fun_level;
       (* Each iteration introduces its own abstract types, so they can't be
          passed between iterations, through the result or the accumulators *)
-      let carried = output :: List.map (fun (p : _ pat) -> p.ty) accs in
       let problem =
         if index.fun_level < level then Some Index_escapes
         else
-          List.find_opt (fun abs -> abs.id > counter) (List.concat_map abstracts carried)
+          List.find_opt (fun abs -> abs.id > counter) (List.concat_map abstracts (output :: acc_tys))
           |> Option.map (fun abs -> Escapes_recursion abs.name)
       in
       let outer = fresh () in
       let copy = copy (function Rigid x when x.abs == index -> Some outer | _ -> None) in
-      let input_ty = copy (Recurs layer) and ty = copy output in
-      let problem = if problem = None then expect input_ty input.ty else problem in
-      e.ty <- ty;
-      mark_if scope e problem
+      let layer_ty = copy (Recurs layer) and ty = copy output in
+      found scope e expected ty (if problem = None then expect layer_ty input_ty else problem)
 
   (* A program, with [vars] in scope, is checked like a let's definition *)
   let program ?(vars = []) report (e : _ expr) =
     level := 0;
     fun_level := 0;
-    infer {vars; types = []; deps = empty; report} e;
+    check {vars; types = []; deps = empty; report} (fresh ()) e;
     decr level;
     generalize e.ty
 end

@@ -1,1 +1,1 @@
-line 1, column 45: cannot unify {} with [#a, ..'a]
+line 1, column 47: cannot unify [#a, ..'a] with {}
